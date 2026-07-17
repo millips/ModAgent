@@ -20,10 +20,31 @@ ModAgent 是一个面向 PC 游戏的开源 AI Mod 管理器，帮助用户搜�
 ## 系统要求
 
 - Windows 10/11 x64
+- 当前 v1.0 仅提供中文界面与中文交互
 - Python 3.10 或更高版本（仅源码运行需要）
 - Node.js 18 或更高版本（仅前端开发与打包需要）
-- 使用在线搜索、Mod 来源或 AI 模型时需要网络连接
-- Nexus Mods、搜索服务及模型服务可能需要用户自己的 API Key
+- 使用在线搜索、Mod 来源和 AI 模型时需要网络连接
+
+## 必需的 API Key
+
+ModAgent 普通版不内置共享密钥。用户需要在“设置”中填写自己的 API Key：
+
+| API Key | 用途 | 缺少时的影响 |
+|---|---|---|
+| Nexus Mods API Key | 查询 Nexus Mods、读取文件和版本信息、执行 Nexus 下载流程 | 无法完整使用 Nexus Mods 来源 |
+| Tavily Search API Key | 搜索 GitHub、Steam Workshop、GameBanana 及其他网页来源，补充跨站推荐信息 | 跨网站搜索与综合推荐能力明显受限 |
+| DeepSeek API Key | 驱动中文对话、需求理解、计划生成和工具调用 | 无法使用 AI 对话与自动规划 |
+
+API Key 分别由对应服务提供，相关额度、费用、地区可用性和服务条款由服务提供方决定。
+
+### 当前模型与语言支持
+
+- 当前官方验证并支持的模型服务：**DeepSeek**
+- 当前产品语言：**简体中文**
+- 设置页中可能出现兼容 OpenAI 接口格式的实验性模型选项，但 v1.0 不承诺其完整可用性
+- 英文界面、其他模型服务和免配置托管能力属于后续规划
+
+因此，当前版本更准确的定位是：**由用户提供 API Key 的中文 AI Mod 管理器**，并非无需配置即可使用的在线服务。
 
 ## 从源码运行
 
@@ -69,3 +90,7 @@ npm run dist:win
 ModAgent 普通版以 **GNU GPL v3.0 only** 发布，详见 [LICENSE.md](LICENSE.md) 与 [LICENSE-GPL-3.0.txt](LICENSE-GPL-3.0.txt)。
 
 第三方组件仍受各自许可证约束，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 联系
+
+问题反馈、权利投诉与公开联系：`3387454098@qq.com`
