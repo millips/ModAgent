@@ -710,26 +710,18 @@ async def download_mod(
     local_path = os.path.join(DOWNLOADS_DIR, game_slug, filename)
 
     last_err = None
-    consecutive_403 = 0
     for attempt in range(6):
         # 每次都重新生成直链（旧链可能已过期）。
         # 走"文件页上下文"通路:免费账号必须如此(从首页等其他页请求必 403),Premium 同样兼容。
         try:
             cdn_url = await get_download_url_filepage(cdp_port, game_slug, mod_id, file_id, game_id)
-            consecutive_403 = 0
         except RuntimeError as e:
             last_err = e
-            if "403" in str(e):
-                consecutive_403 += 1
-                if consecutive_403 >= 2:
-                    # 同一上下文连吃两次 403,重试无意义:快速失败并给出用户可执行的下一步
-                    raise RuntimeError(
-                        f"下载 mod {mod_id} 失败: 文件页上下文内仍返回 403。"
-                        f"可能原因:未登录 Nexus / 该文件需站内确认。请在 Chrome 里打开 "
-                        f"https://www.nexusmods.com/{game_slug}/mods/{mod_id}?tab=files "
-                        f"手动点一次 Slow download,之后重试本命令。") from e
-            await asyncio.sleep(2)
-            continue
+            # get_download_url_filepage 已在同一个标签内重试三次。继续外层循环
+            # 只会反复开 Files 页，并不能修复登录、参数或站方确认问题。
+            raise RuntimeError(
+                f"下载 mod {mod_id} 失败: {e}"
+            ) from e
         if not cdn_url or cdn_url == 'None':
             last_err = RuntimeError("获取下载链接失败")
             await asyncio.sleep(2)

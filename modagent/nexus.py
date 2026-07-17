@@ -183,6 +183,20 @@ def _api(url: str, api_key: str) -> dict:
         return json.loads(resp.read())
 
 
+def resolve_game_id(game_slug: str, api_key: str) -> int:
+    """Resolve Nexus' numeric game id for a domain slug (including ``site``)."""
+    if not (game_slug or "").strip() or not api_key:
+        return 0
+    try:
+        data = _api(
+            f"https://api.nexusmods.com/v1/games/{game_slug.strip()}.json",
+            api_key,
+        )
+        return int(data.get("id") or data.get("game_id") or 0)
+    except Exception:
+        return 0
+
+
 def search(query: str, game_slug: str, api_key: str, cdp_port: int = 18888, game_id: int = 0, tavily_key: str = "") -> list[dict]:
     """搜索 Nexus Mods。Tavily → CDP → API Cache 三层回退。"""
     if not (game_slug or "").strip():
