@@ -14,6 +14,10 @@ _TOOL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool")
 try:
     from .report_validator import validate_report, build_correction_message
     from .report_validator import check_unsourced_state, build_state_correction_message
+    from .report_validator import (
+        validate_search_report, build_search_correction_message,
+        build_search_fallback,
+    )
     _HAS_VALIDATOR = True
 except Exception:
     _HAS_VALIDATOR = False
@@ -205,6 +209,16 @@ class Agent:
                         reply = self._once(messages, tools) or reply
                     except Exception:
                         pass
+                    if not validate_search_report(reply, persist).ok:
+                        reply = build_search_fallback(persist)
+                search_res = validate_search_report(reply, persist)
+                if not search_res.ok:
+                    messages.append({"role": "assistant", "content": reply})
+                    messages.append(build_search_correction_message(search_res))
+                    try:
+                        reply = self._once(messages, tools) or reply
+                    except Exception:
+                        pass
             persist.append({"role": "assistant", "content": reply})
             self.history.extend(persist)
             return reply
@@ -313,6 +327,16 @@ class Agent:
                     if not res.ok:
                         messages.append({"role": "assistant", "content": final_text})
                         messages.append(build_correction_message(res))
+                        try:
+                            final_text = self._once(messages, tools) or final_text
+                        except Exception:
+                            pass
+                        if not validate_search_report(final_text, persist).ok:
+                            final_text = build_search_fallback(persist)
+                    search_res = validate_search_report(final_text, persist)
+                    if not search_res.ok:
+                        messages.append({"role": "assistant", "content": final_text})
+                        messages.append(build_search_correction_message(search_res))
                         try:
                             final_text = self._once(messages, tools) or final_text
                         except Exception:

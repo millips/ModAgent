@@ -33,27 +33,63 @@ _SRC_CACHE = {}                  # slug/name(lower) -> (ts, result)
 _SRC_TTL = 3600
 
 
-def available_sources(game_name: str, game_slug: str, game_root: str) -> dict:
+def available_sources(game_name: str, game_slug: str, game_root: str,
+                      tavily_key: str = "") -> dict:
     """当前游戏在哪些平台有 mod 可搜。CURRENT STATE 注入 + mod_recommend 选源共用。
     本地判断(nexus=slug 非 local_、工坊=acf 解析)零成本;联网探测(thunderstore 社区、
     gamebanana 收录)并发跑、单项限时 4 秒,失败按不可用处理——绝不阻塞对话首条消息。
     结果按游戏缓存 1 小时。github 是通用代码托管,恒可用。"""
     import time
-    key = (game_slug or game_name or "").lower()
+    key = (
+        (game_slug or game_name or "").lower(),
+        bool(tavily_key),
+    )
     hit = _SRC_CACHE.get(key)
     if hit and time.time() - hit[0] < _SRC_TTL:
         return hit[1]
 
+    static_nexus = bool(game_slug) and not str(game_slug).startswith("local_")
     out = {
-        "nexus": bool(game_slug) and not str(game_slug).startswith("local_"),
+        "nexus": game_slug if static_nexus else None,
         "workshop": None,        # appid | None
         "thunderstore": None,    # community slug | None
         "gamebanana": None,      # game id | None
         "github": True,
+        "source_status": {
+            "nexus": {
+                "status": "available" if static_nexus else "not_detected",
+                "evidence": "static game mapping" if static_nexus else "",
+                "slug": game_slug if static_nexus else "",
+            },
+            "workshop": {"status": "not_detected", "evidence": ""},
+            "thunderstore": {"status": "not_detected", "evidence": ""},
+            "gamebanana": {"status": "not_detected", "evidence": ""},
+            "github": {"status": "available", "evidence": "generic repository search"},
+        },
     }
+    if not static_nexus:
+        try:
+            from .. import nexus
+            discovered = nexus.discover_game(game_name, tavily_key)
+            out["source_status"]["nexus"] = discovered
+            if discovered.get("status") == "available":
+                out["nexus"] = discovered.get("slug") or None
+        except Exception as exc:
+            out["source_status"]["nexus"] = {
+                "status": "search_failed",
+                "evidence": "",
+                "slug": "",
+                "reason": (str(exc) or type(exc).__name__)[:160],
+            }
     try:
         from . import steam_workshop as sw
         out["workshop"] = sw.resolve_appid(game_root) or None
+        if out["workshop"]:
+            out["source_status"]["workshop"] = {
+                "status": "candidate",
+                "evidence": f"Steam appid {out['workshop']}",
+                "reason": "Steam app identity found; Workshop availability is not confirmed",
+            }
     except Exception:
         pass
 
@@ -69,8 +105,17 @@ def available_sources(game_name: str, game_slug: str, game_root: str) -> dict:
     for k, f in futs.items():
         try:
             out[k] = f.result(timeout=4) or None
+            if out[k]:
+                out["source_status"][k] = {
+                    "status": "available",
+                    "evidence": str(out[k]),
+                }
         except Exception:
             out[k] = None
+            out["source_status"][k] = {
+                "status": "search_failed",
+                "evidence": "",
+            }
     ex.shutdown(wait=False)      # 超时的探测线程后台自生自灭,不拖住对话
 
     _SRC_CACHE[key] = (time.time(), out)

@@ -46,7 +46,7 @@ check("A1 all five detected", s["nexus"] and s["workshop"] == 1623730
 
 sources._SRC_CACHE.clear()
 s = sources.available_sources("你的老婆", "local_yourwife", "X:/Games/YourWife")
-check("A2 local game: nexus off, github on", s["nexus"] is False and s["github"] is True
+check("A2 local game: nexus unresolved, github on", s["nexus"] is None and s["github"] is True
       and s["thunderstore"] is None and s["gamebanana"] is None)
 
 # 探测炸了 → 降级 None,不抛
@@ -74,7 +74,8 @@ sources._SRC_CACHE.clear()
 cfg = types.SimpleNamespace(game_root="X:/Games/Palworld", game_slug="palworld", game_name="Palworld")
 out = prompts.build_prompt(cfg)
 check("B1 sources line injected", "可用 mod 来源" in out and "创意工坊✓(appid 1623730)" in out)
-check("B2 forbids searching missing sources", "不要去搜" in out)
+check("B2 unresolved sources are not called absent", "当前未确认可用" in out
+      and "空结果只能表述为“本次未搜到”" in out)
 
 # 注入失败不阻塞对话
 _orig_avail = sources.available_sources
@@ -106,6 +107,8 @@ check("C4 github grouped", r.get("github") and r["github"][0]["name"] == "gh-mod
 check("C5 unavailable source not consulted", "thunderstore" not in r["sources_consulted"])
 check("C6 consulted lists ok", set(r["sources_consulted"]) == {"nexus", "workshop", "gamebanana", "github"},
       f"got {r['sources_consulted']}")
+check("C6b source ledger present", set(r["sources_attempted"]) == {"nexus", "workshop", "gamebanana", "github"}
+      and "thunderstore" in r["sources_skipped"])
 
 # 单源失败 → sources_failed,其余不受阻
 async def _ws_boom(q, appid, port=18888):

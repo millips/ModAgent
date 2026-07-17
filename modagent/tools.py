@@ -317,26 +317,58 @@ def execute(name: str, args: dict, cfg: Config) -> str:
     elif name == "nexus_search":
         import re as _re
         q = (args.get("query") or "").strip()
+        effective_slug = slug
+        discovery = None
+        if not effective_slug or str(effective_slug).startswith("local_"):
+            discovery = nexus.discover_game(
+                cfg.game_name or "", getattr(cfg, "tavily_api_key", "")
+            )
+            effective_slug = discovery.get("slug", "")
+        if not effective_slug:
+            return json.dumps({
+                "error": "game_mapping_missing",
+                "status": (discovery or {}).get("status", "not_detected"),
+                "reason": (discovery or {}).get(
+                    "reason", "未能确认当前游戏对应的 Nexus 专区"
+                ),
+                "game_name": cfg.game_name or "",
+                "searched": False,
+                "note": "未执行 Nexus Mod 搜索；这不代表 Nexus 没有该游戏专区。",
+            }, ensure_ascii=False)
         # 粘贴 Nexus 链接或直接给 mod_id → 绕过受限的搜索索引，直接解析详情
         m = _re.search(r"nexusmods\.com/(?:games/)?[\w-]+/mods/(\d+)", q) or _re.fullmatch(r"\d{2,7}", q)
         if m:
             mid = int(m.group(1) if m.lastindex else m.group(0))
             try:
-                d = nexus.get_detail(mid, slug, api_key, cdp_port=cfg.chrome_cdp_port)
+                d = nexus.get_detail(mid, effective_slug, api_key, cdp_port=cfg.chrome_cdp_port)
                 return json.dumps({"direct": True, "results": [{
                     "mod_id": d.get("mod_id"), "name": d.get("name"), "summary": d.get("summary", ""),
                     "version": d.get("version", ""), "file_id": d.get("file_id"),
                 }]}, indent=2, ensure_ascii=False)
             except Exception as e:
                 return json.dumps({"error": f"按 ID/链接获取详情失败: {e}"}, ensure_ascii=False)
-        results = nexus.search(q, slug, api_key, cdp_port=cfg.chrome_cdp_port, game_id=gid, tavily_key=cfg.tavily_api_key)
+        results = nexus.search(q, effective_slug, api_key, cdp_port=cfg.chrome_cdp_port,
+                               game_id=gid, tavily_key=cfg.tavily_api_key)
         if not results:
-            return json.dumps({"error": "未找到匹配的 Mod。Nexus 搜索索引只覆盖近期更新的 mod，老/热门 mod（如服装、身体类）常搜不到。请直接粘贴该 mod 的 Nexus 链接或 mod_id 数字，我可以直接获取。"}, ensure_ascii=False)
-        return json.dumps([{
+            return json.dumps({
+                "status": "search_empty",
+                "searched": True,
+                "source": "nexus",
+                "game_slug": effective_slug,
+                "results": [],
+                "note": "本次 Nexus 搜索未找到匹配结果；不能据此判断专区或相关 Mod 不存在。",
+            }, ensure_ascii=False)
+        return json.dumps({
+            "status": "ok",
+            "searched": True,
+            "source": "nexus",
+            "game_slug": effective_slug,
+            "results": [{
             "mod_id": r.get("mod_id"), "name": r.get("name"), "summary": r.get("summary", ""),
             "endorsements": r.get("endorsement_count", 0), "version": r.get("version", ""),
             "updated": r.get("updated_time", ""),
-        } for r in results[:10]], indent=2, ensure_ascii=False)
+            } for r in results[:10]],
+        }, indent=2, ensure_ascii=False)
 
     elif name == "collection_view":
         import re as _re
@@ -1127,8 +1159,10 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         dependent_info = [_toggle_mod_info(item) for item in dependents]
         if dependents and not args.get("confirmed"):
             return json.dumps({
-                "requires_confirmation": True, "action": "disable",
-                "target": _toggle_mod_info(mod), "dependents": dependent_info,
+                "requires_confirmation": True,
+                "action": "disable",
+                "target": _toggle_mod_info(mod),
+                "dependents": dependent_info,
                 "will_disable": dependent_info + [_toggle_mod_info(mod)],
                 "note": "此 Mod 是其他 Mod 的前置依赖；继续会连带禁用整个依赖链。",
             }, indent=2, ensure_ascii=False)
@@ -1139,9 +1173,10 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         details = operation["details"]
         total_files = sum(len(item["disabled"]) for item in details)
         changed = [_toggle_mod_info(item, disabled=True) for item in plan]
-        return json.dumps({"disabled": total_files, "disabled_mods": changed,
-                           "cascade": bool(dependents), "details": details},
-                          indent=2, ensure_ascii=False)
+        return json.dumps({
+            "disabled": total_files, "disabled_mods": changed,
+            "cascade": bool(dependents), "details": details,
+        }, indent=2, ensure_ascii=False)
 
     elif name == "mod_enable":
         mod = db.get_mod(args["mod_id"], slug)
@@ -1151,14 +1186,19 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         dependency_info = [_toggle_mod_info(item) for item in dependencies]
         if missing:
             return json.dumps({
-                "blocked": True, "action": "enable", "target": _toggle_mod_info(mod),
-                "dependencies": dependency_info, "missing_dependencies": missing,
+                "blocked": True,
+                "action": "enable",
+                "target": _toggle_mod_info(mod),
+                "dependencies": dependency_info,
+                "missing_dependencies": missing,
                 "note": "缺少前置依赖，已阻止启用；请先安装缺失依赖。",
             }, indent=2, ensure_ascii=False)
         if dependencies and not args.get("confirmed"):
             return json.dumps({
-                "requires_confirmation": True, "action": "enable",
-                "target": _toggle_mod_info(mod), "dependencies": dependency_info,
+                "requires_confirmation": True,
+                "action": "enable",
+                "target": _toggle_mod_info(mod),
+                "dependencies": dependency_info,
                 "will_enable": dependency_info + [_toggle_mod_info(mod)],
                 "note": "此 Mod 需要以下前置依赖；继续会先启用依赖，再启用目标 Mod。",
             }, indent=2, ensure_ascii=False)
@@ -1169,9 +1209,10 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         details = operation["details"]
         total_files = sum(len(item["enabled"]) for item in details)
         changed = [_toggle_mod_info(item, disabled=False) for item in plan]
-        return json.dumps({"enabled": total_files, "enabled_mods": changed,
-                           "dependencies_enabled": len(dependencies), "details": details},
-                          indent=2, ensure_ascii=False)
+        return json.dumps({
+            "enabled": total_files, "enabled_mods": changed,
+            "dependencies_enabled": len(dependencies), "details": details,
+        }, indent=2, ensure_ascii=False)
 
     elif name == "game_file_check":
         rel = (args.get("path") or "").strip().replace("\\", "/").lstrip("/")
@@ -1256,13 +1297,15 @@ def _recommend(query: str, cfg: Config) -> dict:
 
     from .sources import available_sources
     slug, api_key = cfg.game_slug, cfg.nexus_api_key
-    src = available_sources(cfg.game_name or "", slug or "", cfg.game_root or "")
+    src = available_sources(cfg.game_name or "", slug or "", cfg.game_root or "",
+                            getattr(cfg, "tavily_api_key", ""))
+    effective_slug = src.get("nexus") or ""
 
     import concurrent.futures as cf
     tasks = {}
     ex = cf.ThreadPoolExecutor(max_workers=5)
-    if src.get("nexus"):
-        tasks["nexus"] = ex.submit(_recommend_nexus, query, slug, api_key)
+    if effective_slug:
+        tasks["nexus"] = ex.submit(_recommend_nexus, query, effective_slug, api_key)
     if src.get("workshop"):
         from .sources import steam_workshop as sw
         tasks["workshop"] = ex.submit(
@@ -1276,8 +1319,19 @@ def _recommend(query: str, cfg: Config) -> dict:
     from .sources import github as gh
     tasks["github"] = ex.submit(gh.search, query, cfg.game_name or slug or "", 5)
 
+    source_status = src.get("source_status", {})
     out = {"recommendations": [], "install_plan": [],
-           "sources_consulted": [], "sources_failed": {}}
+           "sources_attempted": list(tasks),
+           "sources_consulted": [], "sources_empty": [],
+           "sources_failed": {}, "sources_skipped": {},
+           "source_evidence": source_status}
+    for source_name in ("nexus", "workshop", "thunderstore", "gamebanana", "github"):
+        if source_name not in tasks:
+            state = source_status.get(source_name, {})
+            out["sources_skipped"][source_name] = {
+                "status": state.get("status", "not_detected"),
+                "reason": state.get("reason", "source was not selected for this search"),
+            }
     for name, fut in tasks.items():
         # nexus 是"搜索+逐个解析依赖"(5 个 mod 十几次 API 调用),比其他源慢一个量级
         budget = 90 if name == "nexus" else 25
@@ -1293,8 +1347,12 @@ def _recommend(query: str, cfg: Config) -> dict:
         if name == "nexus":
             out["recommendations"] = r["recommendations"]
             out["install_plan"] = r["install_plan"]
+            if not r["recommendations"]:
+                out["sources_empty"].append(name)
         else:
             out[name] = r
+            if not r:
+                out["sources_empty"].append(name)
     ex.shutdown(wait=False)
 
     total = len(out["recommendations"]) + sum(

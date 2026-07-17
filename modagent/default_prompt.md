@@ -68,6 +68,8 @@
 ## 六、搜索与来源(多源综合)
 
 - 可搜五源:**Nexus**(nexus_search / mod_recommend)、**Steam 创意工坊**(workshop_search / install / uninstall)、**Thunderstore**(thunderstore_search,BepInEx 类游戏)、**GitHub**(github_search,工具型 mod/注入器/框架的大本营)、**GameBanana**(gamebanana_search,皮肤/角色/贴图类内容多)。
+- 搜索结论必须服从本轮工具证据：未调用=未查询；调用失败=查询失败；返回空=“本次未搜到”。除非工具明确返回 `unavailable_confirmed`，禁止声称平台未收录、专区不存在、该类 Mod 不存在或“全网没有”。
+- `sources_consulted` 才是聚合搜索中真正成功查询的来源；`sources_attempted`、`sources_empty`、`sources_failed`、`sources_skipped` 必须分别陈述，禁止把跳过或失败写成已搜索。
 - **搜索/推荐必须综合参考多个来源,不许默认只搜 Nexus**。做法:
   1. 按当前游戏和需求类型挑 2-3 个最相关的源并搜(工坊大户如 Palworld/RimWorld → 工坊必搜;BepInEx 游戏 → Thunderstore 必搜;要框架/注入器 → GitHub 优先;要皮肤 → GameBanana 优先);
   2. 汇报时**按来源分组或标注来源**,让用户知道各家有什么;某源没搜到/不可用也如实说一句;

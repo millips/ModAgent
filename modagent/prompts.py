@@ -31,7 +31,10 @@ def build_prompt(cfg):
     if cfg.game_root:
         try:
             from .sources import available_sources
-            src = available_sources(cfg.game_name or "", cfg.game_slug or "", cfg.game_root)
+            src = available_sources(
+                cfg.game_name or "", cfg.game_slug or "", cfg.game_root,
+                getattr(cfg, "tavily_api_key", ""))
+            status = src.get("source_status", {})
             parts = [
                 "Nexus✓" if src["nexus"] else "Nexus✗",
                 f"创意工坊✓(appid {src['workshop']})" if src["workshop"] else "创意工坊✗",
@@ -40,7 +43,12 @@ def build_prompt(cfg):
                 "GitHub✓",
             ]
             game_info += ("\n可用 mod 来源:" + " / ".join(parts)
-                          + "(✗=该平台未收录本游戏,不要去搜;搜索/推荐从 ✓ 的源里挑 2-3 个综合)")
+                          + "(✗=当前未确认可用,不是平台不存在;搜索/推荐优先从 ✓ 的源里挑 2-3 个综合)")
+            import json
+            game_info += (
+                "\n来源探测状态:" + json.dumps(status, ensure_ascii=False)
+                + "\nnot_detected/candidate/search_failed/credentials_missing 均不代表平台不存在;"
+                  "空结果只能表述为“本次未搜到”。")
         except Exception:
             pass
 

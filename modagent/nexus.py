@@ -4,6 +4,7 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+import re
 from typing import Optional
 
 USER_AGENT = "ModAgent/0.1"
@@ -11,6 +12,103 @@ USER_AGENT = "ModAgent/0.1"
 # Cache for updated mod IDs per game (max 20 entries to prevent unbounded growth)
 _MOD_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _MOD_CACHE_MAX = 20
+_GAME_DISCOVERY_CACHE: dict[str, tuple[float, dict]] = {}
+_GAME_DISCOVERY_TTL = 24 * 3600
+
+
+def _normalise_game_name(name: str) -> str:
+    value = (name or "").strip()
+    value = re.sub(r"[™®©]", "", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def _game_name_tokens(name: str) -> set[str]:
+    return {
+        token for token in re.findall(r"[a-z0-9]+", _normalise_game_name(name).lower())
+        if token not in {"the", "game", "edition", "pc"} and len(token) > 1
+    }
+
+
+def discover_game(game_name: str, tavily_key: str = "") -> dict:
+    """Resolve an unknown game name to a Nexus game slug.
+
+    A missing static mapping is not evidence that Nexus has no page.  Discovery
+    is deliberately conservative: it returns ``not_detected`` rather than
+    claiming that a game is unavailable when search cannot prove it.
+    """
+    name = _normalise_game_name(game_name)
+    cache_key = name.casefold()
+    now = time.time()
+    cached = _GAME_DISCOVERY_CACHE.get(cache_key)
+    if cached and now - cached[0] < _GAME_DISCOVERY_TTL:
+        return dict(cached[1])
+
+    result = {
+        "status": "not_detected",
+        "slug": "",
+        "evidence": "",
+        "reason": "no verified Nexus game page was discovered",
+    }
+    if not name:
+        result["reason"] = "game name is empty"
+    elif not tavily_key:
+        result["status"] = "credentials_missing"
+        result["reason"] = "Tavily API key is required for unknown-game Nexus discovery"
+    else:
+        body = json.dumps({
+            "query": f'site:nexusmods.com/games "{name}"',
+            "search_depth": "basic",
+            "include_domains": ["nexusmods.com"],
+            "max_results": 8,
+        }).encode()
+        ctx = ssl._create_unverified_context()
+        try:
+            req = urllib.request.Request(
+                "https://api.tavily.com/search",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {tavily_key}",
+                },
+            )
+            payload = json.loads(
+                urllib.request.urlopen(req, context=ctx, timeout=12).read()
+            )
+            candidates = []
+            wanted = _game_name_tokens(name)
+            for item in payload.get("results", []):
+                url = item.get("url", "")
+                match = re.search(
+                    r"nexusmods\.com/games/([a-z0-9-]+)(?:/|$)",
+                    url,
+                    re.IGNORECASE,
+                )
+                if match:
+                    haystack = " ".join([
+                        item.get("title", ""),
+                        item.get("content", ""),
+                        url.replace("-", " "),
+                    ])
+                    seen = _game_name_tokens(haystack)
+                    overlap = len(wanted & seen)
+                    required = 1 if len(wanted) <= 1 else min(2, len(wanted))
+                    if overlap >= required:
+                        candidates.append((overlap, match.group(1).lower(), url))
+            if candidates:
+                _, slug, url = max(candidates, key=lambda item: item[0])
+                result = {
+                    "status": "available",
+                    "slug": slug,
+                    "evidence": url,
+                    "reason": "verified Nexus game page discovered",
+                }
+        except Exception as exc:
+            result["status"] = "search_failed"
+            result["reason"] = (str(exc) or type(exc).__name__)[:160]
+
+    _GAME_DISCOVERY_CACHE[cache_key] = (now, dict(result))
+    return result
 
 
 def _api(url: str, api_key: str) -> dict:
@@ -24,6 +122,8 @@ def _api(url: str, api_key: str) -> dict:
 
 def search(query: str, game_slug: str, api_key: str, cdp_port: int = 18888, game_id: int = 0, tavily_key: str = "") -> list[dict]:
     """搜索 Nexus Mods。Tavily → CDP → API Cache 三层回退。"""
+    if not (game_slug or "").strip():
+        raise ValueError("game_mapping_missing: Nexus game slug is empty")
 
     # 1. Tavily web search
     if tavily_key:

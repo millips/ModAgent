@@ -152,6 +152,164 @@ def build_correction_message(result: ValidationResult) -> dict:
     }
 
 
+_SEARCH_TOOL_SOURCE = {
+    "nexus_search": "nexus",
+    "workshop_search": "workshop",
+    "thunderstore_search": "thunderstore",
+    "github_search": "github",
+    "gamebanana_search": "gamebanana",
+}
+_SOURCE_LABELS = {
+    "nexus": ("nexus",),
+    "workshop": ("创意工坊", "workshop"),
+    "thunderstore": ("thunderstore",),
+    "github": ("github",),
+    "gamebanana": ("gamebanana",),
+}
+_SEARCHED_WORDS = ("已搜索", "搜过", "查过", "已查", "实际调用", "翻了")
+_ABSENCE_WORDS = (
+    "没有专区", "无专区", "未收录", "根本没有", "不存在",
+    "没有任何mod", "没有任何 mod", "全网没有",
+)
+_AVAILABILITY_WORDS = ("专区存在", "工坊存在", "支持创意工坊", "已经开了")
+_ALL_SOURCE_WORDS = ("所有来源", "全部来源", "所有渠道", "全网", "翻了一遍")
+
+
+def _search_ledger(persist: list[dict]) -> dict:
+    """Build a source ledger from real tool calls and their paired results."""
+    calls = {}
+    for message in persist or []:
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            calls[call.get("id", "")] = fn.get("name", "")
+
+    ledger = {
+        "attempted": set(),
+        "consulted": set(),
+        "empty": set(),
+        "failed": set(),
+        "skipped": set(),
+        "confirmed_unavailable": set(),
+        "confirmed_available": set(),
+    }
+    for message in persist or []:
+        if message.get("role") != "tool":
+            continue
+        tool_name = calls.get(message.get("tool_call_id", ""), "")
+        source = _SEARCH_TOOL_SOURCE.get(tool_name)
+        try:
+            payload = json.loads(message.get("content") or "{}")
+        except Exception:
+            payload = {}
+
+        if tool_name == "mod_recommend" and isinstance(payload, dict):
+            ledger["attempted"].update(payload.get("sources_attempted") or [])
+            ledger["consulted"].update(payload.get("sources_consulted") or [])
+            ledger["empty"].update(payload.get("sources_empty") or [])
+            ledger["failed"].update((payload.get("sources_failed") or {}).keys())
+            ledger["skipped"].update((payload.get("sources_skipped") or {}).keys())
+            for name, state in (payload.get("source_evidence") or {}).items():
+                if isinstance(state, dict) and state.get("status") == "unavailable_confirmed":
+                    ledger["confirmed_unavailable"].add(name)
+                if isinstance(state, dict) and state.get("status") == "available":
+                    ledger["confirmed_available"].add(name)
+            continue
+        if not source:
+            continue
+        ledger["attempted"].add(source)
+        if isinstance(payload, dict) and (
+            payload.get("error") or payload.get("searched") is False
+        ):
+            ledger["failed"].add(source)
+        else:
+            ledger["consulted"].add(source)
+            if (
+                isinstance(payload, dict)
+                and payload.get("status") == "search_empty"
+            ) or payload == []:
+                ledger["empty"].add(source)
+    return ledger
+
+
+def validate_search_report(report_text: str, persist: list[dict]) -> ValidationResult:
+    """Reject source claims that are stronger than this turn's tool evidence."""
+    text = (report_text or "").casefold()
+    ledger = _search_ledger(persist)
+    violations: list[ReportViolation] = []
+
+    for source, labels in _SOURCE_LABELS.items():
+        mentioned = any(label.casefold() in text for label in labels)
+        if not mentioned:
+            continue
+        says_searched = any(word.casefold() in text for word in _SEARCHED_WORDS)
+        if says_searched and source not in ledger["consulted"]:
+            violations.append(ReportViolation(
+                "unconsulted_source", source,
+                "回复声称已搜索，但本轮工具证据中该来源未成功查询"))
+        says_absent = any(word.casefold() in text for word in _ABSENCE_WORDS)
+        for match in re.finditer(r"没有[^，。；;\n]{0,24}(?:mod|模组)", text, re.IGNORECASE):
+            fragment = match.group(0)
+            if not any(word in fragment for word in ("没搜到", "没有搜到", "未搜到")):
+                says_absent = True
+        if says_absent and source not in ledger["confirmed_unavailable"]:
+            violations.append(ReportViolation(
+                "unsupported_absence", source,
+                "空结果、跳过或探测失败不能证明平台/专区/Mod 不存在"))
+        says_available = any(word.casefold() in text for word in _AVAILABILITY_WORDS)
+        if says_available and source not in ledger["confirmed_available"]:
+            violations.append(ReportViolation(
+                "unsupported_availability", source,
+                "Steam appid 或一次搜索尝试不能证明平台专区可用"))
+
+    if any(word.casefold() in text for word in _ALL_SOURCE_WORDS):
+        all_sources = set(_SOURCE_LABELS)
+        if ledger["consulted"] != all_sources:
+            violations.append(ReportViolation(
+                "unsupported_all_sources", ",".join(sorted(ledger["consulted"])),
+                "并未成功查询全部来源"))
+
+    return ValidationResult(ok=not violations, violations=violations)
+
+
+def build_search_correction_message(result: ValidationResult) -> dict:
+    return {
+        "role": "user",
+        "content": (
+            "[系统纠偏] 搜索汇报与本轮真实工具证据不一致："
+            + result.summary()
+            + "。请按实际来源状态重写：未调用=未查询；失败=查询失败；"
+              "空结果=本次未搜到。不得把这些情况写成平台未收录、专区不存在、"
+              "全网没有或所有来源都已搜索。只重写最终汇报，不要提及本次纠偏。"
+        ),
+    }
+
+
+def build_search_fallback(persist: list[dict]) -> str:
+    """Deterministic safe report used when the model ignores correction."""
+    ledger = _search_ledger(persist)
+    labels = {
+        "nexus": "Nexus",
+        "workshop": "Steam 创意工坊",
+        "thunderstore": "Thunderstore",
+        "github": "GitHub",
+        "gamebanana": "GameBanana",
+    }
+    lines = ["本轮搜索结果按实际工具记录汇总："]
+    for source in sorted(ledger["consulted"]):
+        if source in ledger["empty"]:
+            lines.append(f"- {labels.get(source, source)}：已查询，本次未搜到匹配结果。")
+        else:
+            lines.append(f"- {labels.get(source, source)}：已成功查询，请以工具返回结果为准。")
+    for source in sorted(ledger["failed"]):
+        lines.append(f"- {labels.get(source, source)}：查询失败，不能据此判断是否存在相关 Mod。")
+    for source in sorted(ledger["skipped"] - ledger["consulted"] - ledger["failed"]):
+        lines.append(f"- {labels.get(source, source)}：本轮未查询。")
+    lines.append("以上空结果仅代表本次搜索未命中，不能证明平台未收录、专区不存在或全网没有相关 Mod。")
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 状态断言校验(v1)——干掉"该查状态却用记忆瞎报"的幻觉
 #
