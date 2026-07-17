@@ -22,6 +22,7 @@ def check(label, condition, detail=""):
 originals = {
     "discover_game": nexus.discover_game,
     "nexus_search": nexus.search,
+    "nexus_get_detail": nexus.get_detail,
     "resolve_deps": nexus.resolve_deps,
     "workshop_resolve": workshop.resolve_appid,
     "workshop_search": workshop.search,
@@ -65,6 +66,17 @@ try:
           "nexus" in result["sources_consulted"]
           and "nexus" in result["sources_empty"])
 
+    detail_calls = []
+    nexus.get_detail = lambda mid, slug, key, cdp_port=18888: (
+        detail_calls.append((mid, slug)) or
+        {"mod_id": mid, "name": "Verified detail"}
+    )
+    detail = json.loads(tools.execute(
+        "nexus_get_detail", {"mod_id": 2429}, cfg))
+    check("B3 detail reuses dynamically discovered Nexus slug",
+          detail.get("name") == "Verified detail"
+          and detail_calls == [(2429, "generic-unknown-game")])
+
     persist = [
         {
             "role": "assistant",
@@ -105,9 +117,22 @@ try:
     check("C6 deterministic fallback distinguishes empty and skipped",
           "Nexus：已查询，本次未搜到" in fallback
           and "Steam 创意工坊：本轮未查询" in fallback)
+    detail_404 = persist + [
+        {"role": "assistant", "tool_calls": [{
+            "id": "detail-404", "type": "function",
+            "function": {"name": "nexus_get_detail", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "detail-404",
+         "content": json.dumps({"error": "HTTP Error 404: Not Found"})},
+    ]
+    invented_cause = validator.validate_search_report(
+        "Nexus API 对成人内容的访问受限，工具侧绕不过去。", detail_404)
+    check("C7 a 404 cannot become an adult-content restriction",
+          not invented_cause.ok)
 finally:
     nexus.discover_game = originals["discover_game"]
     nexus.search = originals["nexus_search"]
+    nexus.get_detail = originals["nexus_get_detail"]
     nexus.resolve_deps = originals["resolve_deps"]
     workshop.resolve_appid = originals["workshop_resolve"]
     workshop.search = originals["workshop_search"]

@@ -30,7 +30,45 @@ def _game_name_tokens(name: str) -> set[str]:
     }
 
 
-def discover_game(game_name: str, tavily_key: str = "") -> dict:
+def _match_game_catalog(game_name: str, games) -> dict | None:
+    """Match a display name against Nexus' official game catalogue."""
+    wanted = _game_name_tokens(game_name)
+    if not wanted:
+        return None
+    candidates = []
+    for item in games if isinstance(games, list) else []:
+        if not isinstance(item, dict):
+            continue
+        slug = str(
+            item.get("domain_name") or item.get("domainName")
+            or item.get("slug") or ""
+        ).strip().lower()
+        title = str(item.get("name") or "")
+        if not slug:
+            continue
+        seen = _game_name_tokens(f"{title} {slug}")
+        overlap = len(wanted & seen)
+        # Require all meaningful words for short names, and nearly all for long
+        # names. This avoids mapping similarly named sequels to each other.
+        required = len(wanted) if len(wanted) <= 3 else len(wanted) - 1
+        if overlap >= required:
+            exact = int(_normalise_game_name(title).casefold()
+                        == _normalise_game_name(game_name).casefold())
+            candidates.append((exact, overlap, slug, title))
+    if not candidates:
+        return None
+    _, _, slug, title = max(candidates)
+    return {
+        "status": "available",
+        "slug": slug,
+        "game_id": int(item.get("id") or 0),
+        "evidence": f"Nexus API games catalogue: {title}",
+        "reason": "verified in Nexus official game catalogue",
+    }
+
+
+def discover_game(game_name: str, tavily_key: str = "",
+                  nexus_api_key: str = "") -> dict:
     """Resolve an unknown game name to a Nexus game slug.
 
     A missing static mapping is not evidence that Nexus has no page.  Discovery
@@ -38,7 +76,10 @@ def discover_game(game_name: str, tavily_key: str = "") -> dict:
     claiming that a game is unavailable when search cannot prove it.
     """
     name = _normalise_game_name(game_name)
-    cache_key = name.casefold()
+    # Credential availability is part of the cache key. Otherwise an early
+    # credentials_missing result would hide a valid discovery for 24 hours
+    # after the user configured their API keys.
+    cache_key = (name.casefold(), bool(tavily_key), bool(nexus_api_key))
     now = time.time()
     cached = _GAME_DISCOVERY_CACHE.get(cache_key)
     if cached and now - cached[0] < _GAME_DISCOVERY_TTL:
@@ -52,10 +93,27 @@ def discover_game(game_name: str, tavily_key: str = "") -> dict:
     }
     if not name:
         result["reason"] = "game name is empty"
-    elif not tavily_key:
-        result["status"] = "credentials_missing"
-        result["reason"] = "Tavily API key is required for unknown-game Nexus discovery"
-    else:
+    elif nexus_api_key:
+        try:
+            catalog = _api("https://api.nexusmods.com/v1/games.json",
+                           nexus_api_key)
+            games = catalog if isinstance(catalog, list) else catalog.get("data", [])
+            matched = _match_game_catalog(name, games)
+            if matched:
+                result = matched
+        except Exception as exc:
+            result["status"] = "search_failed"
+            result["reason"] = f"Nexus game catalogue failed: {exc}"[:160]
+
+    if name and result.get("status") != "available" and tavily_key:
+        # Tavily remains a fallback when the official catalogue is unavailable
+        # or has not yet indexed a newly-created game page.
+        result = {
+            "status": "not_detected",
+            "slug": "",
+            "evidence": "",
+            "reason": "no verified Nexus game page was discovered",
+        }
         body = json.dumps({
             "query": f'site:nexusmods.com/games "{name}"',
             "search_depth": "basic",
@@ -106,6 +164,11 @@ def discover_game(game_name: str, tavily_key: str = "") -> dict:
         except Exception as exc:
             result["status"] = "search_failed"
             result["reason"] = (str(exc) or type(exc).__name__)[:160]
+    elif name and result.get("status") != "available" and not nexus_api_key:
+        result["status"] = "credentials_missing"
+        result["reason"] = (
+            "Nexus or Tavily API key is required for unknown-game discovery"
+        )
 
     _GAME_DISCOVERY_CACHE[cache_key] = (now, dict(result))
     return result

@@ -233,6 +233,28 @@ def _search_ledger(persist: list[dict]) -> dict:
     return ledger
 
 
+def _has_explicit_nexus_restriction_evidence(persist: list[dict]) -> bool:
+    calls = {}
+    for message in persist or []:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                calls[call.get("id", "")] = (
+                    (call.get("function") or {}).get("name", "")
+                )
+        elif (
+            message.get("role") == "tool"
+            and calls.get(message.get("tool_call_id", ""))
+            in {"nexus_get_detail", "mod_download"}
+        ):
+            content = (message.get("content") or "").casefold()
+            if any(marker in content for marker in (
+                "adult content", "content blocking",
+                "permission denied", "http 403", "status 403",
+            )):
+                return True
+    return False
+
+
 def validate_search_report(report_text: str, persist: list[dict]) -> ValidationResult:
     """Reject source claims that are stronger than this turn's tool evidence."""
     text = (report_text or "").casefold()
@@ -269,6 +291,18 @@ def validate_search_report(report_text: str, persist: list[dict]) -> ValidationR
             violations.append(ReportViolation(
                 "unsupported_all_sources", ",".join(sorted(ledger["consulted"])),
                 "并未成功查询全部来源"))
+
+    causal_claim = (
+        any(word in text for word in ("成人内容", "adult content", "nsfw"))
+        and any(word in text for word in (
+            "受限", "限制", "过滤", "攔", "拦", "权限",
+            "需要登录", "绕不过", "content blocking",
+        ))
+    )
+    if causal_claim and not _has_explicit_nexus_restriction_evidence(persist):
+        violations.append(ReportViolation(
+            "unsupported_error_cause", "nexus",
+            "404 或详情读取失败不能证明成人内容过滤、登录限制、下架或权限问题"))
 
     return ValidationResult(ok=not violations, violations=violations)
 
