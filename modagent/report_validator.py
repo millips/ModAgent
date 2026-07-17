@@ -170,6 +170,8 @@ _SEARCHED_WORDS = ("已搜索", "搜过", "查过", "已查", "实际调用", "�
 _ABSENCE_WORDS = (
     "没有专区", "无专区", "未收录", "根本没有", "不存在",
     "没有任何mod", "没有任何 mod", "全网没有",
+    "不在github", "不在 github", "不在nexus", "不在 nexus",
+    "没有放在github", "没有放在 github", "没有放在nexus", "没有放在 nexus",
 )
 _AVAILABILITY_WORDS = ("专区存在", "工坊存在", "支持创意工坊", "已经开了")
 _ALL_SOURCE_WORDS = ("所有来源", "全部来源", "所有渠道", "全网", "翻了一遍")

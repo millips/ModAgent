@@ -105,6 +105,11 @@ try:
         "Nexus 没有专区，Steam 创意工坊也确定未收录。", persist)
     check("C3 unsupported platform absence blocked", not false_nexus.ok)
 
+    false_github_location = validator.validate_search_report(
+        "Fluffy Mod Manager 不在 GitHub 上，只能去作者官网。", persist)
+    check("C3b empty GitHub result cannot prove a project is not on GitHub",
+          not false_github_location.ok)
+
     uncalled = validator.validate_search_report(
         "GameBanana 已搜索，但没有结果。", persist)
     check("C4 unconsulted source claim blocked", not uncalled.ok)
