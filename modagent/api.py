@@ -34,7 +34,7 @@ PROMPT_REFERENCED_TOOLS = {
     "mod_install", "mod_install_batch", "mod_install_custom", "mod_uninstall", "mod_update_check", "mod_update",
     "mod_disable", "mod_enable", "mod_dependency_set",
     "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete", "conflict_check",
-    "list_local_mods",
+    "list_local_mods", "tool_extract",
     "get_installed", "read_readme", "game_diagnose", "mod_patch",
     "scan_games", "scan_existing_mods", "import_existing_mods",
     "collection_view", "download_from_url", "thunderstore_search",
@@ -613,6 +613,35 @@ def open_dropbox():
         return {"ok": True, "path": path}
     except Exception as e:
         return {"ok": False, "path": path, "error": str(e)}
+
+
+def _open_folder(path: str):
+    import subprocess
+    os.makedirs(path, exist_ok=True)
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return {"ok": True, "path": path}
+    except Exception as e:
+        return {"ok": False, "path": path, "error": str(e)}
+
+
+@app.post("/downloads/open")
+def open_downloads():
+    """Open the current game's managed Mod download cache."""
+    from . import downloader
+    return _open_folder(downloader.ensure_downloads_dir(cfg.game_slug or "_unknown"))
+
+
+@app.post("/tools/open")
+def open_tools():
+    """Open ModAgent's managed standalone-tools directory."""
+    from . import downloader
+    return _open_folder(downloader.ensure_tools_dir())
 
 
 @app.get("/health")

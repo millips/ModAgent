@@ -2,7 +2,10 @@ import asyncio
 import glob
 import json
 import os
+import re
+import shutil
 import ssl
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -16,6 +19,7 @@ USER_AGENT = "ModAgent/1.0"
 # 投放文件夹(靶向文件夹):放在用户数据区,给"没法自动搜/下的站"(三宫六院/3DM/网盘/私享)
 # 一个统一入口——用户手动下载的 mod 扔进来,ModAgent 扫描→透视→mod_install_custom 安装。
 DROPBOX_DIR = os.path.join(CONFIG_DIR, "dropbox")
+TOOLS_DIR = os.path.join(CONFIG_DIR, "tools")
 
 
 def ensure_downloads_dir(game_slug: str) -> str:
@@ -28,6 +32,84 @@ def ensure_dropbox_dir(game_slug: str) -> str:
     path = os.path.join(DROPBOX_DIR, game_slug or "_unknown")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def ensure_tools_dir() -> str:
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    return TOOLS_DIR
+
+
+def extract_external_tool(archive_path: str, display_name: str = "") -> dict:
+    """Extract a standalone modding tool into ModAgent's managed tools folder."""
+    from . import installer
+
+    archive_path = os.path.abspath(archive_path or "")
+    allowed_roots = (
+        os.path.abspath(DOWNLOADS_DIR),
+        os.path.abspath(DROPBOX_DIR),
+    )
+    if not archive_path or not os.path.isfile(archive_path):
+        raise FileNotFoundError(f"外部工具压缩包不存在: {archive_path}")
+    if not any(
+        os.path.commonpath((archive_path, root)) == root
+        for root in allowed_roots
+    ):
+        raise RuntimeError("外部工具只允许从 ModAgent 下载缓存或投放文件夹解压")
+
+    raw_name = display_name or os.path.splitext(os.path.basename(archive_path))[0]
+    safe_name = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", raw_name).strip("._")
+    if not safe_name:
+        safe_name = "external_tool"
+    tools_root = ensure_tools_dir()
+    target = os.path.abspath(os.path.join(tools_root, safe_name[:100]))
+    if os.path.commonpath((target, os.path.abspath(tools_root))) != os.path.abspath(tools_root):
+        raise RuntimeError("外部工具目标目录越界")
+
+    if os.path.isdir(target):
+        executables = [
+            os.path.join(root, filename)
+            for root, _, files in os.walk(target)
+            for filename in files
+            if filename.lower().endswith(".exe")
+        ]
+        return {
+            "status": "already_extracted",
+            "archive_path": archive_path,
+            "tool_dir": target,
+            "executables": executables[:20],
+        }
+
+    temp_dir = tempfile.mkdtemp(prefix=".extract-", dir=tools_root)
+    try:
+        members = installer.extract_archive(archive_path, temp_dir)
+        entries = [
+            entry for entry in os.listdir(temp_dir)
+            if entry.lower() != "__macosx"
+        ]
+        source = temp_dir
+        if len(entries) == 1 and os.path.isdir(os.path.join(temp_dir, entries[0])):
+            source = os.path.join(temp_dir, entries[0])
+        os.replace(source, target)
+        if source != temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+    executables = [
+        os.path.join(root, filename)
+        for root, _, files in os.walk(target)
+        for filename in files
+        if filename.lower().endswith(".exe")
+    ]
+    return {
+        "status": "extracted",
+        "archive_path": archive_path,
+        "tool_dir": target,
+        "file_count": len(members),
+        "executables": executables[:20],
+        "note": "已解压但未自动运行可执行文件；首次启动和工具自身的游戏选择由用户确认。",
+    }
 
 
 # ── Preflight ──
