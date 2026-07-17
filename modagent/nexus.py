@@ -248,6 +248,149 @@ def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
     return results
 
 
+_TOOL_QUERY_WORDS = (
+    "manager", "mod manager", "loader", "mod loader", "framework",
+    "injector", "patcher", "tool", "utility", "ue4ss", "bepinex",
+    "melonloader", "reframework",
+    "管理器", "加载器", "框架", "注入器", "工具", "前置",
+)
+
+
+def is_tool_query(query: str) -> bool:
+    """Return whether a query likely names a cross-game tool/framework."""
+    text = (query or "").casefold()
+    return any(word in text for word in _TOOL_QUERY_WORDS)
+
+
+def search_tool_entries(query: str, tavily_key: str, api_key: str = "",
+                        cdp_port: int = 18888, limit: int = 10) -> list[dict]:
+    """Search Nexus globally for duplicate/canonical tool entries.
+
+    Game pages often retain an old copy while the maintained tool moves to
+    ``site/mods/<id>``. Each result therefore carries its own Nexus slug.
+    """
+    if not tavily_key or not (query or "").strip():
+        return []
+    body = json.dumps({
+        "query": f'site:nexusmods.com "{query.strip()}" mod manager tool',
+        "search_depth": "basic",
+        "include_domains": ["nexusmods.com"],
+        "max_results": max(1, min(limit, 20)),
+    }).encode()
+    ctx = ssl._create_unverified_context()
+    try:
+        req = urllib.request.Request(
+            "https://api.tavily.com/search", data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {tavily_key}",
+            },
+        )
+        payload = json.loads(
+            urllib.request.urlopen(req, context=ctx, timeout=10).read()
+        )
+    except Exception:
+        return []
+
+    found = []
+    seen = set()
+    for item in payload.get("results", []):
+        url = item.get("url", "")
+        match = re.search(
+            r"nexusmods\.com/(?:games/)?([a-z0-9_-]+)/mods/(\d+)",
+            url, re.IGNORECASE,
+        )
+        if not match:
+            continue
+        nexus_slug, mod_id = match.group(1).lower(), int(match.group(2))
+        key = (nexus_slug, mod_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        result = {
+            "mod_id": mod_id,
+            "nexus_slug": nexus_slug,
+            "url": f"https://www.nexusmods.com/{nexus_slug}/mods/{mod_id}",
+            "name": item.get("title", "").split(" at ")[0].strip()[:100],
+            "summary": item.get("content", "")[:240],
+            "source_scope": "nexus_global_tool_search",
+        }
+        if api_key:
+            try:
+                detail = get_detail(mod_id, nexus_slug, api_key, cdp_port)
+                result.update({
+                    "name": detail.get("name") or result["name"],
+                    "summary": detail.get("summary") or result["summary"],
+                    "version": detail.get("version", ""),
+                    "updated_time": detail.get("updated_at", ""),
+                    "author": detail.get("author", ""),
+                    "endorsement_count": detail.get("endorsements", 0),
+                    "downloads": detail.get("downloads", 0),
+                    "file_id": detail.get("file_id"),
+                    "staleness": detail.get("staleness"),
+                })
+            except Exception:
+                pass
+        found.append(result)
+    return found
+
+
+def rank_duplicate_entries(results: list[dict]) -> list[dict]:
+    """Mark the newest same-name/same-author Nexus entry as canonical."""
+    import datetime as _dt
+
+    def normalized(value):
+        return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
+
+    def timestamp(item):
+        raw = item.get("updated_time") or item.get("updated") or ""
+        try:
+            return _dt.datetime.fromisoformat(
+                str(raw).replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
+            return 0
+
+    groups = {}
+    for item in results:
+        name = normalized(item.get("name"))
+        if name:
+            groups.setdefault(name, []).append(item)
+
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        known_authors = {
+            normalized(item.get("author")) for item in group
+            if normalized(item.get("author"))
+        }
+        # Exact title plus matching/unknown author is enough to compare mirrors.
+        # If two explicitly different authors reused a generic title, leave them
+        # separate rather than declaring one superseded.
+        if len(known_authors) > 1:
+            continue
+        winner = max(group, key=lambda item: (
+            timestamp(item),
+            item.get("nexus_slug") == "site",
+            str(item.get("version") or ""),
+        ))
+        for item in group:
+            item["duplicate_group"] = True
+            item["canonical_candidate"] = item is winner
+            if item is not winner:
+                item["superseded_by"] = {
+                    "mod_id": winner.get("mod_id"),
+                    "nexus_slug": winner.get("nexus_slug"),
+                    "version": winner.get("version", ""),
+                    "updated": winner.get("updated_time")
+                               or winner.get("updated", ""),
+                }
+    return sorted(results, key=lambda item: (
+        not item.get("canonical_candidate", False),
+        -timestamp(item),
+    ))
+
+
 def _search_api(query: str, game_slug: str, api_key: str, game_id: int) -> list[dict]:
     """用 /mods/updated.json 拿全量 mod_id → 本地缓存 → 按名称匹配 → 补全详情。"""
     cache_key = f"{game_slug}_{game_id}"
