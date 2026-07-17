@@ -21,8 +21,8 @@ def build_prompt(cfg):
         game_info = "（用户尚未选择游戏，请先让其在右上角选择游戏）"
     elif (cfg.game_slug or "").startswith("local_"):
         game_info = (f"《{cfg.game_name}》（目录: {cfg.game_root}）"
-                     f"——⚠️ 该游戏不在 Nexus Mods 上，无法用 nexus_search/mod_download 搜索或下载 Nexus mod；"
-                     f"可处理本地已有 mod、快照等操作。")
+                     f"——该游戏尚未建立静态 Nexus 映射，将根据游戏名动态探测 Nexus 等来源；"
+                     f"探测失败或搜索为空都不代表平台未收录。仍可处理本地已有 mod、快照等操作。")
     else:
         game_info = f"《{cfg.game_name}》（Nexus slug: {cfg.game_slug}, 目录: {cfg.game_root}）"
 

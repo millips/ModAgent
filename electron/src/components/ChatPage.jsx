@@ -67,11 +67,15 @@ export default function ChatPage({ status, games, onGameChange, toast, api, onRe
   // 截断时把后端会话历史覆盖为指定快照
   const syncHistory = async (sid, msgs) => {
     try {
-      await fetch(`${api}/sessions/${sid}/messages`, {
+      const response = await fetch(`${api}/sessions/${sid}/messages`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: buildHistory(msgs) }),
       })
-    } catch (_) {}
+      if (!response.ok) throw new Error(`history sync failed: ${response.status}`)
+      return true
+    } catch (_) {
+      return false
+    }
   }
 
   const selectSession = async (s) => {
@@ -204,7 +208,13 @@ export default function ChatPage({ status, games, onGameChange, toast, api, onRe
     }
 
     // 若是编辑/重新生成带来的截断，先把后端历史同步成截断后的快照
-    if (baseMessages) await syncHistory(sid, baseMessages)
+    if (baseMessages) {
+      const synced = await syncHistory(sid, baseMessages)
+      if (!synced) {
+        toast('无法截断旧回复，重新生成已取消', 'error')
+        return
+      }
+    }
 
     setStreamProgress(0)
     const userMsg = { id: mkId(), role: 'user', content: text }

@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -191,6 +191,10 @@ class SessionUpdate(BaseModel):
     title: str = ""
 
 
+class SessionMessagesUpdate(BaseModel):
+    messages: list[dict] = Field(default_factory=list)
+
+
 class ConfigUpdate(BaseModel):
     api_key: Optional[str] = None
     nexus_api_key: Optional[str] = None
@@ -314,6 +318,7 @@ def update_config(body: ConfigUpdate):
 @app.get("/mods")
 def list_mods(game_slug: str = ""):
     mods = db.get_installed_mods(game_slug if game_slug else cfg.game_slug)
+
     return [{
         "id": m.id, "name": m.name, "version": m.version,
         "load_order": m.load_order, "snapshot_id": m.snapshot_id,
@@ -435,6 +440,8 @@ def mods_reconcile(game_slug: str = ""):
             files = json.loads(m.files_installed or "[]")
         except Exception:
             files = []
+        # A disabled copy is still present and managed; do not report it as a
+        # missing file during ledger reconciliation.
         missing = [f for f in files if not os.path.exists(f) and not os.path.exists(f + ".disabled")]
         if not files or missing:
             issues.append({"mod_id": m.id, "name": m.name,
@@ -557,6 +564,26 @@ def update_session(sid: str, req: SessionUpdate):
     return {"ok": True}
 
 
+@app.put("/sessions/{sid}/messages")
+def update_session_message_history(sid: str, req: SessionMessagesUpdate):
+    if not db.get_session(sid):
+        raise HTTPException(404, "Session not found")
+    if len(req.messages) > 200:
+        raise HTTPException(400, "Too many messages")
+    clean = []
+    for message in req.messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            raise HTTPException(400, "History only accepts user/assistant text messages")
+        clean.append({"role": role, "content": content})
+    db.update_session_messages(sid, clean)
+    if sid in agents:
+        agents[sid].history = list(clean)
+        _agent_last_used[sid] = time.time()
+    return {"ok": True, "messages_count": len(clean)}
+
+
 @app.delete("/sessions/{sid}")
 def delete_session(sid: str):
     db.delete_session(sid)
@@ -591,6 +618,13 @@ def open_dropbox():
 @app.get("/health")
 def health():
     return {"ok": True, "timestamp": time.time()}
+
+
+@app.get("/downloads/status")
+def downloads_status():
+    """Expose the in-process download queue to the authenticated renderer."""
+    from . import progress
+    return progress.snapshot()
 
 
 @app.get("/static/bg/{filename}")
