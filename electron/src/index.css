@@ -1,0 +1,146 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+
+.app-page-stage {
+  position: relative;
+  isolation: isolate;
+}
+
+.app-page-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(6px);
+  transition:
+    opacity 150ms ease-out,
+    transform 210ms cubic-bezier(.2, .72, .2, 1),
+    visibility 0s linear 210ms;
+}
+
+.app-page-layer.is-active {
+  z-index: 2;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0);
+  transition-delay: 70ms, 70ms, 0s;
+}
+
+.app-page-atmosphere {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-page-layer {
+    transform: none;
+    transition-duration: 1ms;
+    transition-delay: 0s;
+  }
+}
+
+@layer base {
+  * { scrollbar-width: thin; scrollbar-color: #30363d transparent; }
+  *::-webkit-scrollbar { width: 4px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+  *::-webkit-scrollbar-thumb:hover { background: #484f58; }
+  body { overflow: hidden; }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background:
+      linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+    background-size: 32px 32px;
+    pointer-events: none;
+  }
+
+  body.has-bg::before { background: none; }
+  body.has-bg {
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+  }
+
+  body.has-bg::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background: rgba(13, 17, 23, 0.42);
+    pointer-events: none;
+  }
+  body.default-bg::after { background: rgba(13, 17, 23, 0.18); }
+
+  body.has-bg .bg-surface-900 { background-color: rgba(13, 17, 23, 0.50) !important; }
+  body.has-bg .bg-surface-800 { background-color: rgba(22, 27, 34, 0.52) !important; backdrop-filter: blur(10px); }
+  body.has-bg .card-cyber { background-color: rgba(22, 27, 34, 0.45) !important; backdrop-filter: blur(6px); }
+  body.has-bg .input-cyber { background-color: rgba(13, 17, 23, 0.45) !important; }
+
+  @keyframes shake {
+    0%,100% { transform: translateX(0); }
+    20% { transform: translateX(-4px); }
+    40% { transform: translateX(4px); }
+    60% { transform: translateX(-2px); }
+    80% { transform: translateX(2px); }
+  }
+  .shake { animation: shake 0.3s ease; }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  .skeleton {
+    background: linear-gradient(90deg, #21262d 25%, #30363d 50%, #21262d 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: 6px;
+  }
+}
+
+@layer components {
+  .btn-cyber {
+    @apply px-4 py-2 rounded-md text-sm font-medium transition-all duration-150
+           bg-cyber-blue/20 text-cyber-cyan border border-cyber-cyan/30
+           hover:bg-cyber-blue/30 hover:border-cyber-cyan/50
+           active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply px-3 py-1.5 rounded-md text-sm text-surface-500 transition-all duration-150
+           hover:bg-surface-700 hover:text-white;
+  }
+  .btn-danger {
+    @apply px-3 py-1.5 rounded-md text-sm text-cyber-red transition-all duration-150
+           hover:bg-cyber-red/10;
+  }
+  .input-cyber {
+    @apply w-full px-3 py-2 rounded-md text-sm bg-surface-800 border border-surface-600
+           text-white placeholder-surface-500 outline-none transition-all duration-150
+           focus:border-cyber-cyan/50;
+  }
+  .card-cyber {
+    @apply bg-surface-800 border border-surface-600 rounded-lg p-4 shadow-lg shadow-black/20;
+  }
+  .badge { @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium; }
+  .badge-update { @apply badge bg-cyber-orange/15 text-cyber-orange; }
+  .badge-cyan { @apply badge bg-cyber-cyan/15 text-cyber-cyan; }
+  .badge-green { @apply badge bg-cyber-green/15 text-cyber-green; }
+  .badge-red { @apply badge bg-cyber-red/15 text-cyber-red; }
+  .badge-purple { @apply badge bg-cyber-purple/15 text-cyber-purple; }
+}

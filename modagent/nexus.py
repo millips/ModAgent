@@ -1,0 +1,301 @@
+import json
+import ssl
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
+from typing import Optional
+
+USER_AGENT = "ModAgent/0.1"
+
+# Cache for updated mod IDs per game (max 20 entries to prevent unbounded growth)
+_MOD_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_MOD_CACHE_MAX = 20
+
+
+def _api(url: str, api_key: str) -> dict:
+    ctx = ssl._create_unverified_context()
+    req = urllib.request.Request(url, headers={
+        "apikey": api_key, "Accept": "application/json", "User-Agent": USER_AGENT,
+    })
+    with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def search(query: str, game_slug: str, api_key: str, cdp_port: int = 18888, game_id: int = 0, tavily_key: str = "") -> list[dict]:
+    """搜索 Nexus Mods。Tavily → CDP → API Cache 三层回退。"""
+
+    # 1. Tavily web search
+    if tavily_key:
+        result = _search_via_tavily(query, game_slug, tavily_key)
+        if result:
+            return result
+
+    # 2. CDP simulated search
+    result = _search_cdp(query, game_slug, api_key, cdp_port, game_id)
+    if result and not (len(result) == 1 and result[0].get("error")):
+        return result
+
+    # 3. API cache index
+    return _search_api(query, game_slug, api_key, game_id)
+
+
+def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
+    """通过 Tavily 搜索 Nexus Mods，从 URL 提取 mod_id。"""
+    import re, ssl
+
+    if not api_key:
+        return []
+
+    search_query = f"site:nexusmods.com/{game_slug}/mods {query}"
+    body = json.dumps({
+        "query": search_query,
+        "search_depth": "basic",
+        "include_domains": ["nexusmods.com"],
+        "max_results": 10,
+    }).encode()
+
+    ctx = ssl._create_unverified_context()
+    try:
+        req = urllib.request.Request(
+            "https://api.tavily.com/search",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        resp = json.loads(urllib.request.urlopen(req, context=ctx, timeout=10).read())
+    except Exception:
+        return []
+
+    results = []
+    for item in resp.get("results", []):
+        url = item.get("url", "")
+        m = re.search(rf"/{game_slug}/mods/(\d+)", url)
+        if m:
+            results.append({
+                "mod_id": int(m.group(1)),
+                "name": item.get("title", "").split(" at ")[0].strip()[:80],
+                "summary": item.get("content", "")[:200],
+                "endorsements": 0,
+                "version": "",
+                "updated": "",
+            })
+    return results
+
+
+def _search_api(query: str, game_slug: str, api_key: str, game_id: int) -> list[dict]:
+    """用 /mods/updated.json 拿全量 mod_id → 本地缓存 → 按名称匹配 → 补全详情。"""
+    cache_key = f"{game_slug}_{game_id}"
+    now = time.time()
+
+    if cache_key in _MOD_CACHE:
+        ts, mods = _MOD_CACHE[cache_key]
+        if now - ts < 3600:
+            return _match_and_detail(query, mods, game_slug, api_key)
+
+    try:
+        url = f"https://api.nexusmods.com/v1/games/{game_slug}/mods/updated.json?game_id={game_id}&period=1m"
+        data = _api(url, api_key)
+
+        mods = []
+        for item in (data if isinstance(data, list) else data.get("data", [])):
+            mod_id = item.get("mod_id") or item.get("id")
+            if mod_id:
+                mods.append({"mod_id": int(mod_id)})
+
+        if mods:
+            if len(_MOD_CACHE) >= _MOD_CACHE_MAX:
+                oldest = min(_MOD_CACHE, key=lambda k: _MOD_CACHE[k][0])
+                del _MOD_CACHE[oldest]
+            _MOD_CACHE[cache_key] = (now, mods)
+            return _match_and_detail(query, mods, game_slug, api_key)
+    except Exception:
+        pass
+
+    return []
+
+
+def _match_and_detail(query: str, mods: list, game_slug: str, api_key: str) -> list[dict]:
+    """从缓存的 mod_id 列表中按名称匹配，补全详情。"""
+    if not query.strip():
+        return mods[:10]
+
+    q = query.lower().replace(" ", "").replace("_", "").replace("-", "")
+    candidates = mods[:20]
+
+    matched = []
+    for m in candidates:
+        try:
+            detail = get_mod(m["mod_id"], game_slug, api_key)
+            name = detail.get("name", "")
+            name_clean = name.lower().replace(" ", "").replace("_", "").replace("-", "")
+            if q in name_clean:
+                matched.append({
+                    "mod_id": m["mod_id"],
+                    "name": name,
+                    "summary": detail.get("summary", ""),
+                    "endorsements": detail.get("endorsement_count", 0),
+                    "version": detail.get("version", ""),
+                    "updated": detail.get("updated_time", ""),
+                })
+                if len(matched) >= 10:
+                    break
+        except Exception:
+            continue
+
+    return matched
+
+
+def _search_cdp(query: str, game_slug: str, api_key: str, cdp_port: int, game_id: int) -> list[dict]:
+    """CDP 搜索作为回退。"""
+    try:
+        import asyncio
+        from . import downloader
+        results = asyncio.run(downloader.search_via_cdp(query, game_slug, game_id, cdp_port))
+        return results
+    except RuntimeError as e:
+        return [{"name": f"Chrome 未启动: {e}", "mod_id": 0, "error": str(e)}]
+    except Exception as e:
+        return [{"name": f"搜索失败: {e}", "mod_id": 0, "error": str(e)}]
+
+
+def get_mod(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888) -> dict:
+    try:
+        return _api(f"https://api.nexusmods.com/v1/games/{game_slug}/mods/{mod_id}.json", api_key)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            # 成人/受限内容 API 被拒 → 用已登录 Chrome 抓页面兜底
+            info = _get_mod_via_cdp(mod_id, game_slug, cdp_port)
+            if info:
+                return info
+            raise RuntimeError(f"获取 Mod {mod_id} 详情失败：HTTP {e.code}（成人内容受 API 限制；如已在 Chrome 登录 Nexus 仍失败，可直接用 mod_id 下载）")
+        raise
+
+
+def _get_mod_via_cdp(mod_id: int, game_slug: str, cdp_port: int) -> Optional[dict]:
+    try:
+        import asyncio
+        from . import downloader
+        return asyncio.run(downloader.fetch_mod_page_cdp(mod_id, game_slug, cdp_port))
+    except Exception:
+        return None
+
+
+def get_mod_files(mod_id: int, game_slug: str, api_key: str) -> list[dict]:
+    data = _api(f"https://api.nexusmods.com/v1/games/{game_slug}/mods/{mod_id}/files.json", api_key)
+    return data.get("files", [])
+
+
+def get_main_file(mod_id: int, game_slug: str, api_key: str) -> Optional[dict]:
+    files = get_mod_files(mod_id, game_slug, api_key)
+    for f in files:
+        if f.get("category_name") == "MAIN":
+            return f
+    return files[0] if files else None
+
+
+def _staleness(updated_iso, threshold_months: int = 12) -> dict:
+    """据 Nexus updated_time(ISO 8601)判断 mod 陈旧程度 → 安装前预警。
+    Basic MiniMap 那类:2024 的 mod 跟不上高频更新的游戏,装了 ModClass 加载失败不生效。
+    解析失败/无时间返回 None,绝不阻塞。"""
+    if not updated_iso:
+        return None
+    import time as _t, datetime as _dt
+    try:
+        d = _dt.datetime.fromisoformat(str(updated_iso).replace("Z", "+00:00"))
+        months = (_t.time() - d.timestamp()) / (30 * 86400)
+    except Exception:
+        return None
+    m = max(0, int(months))
+    if m >= threshold_months:
+        return {"months_ago": m, "stale": True,
+                "note": f"该 mod 最后更新于约 {m} 个月前,可能不兼容当前游戏版本"
+                        "(高频更新的游戏如 Palworld 尤甚),装了不生效的风险较高——"
+                        "装前请留意,不生效就找更新更近的替代。"}
+    return {"months_ago": m, "stale": False}
+
+
+def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888) -> dict:
+    mod = get_mod(mod_id, game_slug, api_key, cdp_port)
+    try:
+        main = get_main_file(mod_id, game_slug, api_key)
+    except Exception:
+        main = None
+    deps = [d.get("mod_id") for d in mod.get("dependencies", []) if d.get("mod_id")]
+
+    return {
+        "mod_id": mod.get("mod_id", mod_id),
+        "name": mod.get("name", ""),
+        "summary": mod.get("summary", ""),
+        "description": mod.get("description", "")[:2000],
+        "version": main.get("version", mod.get("version", "?")) if main else mod.get("version", "?"),
+        "file_id": main.get("file_id") if main else None,
+        "file_name": main.get("file_name", "") if main else "",
+        "file_size_kb": main.get("size_kb", 0) if main else 0,
+        "endorsements": mod.get("endorsement_count", 0),
+        "downloads": mod.get("mod_downloads", 0),
+        "author": mod.get("author", ""),
+        "category": mod.get("category", ""),
+        "updated_at": mod.get("updated_time", ""),
+        "staleness": _staleness(mod.get("updated_time", "")),
+        "dependencies": deps,
+        "install_notes": _extract_install_notes(mod.get("description", "")),
+    }
+
+
+def get_description(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888) -> str:
+    mod = get_mod(mod_id, game_slug, api_key, cdp_port)
+    return mod.get("description", "") or mod.get("summary", "")
+
+
+def get_mod_description(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888) -> dict:
+    desc = get_description(mod_id, game_slug, api_key, cdp_port)
+    return _parse_readme(desc)
+
+
+def resolve_deps(mod_id: int, game_slug: str, api_key: str) -> list[int]:
+    mod = get_mod(mod_id, game_slug, api_key)
+    return [d.get("mod_id") for d in mod.get("dependencies", []) if d.get("mod_id")]
+
+
+def _extract_install_notes(desc: str) -> str:
+    if not desc:
+        return ""
+    lines = desc.split("\n")
+    notes = []
+    in_install = False
+    for line in lines:
+        lower = line.strip().lower()
+        if any(kw in lower for kw in ["installation", "install", "how to install", "usage"]):
+            in_install = True
+            continue
+        if in_install and lower.startswith("#"):
+            break
+        if in_install and line.strip():
+            notes.append(line.strip())
+    return "\n".join(notes[:10]) if notes else ""
+
+
+def _parse_readme(desc: str) -> dict:
+    result = {"dependencies": [], "install_paths": [], "warnings": [], "uninstall_method": ""}
+    if not desc:
+        return result
+
+    lower = desc.lower()
+
+    if "extract to" in lower or "drop into" in lower or "place in" in lower:
+        for line in desc.split("\n"):
+            if any(kw in line.lower() for kw in ["extract to", "drop into", "place in", "copy to", "install to"]):
+                result["install_paths"].append(line.strip()[:120])
+
+    for line in desc.split("\n"):
+        if any(kw in line.lower() for kw in ["require", "dependency", "need", "prerequisite"]):
+            result["dependencies"].append(line.strip()[:120])
+
+    for line in desc.split("\n"):
+        if any(kw in line.lower() for kw in ["warning", "caution", "important", "note:", "compatib"]):
+            result["warnings"].append(line.strip()[:120])
+
+    return result

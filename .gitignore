@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Node / build output
+node_modules/
+downloads/
+dist/
+build/
+*.log
+.DS_Store
+snapshots/
+*.egg-info/
+
+# Local workspace and application state
+.claude/settings.local.json
+*.lnk
+*.exe
+.env
+.env.*
+.modagent/
+backups/
+_stage_backup/
+electron/release/
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+
+# Historical and scratch files
