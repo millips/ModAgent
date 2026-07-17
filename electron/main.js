@@ -20,6 +20,25 @@ const APP_USER_DATA = IS_SMOKE_TEST && process.env.MODAGENT_USER_DATA_DIR
   ? path.resolve(process.env.MODAGENT_USER_DATA_DIR)
   : path.join(app.getPath('appData'), IDENTITY.userDataFolder);
 
+const TRUSTED_EXTERNAL_HOSTS = new Set([
+  'www.nexusmods.com',
+  'app.tavily.com',
+  'platform.deepseek.com',
+]);
+
+async function openTrustedExternal(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ''));
+    if (parsed.protocol !== 'https:' || !TRUSTED_EXTERNAL_HOSTS.has(parsed.hostname)) {
+      return { ok: false, error: 'Blocked external URL' };
+    }
+    await shell.openExternal(parsed.toString());
+    return { ok: true };
+  } catch (_) {
+    return { ok: false, error: 'Invalid external URL' };
+  }
+}
+
 app.setName(IDENTITY.productName);
 app.setPath('userData', APP_USER_DATA);
 if (process.platform === 'win32') app.setAppUserModelId(IDENTITY.appId);
@@ -238,11 +257,11 @@ async function createWindow() {
     const allowed = url.startsWith('file://') || (process.argv.includes('--dev') && url.startsWith('http://localhost:3000'));
     if (!allowed) {
       event.preventDefault();
-      shell.openExternal(url);
+      openTrustedExternal(url);
     }
   });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    openTrustedExternal(url);
     return { action: 'deny' };
   });
   mainWindow.once('ready-to-show', () => {
@@ -330,7 +349,7 @@ app.on('activate', () => {
 
 ipcMain.handle('get-api-base', () => API_BASE);
 ipcMain.on('get-api-base-sync', event => { event.returnValue = API_BASE; });
-ipcMain.handle('open-external', (_, url) => shell.openExternal(url));
+ipcMain.handle('open-external', (_, url) => openTrustedExternal(url));
 ipcMain.handle('save-secrets', (_, updates = {}) => {
   const allowed = {};
   for (const key of ['nexus_api_key', 'llm_api_key', 'tavily_api_key']) {

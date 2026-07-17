@@ -133,7 +133,7 @@ export default function SettingsPage({ toast, api }) {
             <input
               type="password"
               className="input-cyber"
-              placeholder={cfg.tavily_set ? '已设置' : '未设置 (可选，提升搜索质量)'}
+              placeholder={cfg.tavily_set ? '已设置' : '未设置（完整跨站搜索所需）'}
               value={tavilyKey}
               onChange={e => setTavilyKey(e.target.value)}
             />
@@ -161,8 +161,6 @@ export default function SettingsPage({ toast, api }) {
               <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
               <option value="deepseek-chat">DeepSeek V3</option>
               <option value="deepseek-reasoner">DeepSeek R1</option>
-              <option value="gpt-4o">GPT-4o</option>
-              <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
             </select>
           </div>
           <div>

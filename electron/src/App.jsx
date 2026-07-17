@@ -37,7 +37,7 @@ export default function App() {
             bg: s.bg || null,
           }))
           document.body.classList.add('has-bg')
-          setConfigured(s.api_key_set && s.llm_set)
+          setConfigured(s.api_key_set && s.tavily_set && s.llm_set)
           if (!games.length && !window.__gamesDetected) {
             window.__gamesDetected = true
             fetch(API + '/games/detect').then(r => r.json()).then(g => {

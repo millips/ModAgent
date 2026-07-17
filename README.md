@@ -60,6 +60,14 @@ python -m pip install -r requirements.txt
 cd electron
 npm install
 ```
+## 普通用户下载
+
+普通用户请从 GitHub 仓库右侧的 **Releases** 下载 `ModAgent-Setup-*.exe` 安装程序。
+
+GitHub 自动提供的 **Source code (zip)** 只包含约数 MB 的源代码，不能解压后直接运行 ModAgent。完整 Windows 安装程序包含 Electron、Python 后端和运行依赖，体积会明显更大。
+
+暂未发布 Release 时，表示当前版本仍在封闭测试阶段。
+
 
 开发模式运行：
 
