@@ -15,6 +15,7 @@ from . import diagnostics
 from . import progress
 from . import patcher
 from . import games as games_mod
+from . import web_agent
 
 
 def _resolve_github_release_url(url: str) -> dict:
@@ -75,6 +76,20 @@ from . import scanner
 
 def build_tools_definitions(tier: str) -> list[dict]:
     all_tools = [
+        _t("browser_pages", "列出 ModAgent Chrome 中当前打开的受支持 Mod 站点页面。网页任务开始、页面身份不明确或存在多个标签时先调用。",
+           {}, []),
+        _t("browser_observe", "读取网页实际渲染的语义快照：URL、标题、正文、弹窗、错误提示及带 target_id 的可见控件。搜索为空、下载失败或页面改版时先观察，禁止凭固定 SOP 猜测。",
+           {"tab_id": {"type": "string", "description": "可选；browser_pages 返回的标签 ID"}}, []),
+        _t("browser_click", "点击 browser_observe 返回的可见控件。只使用本轮观察结果中的 target_id；点击后返回新快照。",
+           {"target_id": {"type": "string"}, "tab_id": {"type": "string"}}, ["target_id"]),
+        _t("browser_input", "向观察到的输入框填写文本，可选择提交；操作后返回新快照。",
+           {"target_id": {"type": "string"}, "value": {"type": "string"},
+            "submit": {"type": "boolean"}, "tab_id": {"type": "string"}},
+           ["target_id", "value"]),
+        _t("browser_wait", "等待异步加载后重新观察页面。用于点击、提交或下载倒计时之后读取真实状态。",
+           {"seconds": {"type": "number"}, "tab_id": {"type": "string"}}, ["seconds"]),
+        _t("browser_open", "在 ModAgent Chrome 中打开受支持的 Mod 站点页面并立即观察。",
+           {"url": {"type": "string"}}, ["url"]),
         _t("scan_existing_mods", "扫描当前游戏目录，识别已手动安装的 Mod 文件（非 ModAgent 安装的），对比 Nexus 数据库确认身份。首次使用或发现游戏目录有文件但 db 为空时自动触发。",
            {}, []),
         _t("import_existing_mods", "将 scan_existing_mods 识别出的 Mod 批量导入数据库。导入后标记为 imported（非 ModAgent 安装）。",
@@ -296,7 +311,34 @@ def execute(name: str, args: dict, cfg: Config) -> str:
     root = cfg.game_root
 
     # T00 - scan existing mods in game directory
-    if name == "scan_existing_mods":
+    if name == "browser_pages":
+        return json.dumps(web_agent.list_pages(cfg.chrome_cdp_port), ensure_ascii=False)
+
+    elif name == "browser_observe":
+        return json.dumps(web_agent.observe(cfg.chrome_cdp_port, args.get("tab_id", "")), ensure_ascii=False)
+
+    elif name == "browser_click":
+        return json.dumps(web_agent.click(
+            cfg.chrome_cdp_port, args.get("target_id", ""), args.get("tab_id", "")
+        ), ensure_ascii=False)
+
+    elif name == "browser_input":
+        return json.dumps(web_agent.input_text(
+            cfg.chrome_cdp_port, args.get("target_id", ""), args.get("value", ""),
+            args.get("tab_id", ""), bool(args.get("submit", False))
+        ), ensure_ascii=False)
+
+    elif name == "browser_wait":
+        return json.dumps(web_agent.wait_and_observe(
+            cfg.chrome_cdp_port, args.get("seconds", 1), args.get("tab_id", "")
+        ), ensure_ascii=False)
+
+    elif name == "browser_open":
+        return json.dumps(web_agent.open_page(
+            cfg.chrome_cdp_port, args.get("url", "")
+        ), ensure_ascii=False)
+
+    elif name == "scan_existing_mods":
         if not root:
             return json.dumps({"error": "请先选择游戏目录"}, ensure_ascii=False)
         result = scanner.scan_existing_mods(root, slug, api_key)

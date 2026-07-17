@@ -253,6 +253,39 @@ async def _cdp_eval(ws, expr: str, msg_id: int, await_promise: bool = False, tim
             return result.get("value") if isinstance(result, dict) else None
 
 
+async def _find_captured_nexus_download(
+    cdp_port: int, game_slug: str, mod_id: int
+) -> str:
+    """Recover a CDN URL captured after semantic browser interaction."""
+    import websockets
+
+    try:
+        tabs = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{int(cdp_port)}/json/list", timeout=5
+        ).read())
+    except Exception:
+        return ""
+    marker = f"nexusmods.com/{game_slug}/mods/{int(mod_id)}"
+    for tab in tabs if isinstance(tabs, list) else []:
+        if marker not in str(tab.get("url", "")):
+            continue
+        ws_url = tab.get("webSocketDebuggerUrl")
+        if not ws_url:
+            continue
+        try:
+            async with websockets.connect(
+                ws_url, ping_interval=None, max_size=4 * 1024 * 1024
+            ) as ws:
+                value = await _cdp_eval(
+                    ws, "window.__modAgentDownloadUrl || ''", 2088
+                )
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    return value
+        except Exception:
+            continue
+    return ""
+
+
 async def get_download_url_filepage(
     cdp_port: int, game_slug: str, mod_id: int, file_id: int, game_id: int
 ) -> str:
@@ -268,6 +301,10 @@ async def get_download_url_filepage(
     import websockets
 
     page_url = f"https://www.nexusmods.com/{game_slug}/mods/{mod_id}?tab=files&file_id={file_id}"
+    captured = await _find_captured_nexus_download(cdp_port, game_slug, mod_id)
+    if captured:
+        return captured
+
     tab = _open_tab(cdp_port, page_url)
     ws_url = tab.get("webSocketDebuggerUrl")
     if not ws_url:
