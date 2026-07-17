@@ -16,6 +16,15 @@ _GAME_DISCOVERY_CACHE: dict[str, tuple[float, dict]] = {}
 _GAME_DISCOVERY_TTL = 24 * 3600
 
 
+class NexusSearchUnavailable(RuntimeError):
+    """Nexus could not be queried; this is not an empty search result."""
+
+    def __init__(self, status: str, reason: str):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
+
+
 def _normalise_game_name(name: str) -> str:
     value = (name or "").strip()
     value = re.sub(r"[™®©]", "", value)
@@ -431,8 +440,18 @@ def _search_api(query: str, game_slug: str, api_key: str, game_id: int) -> list[
                 del _MOD_CACHE[oldest]
             _MOD_CACHE[cache_key] = (now, mods)
             return _match_and_detail(query, mods, game_slug, api_key)
-    except Exception:
-        pass
+    except urllib.error.HTTPError as exc:
+        status = "authentication_failed" if exc.code in (401, 403) else "source_unavailable"
+        raise NexusSearchUnavailable(status, f"Nexus API HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
+        raise NexusSearchUnavailable(
+            "source_unavailable",
+            f"无法连接 Nexus API: {getattr(exc, 'reason', exc)}",
+        ) from exc
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise NexusSearchUnavailable(
+            "invalid_response", f"Nexus API 返回无法解析的数据: {exc}"
+        ) from exc
 
     return []
 
