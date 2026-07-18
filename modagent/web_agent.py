@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
+from . import playwright_driver
 
 ALLOWED_HOST_SUFFIXES = (
     "nexusmods.com",
@@ -32,6 +33,20 @@ ALLOWED_HOST_SUFFIXES = (
     "mod.io",
     "itch.io",
 )
+
+_TAB_HANDLES: dict[str, str] = {}
+_NEXT_TAB_HANDLE = 1
+
+
+def _stable_handle(tab_id: str) -> str:
+    global _NEXT_TAB_HANDLE
+    for handle, current_id in _TAB_HANDLES.items():
+        if current_id == tab_id:
+            return handle
+    handle = f"tab-{_NEXT_TAB_HANDLE}"
+    _NEXT_TAB_HANDLE += 1
+    _TAB_HANDLES[handle] = tab_id
+    return handle
 
 
 def _allowed_url(url: str) -> bool:
@@ -72,6 +87,7 @@ def list_pages(cdp_port: int) -> dict:
         "pages": [
             {
                 "tab_id": tab.get("id"),
+                "stable_id": _stable_handle(tab.get("id", "")),
                 "title": tab.get("title", ""),
                 "url": tab.get("url", ""),
             }
@@ -83,7 +99,8 @@ def list_pages(cdp_port: int) -> dict:
 def _select_tab(cdp_port: int, tab_id: str = "") -> dict:
     tabs = _tabs(cdp_port)
     if tab_id:
-        match = next((tab for tab in tabs if tab.get("id") == tab_id), None)
+        resolved_id = _TAB_HANDLES.get(tab_id, tab_id)
+        match = next((tab for tab in tabs if tab.get("id") == resolved_id), None)
         if not match:
             raise RuntimeError("指定页面不存在、已关闭或不属于允许的 Mod 站点")
         return match
@@ -308,6 +325,15 @@ def observe(cdp_port: int, tab_id: str = "") -> dict:
         if not isinstance(result, dict):
             raise RuntimeError("页面观察返回了异常数据")
         result["tab_id"] = tab.get("id")
+        result["stable_id"] = _stable_handle(tab.get("id", ""))
+        enhanced = playwright_driver.aria_snapshot(
+            cdp_port, result.get("url", ""), result.get("title", "")
+        )
+        if enhanced.get("status") == "ok":
+            result["aria_snapshot"] = enhanced.get("aria_snapshot", "")
+            result["driver"] = "playwright+cdp"
+        else:
+            result["driver"] = "cdp-fallback"
         return result
     except Exception as exc:
         return {"status": "observe_failed", "error": str(exc)}
@@ -317,7 +343,13 @@ def click(cdp_port: int, target_id: str, tab_id: str = "") -> dict:
     try:
         tab = _select_tab(cdp_port, tab_id)
         before_tabs = {item.get("id") for item in _tabs(cdp_port)}
-        result = asyncio.run(_native_click(tab, target_id))
+        result = playwright_driver.click(
+            cdp_port, tab.get("url", ""), target_id, tab.get("title", "")
+        )
+        if result.get("status") in {
+            "unavailable", "page_not_found", "failed"
+        }:
+            result = asyncio.run(_native_click(tab, target_id))
         time.sleep(0.8)
         after_tabs = _tabs(cdp_port)
         new_tabs = [item for item in after_tabs if item.get("id") not in before_tabs]
@@ -363,7 +395,14 @@ def input_text(
     """
     try:
         tab = _select_tab(cdp_port, tab_id)
-        result = asyncio.run(_evaluate(tab, script))
+        result = playwright_driver.input_text(
+            cdp_port, tab.get("url", ""), target_id, value,
+            title=tab.get("title", ""), submit=submit,
+        )
+        if result.get("status") in {
+            "unavailable", "page_not_found", "failed"
+        }:
+            result = asyncio.run(_evaluate(tab, script))
         time.sleep(0.8 if submit else 0.2)
         snapshot = observe(cdp_port, tab.get("id"))
         return {"action": result, "page": snapshot}
@@ -371,10 +410,48 @@ def input_text(
         return {"status": "input_failed", "error": str(exc)}
 
 
-def wait_and_observe(cdp_port: int, seconds: float, tab_id: str = "") -> dict:
-    delay = max(0.2, min(float(seconds or 1), 10.0))
-    time.sleep(delay)
-    return observe(cdp_port, tab_id)
+def wait_and_observe(
+    cdp_port: int, seconds: float = 1, tab_id: str = "",
+    text: str = "", url_pattern: str = "", timeout_ms: int = 10000,
+) -> dict:
+    tab = _select_tab(cdp_port, tab_id)
+    if text or url_pattern:
+        wait_result = playwright_driver.wait_for(
+            cdp_port, tab.get("url", ""), text=text,
+            url_pattern=url_pattern, timeout_ms=timeout_ms,
+        )
+    else:
+        delay = max(0.2, min(float(seconds or 1), 10.0))
+        time.sleep(delay)
+        wait_result = {"status": "delay_complete", "seconds": delay}
+    return {"wait": wait_result, "page": observe(cdp_port, tab.get("id", ""))}
+
+
+def doctor(cdp_port: int) -> dict:
+    started = time.monotonic()
+    try:
+        pages = list_pages(cdp_port)
+        version_url = f"http://127.0.0.1:{int(cdp_port)}/json/version"
+        with urllib.request.urlopen(version_url, timeout=5) as response:
+            version = json.loads(response.read().decode("utf-8"))
+        return {
+            "status": "ok",
+            "preferred_driver": "playwright",
+            "fallback_driver": "raw-cdp",
+            "cdp": {
+                "connected": True,
+                "browser": version.get("Browser", ""),
+                "pages": len(pages.get("pages", [])),
+                "latency_ms": round((time.monotonic() - started) * 1000),
+            },
+            "playwright": playwright_driver.doctor(cdp_port),
+        }
+    except Exception as exc:
+        return {
+            "status": "browser_unavailable",
+            "error": str(exc),
+            "playwright": playwright_driver.doctor(cdp_port),
+        }
 
 
 def open_page(cdp_port: int, url: str) -> dict:

@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH).parent
 
@@ -10,12 +11,15 @@ hiddenimports = [
     "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan.on",
 ]
+hiddenimports += collect_submodules("playwright")
+datas = [(str(ROOT / "modagent" / "default_prompt.md"), "modagent")]
+datas += collect_data_files("playwright")
 
 a = Analysis(
     [str(ROOT / "packaging" / "backend_entry.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[(str(ROOT / "modagent" / "default_prompt.md"), "modagent")],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

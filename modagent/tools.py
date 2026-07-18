@@ -76,20 +76,33 @@ from . import scanner
 
 def build_tools_definitions(tier: str) -> list[dict]:
     all_tools = [
-        _t("browser_pages", "列出 ModAgent Chrome 中当前打开的受支持 Mod 站点页面。网页任务开始、页面身份不明确或存在多个标签时先调用。",
+        _t("browser_pages", "列出 ModAgent Chrome 中当前打开的受支持 Mod 站点页面。网页任务开始、页面身份不明确或出现多个标签时先调用。",
            {}, []),
-        _t("browser_observe", "读取网页实际渲染的语义快照：URL、标题、正文、弹窗、错误提示及带 target_id 的可见控件。搜索为空、下载失败或页面改版时先观察，禁止凭固定 SOP 猜测。",
-           {"tab_id": {"type": "string", "description": "可选；browser_pages 返回的标签 ID"}}, []),
-        _t("browser_click", "点击 browser_observe 返回的可见控件。只使用本轮观察结果中的 target_id；点击后返回新快照。",
-           {"target_id": {"type": "string"}, "tab_id": {"type": "string"}}, ["target_id"]),
-        _t("browser_input", "向观察到的输入框填写文本，可选择提交；操作后返回新快照。",
-           {"target_id": {"type": "string"}, "value": {"type": "string"},
-            "submit": {"type": "boolean"}, "tab_id": {"type": "string"}},
+        _t("browser_doctor", "诊断 ModAgent Chrome、Playwright 与 CDP 连接状态。浏览器打不开、反复开页或下载异常时先调用。",
+           {}, []),
+        _t("browser_observe", "读取当前网页实际渲染出的语义快照：URL、标题、正文、弹窗、错误提示以及带 target_id 的可见按钮/链接/输入框。网页搜索、登录判断、下载失败或页面改版时必须先观察再行动，禁止凭固定 SOP 猜页面。",
+           {"tab_id": {"type": "string", "description": "可选；browser_pages/browser_observe 返回的标签 ID"}},
+           []),
+        _t("browser_click", "点击 browser_observe 返回的可见控件。只能使用本轮观察结果里的 target_id；点击后自动返回新的页面快照。",
+           {"target_id": {"type": "string", "description": "browser_observe 返回的 target_id，如 ma-3-12"},
+            "tab_id": {"type": "string", "description": "可选；对应页面标签 ID"}},
+           ["target_id"]),
+        _t("browser_input", "向 browser_observe 返回的输入框填写文本，可选择提交；操作后自动返回新的页面快照。",
+           {"target_id": {"type": "string"},
+            "value": {"type": "string"},
+            "submit": {"type": "boolean", "description": "是否按 Enter/提交表单"},
+            "tab_id": {"type": "string", "description": "可选；对应页面标签 ID"}},
            ["target_id", "value"]),
-        _t("browser_wait", "等待异步加载后重新观察页面。用于点击、提交或下载倒计时之后读取真实状态。",
-           {"seconds": {"type": "number"}, "tab_id": {"type": "string"}}, ["seconds"]),
-        _t("browser_open", "在 ModAgent Chrome 中打开受支持的 Mod 站点页面并立即观察。",
-           {"url": {"type": "string"}}, ["url"]),
+        _t("browser_wait", "等待页面达到明确条件后重新观察；优先等待文本或 URL，不要盲目固定等待。",
+           {"seconds": {"type": "number", "description": "无明确条件时的等待秒数，0.2-10"},
+            "text": {"type": "string", "description": "等待该文本可见"},
+            "url_pattern": {"type": "string", "description": "等待 URL 匹配该模式"},
+            "timeout_ms": {"type": "integer", "description": "条件等待超时，最多30000毫秒"},
+            "tab_id": {"type": "string", "description": "可选；页面原始 ID 或 stable_id"}},
+           []),
+        _t("browser_open", "在 ModAgent Chrome 中打开受支持的 Mod 站点页面并立即观察。支持 Nexus、Steam Community、GitHub、Thunderstore、GameBanana、ModDB、CurseForge、FluffyQuack、mod.io、itch.io 等已审核站点。",
+           {"url": {"type": "string"}},
+           ["url"]),
         _t("scan_existing_mods", "扫描当前游戏目录，识别已手动安装的 Mod 文件（非 ModAgent 安装的），对比 Nexus 数据库确认身份。首次使用或发现游戏目录有文件但 db 为空时自动触发。",
            {}, []),
         _t("import_existing_mods", "将 scan_existing_mods 识别出的 Mod 批量导入数据库。导入后标记为 imported（非 ModAgent 安装）。",
@@ -101,7 +114,7 @@ def build_tools_definitions(tier: str) -> list[dict]:
         _t("mod_recommend", "根据用户自然语言描述智能推荐 Mod——多源聚合:自动识别当前游戏的可用来源(Nexus/创意工坊/Thunderstore/GameBanana/GitHub)并发搜索,按来源分组返回(各源热度口径不同,不跨源排序)。模糊需求('来点好玩的''综合热度')首选本工具;失败的源在 sources_failed 里,如实告知用户。",
            {"query": {"type": "string", "description": "用户原始需求描述(英文关键词命中率更高)"}},
            ["query"]),
-        _t("nexus_search", "按关键词搜索 Nexus Mods。返回 mod_id / 名称 / 摘要 / 评分。",
+        _t("nexus_search", "按关键词搜索 Nexus Mods。工具/管理器/框架类查询会同时核验 Nexus 通用工具区，归并同名旧条目并标记 canonical_candidate。返回结果中的 nexus_slug 必须原样传给详情和下载工具。",
            {"query": {"type": "string", "description": "搜索关键词（英文最佳）"}},
            ["query"]),
         _t("collection_view", "读取 Nexus 合集(Collection)里包含的所有 Mod。用户给合集链接(含 /collections/xxx)或合集 slug 时调用。",
@@ -131,10 +144,12 @@ def build_tools_definitions(tier: str) -> list[dict]:
            {"workshop_id": {"type": "string"}},
            ["workshop_id"]),
         _t("nexus_get_detail", "获取单个 Mod 的完整详情，包括版本、依赖、安装说明等。安装前必调用。",
-           {"mod_id": {"type": "integer", "description": "Mod ID"}},
+           {"mod_id": {"type": "integer", "description": "Mod ID"},
+            "nexus_slug": {"type": "string", "description": "可选；使用 nexus_search 返回的来源 slug，例如 site 或 streetfighter6"}},
            ["mod_id"]),
         _t("mod_download", "下载 Mod 文件到本地缓存。通常只需 mod_id；若返回多个变体(variants)，再次调用并传入所选变体的 file_id 即可下载指定变体。",
            {"mod_id": {"type": "integer"},
+            "nexus_slug": {"type": "string", "description": "可选；使用 nexus_search 返回的来源 slug，例如 site"},
             "file_id": {"type": "integer", "description": "可选。当 mod 有多个 MAIN 变体时，指定要下载的变体 file_id"}},
            ["mod_id"]),
         _t("batch_download", "批量下载多个 Mod，顺序执行逐一回报进度。",
@@ -165,6 +180,12 @@ def build_tools_definitions(tier: str) -> list[dict]:
             "dependencies": {"type": "array", "items": {"type": "string"},
                              "description": "可选：该 Mod 实际依赖的已安装本地 Mod ID"}},
            ["local_path", "mapping"]),
+        _t("tool_extract", "解压独立 Mod 工具/管理器（如 Fluffy Mod Manager）到 ModAgent 受控工具目录。"
+           "这类程序不应装进游戏目录；下载完成并获得用户确认后调用。返回压缩包、解压目录和 EXE 的绝对路径，"
+           "必须如实展示给用户；只解压，不自动运行 EXE。",
+           {"local_path": {"type": "string", "description": "mod_download 返回的压缩包绝对路径"},
+            "display_name": {"type": "string", "description": "工具名和版本，如 Fluffy_Mod_Manager_v3.079"}},
+           ["local_path"]),
         _t("mod_uninstall", "卸载已安装的 Mod(从游戏目录移除文件;工坊 mod 则退订)。破坏性操作:首次调用返回预览(将删文件数/是否退订/是否有其他 mod 依赖它)并要求确认——把预览展示给用户、得到明确同意后携 confirmed=true 重新调用;未经确认不得自行重调。卸载前自动建快照可回滚。",
            {"mod_id": {"type": "string"},
             "confirmed": {"type": "boolean", "description": "用户已看过卸载预览并明确同意"}},
@@ -309,34 +330,87 @@ def execute(name: str, args: dict, cfg: Config) -> str:
     slug = cfg.game_slug
     gid = cfg.game_id
     root = cfg.game_root
+    nexus_identity_cache = {}
+
+    def current_nexus_identity():
+        """Resolve the remote Nexus identity without changing the local slug."""
+        if nexus_identity_cache:
+            return (
+                nexus_identity_cache["slug"],
+                nexus_identity_cache["game_id"],
+                nexus_identity_cache["discovery"],
+            )
+        if slug and not str(slug).startswith("local_"):
+            discovery = {
+                "status": "available", "slug": slug, "game_id": gid,
+                "evidence": "static game mapping",
+            }
+            resolved_slug, resolved_id = slug, gid
+        else:
+            discovery = nexus.discover_game(
+                cfg.game_name or "", getattr(cfg, "tavily_api_key", ""),
+                api_key,
+            )
+            resolved_slug = discovery.get("slug") or ""
+            resolved_id = int(discovery.get("game_id") or 0)
+        nexus_identity_cache.update(
+            slug=resolved_slug, game_id=resolved_id, discovery=discovery
+        )
+        return resolved_slug, resolved_id, discovery
 
     # T00 - scan existing mods in game directory
     if name == "browser_pages":
         return json.dumps(web_agent.list_pages(cfg.chrome_cdp_port), ensure_ascii=False)
 
+    elif name == "browser_doctor":
+        return json.dumps(web_agent.doctor(cfg.chrome_cdp_port), ensure_ascii=False)
+
     elif name == "browser_observe":
-        return json.dumps(web_agent.observe(cfg.chrome_cdp_port, args.get("tab_id", "")), ensure_ascii=False)
+        return json.dumps(
+            web_agent.observe(cfg.chrome_cdp_port, args.get("tab_id", "")),
+            ensure_ascii=False,
+        )
 
     elif name == "browser_click":
-        return json.dumps(web_agent.click(
-            cfg.chrome_cdp_port, args.get("target_id", ""), args.get("tab_id", "")
-        ), ensure_ascii=False)
+        return json.dumps(
+            web_agent.click(
+                cfg.chrome_cdp_port,
+                args.get("target_id", ""),
+                args.get("tab_id", ""),
+            ),
+            ensure_ascii=False,
+        )
 
     elif name == "browser_input":
-        return json.dumps(web_agent.input_text(
-            cfg.chrome_cdp_port, args.get("target_id", ""), args.get("value", ""),
-            args.get("tab_id", ""), bool(args.get("submit", False))
-        ), ensure_ascii=False)
+        return json.dumps(
+            web_agent.input_text(
+                cfg.chrome_cdp_port,
+                args.get("target_id", ""),
+                args.get("value", ""),
+                args.get("tab_id", ""),
+                bool(args.get("submit", False)),
+            ),
+            ensure_ascii=False,
+        )
 
     elif name == "browser_wait":
-        return json.dumps(web_agent.wait_and_observe(
-            cfg.chrome_cdp_port, args.get("seconds", 1), args.get("tab_id", "")
-        ), ensure_ascii=False)
+        return json.dumps(
+            web_agent.wait_and_observe(
+                cfg.chrome_cdp_port,
+                args.get("seconds", 1),
+                args.get("tab_id", ""),
+                args.get("text", ""),
+                args.get("url_pattern", ""),
+                args.get("timeout_ms", 10000),
+            ),
+            ensure_ascii=False,
+        )
 
     elif name == "browser_open":
-        return json.dumps(web_agent.open_page(
-            cfg.chrome_cdp_port, args.get("url", "")
-        ), ensure_ascii=False)
+        return json.dumps(
+            web_agent.open_page(cfg.chrome_cdp_port, args.get("url", "")),
+            ensure_ascii=False,
+        )
 
     elif name == "scan_existing_mods":
         if not root:
@@ -359,13 +433,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
     elif name == "nexus_search":
         import re as _re
         q = (args.get("query") or "").strip()
-        effective_slug = slug
-        discovery = None
-        if not effective_slug or str(effective_slug).startswith("local_"):
-            discovery = nexus.discover_game(
-                cfg.game_name or "", getattr(cfg, "tavily_api_key", "")
-            )
-            effective_slug = discovery.get("slug", "")
+        effective_slug, effective_gid, discovery = current_nexus_identity()
         if not effective_slug:
             return json.dumps({
                 "error": "game_mapping_missing",
@@ -378,19 +446,59 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "note": "未执行 Nexus Mod 搜索；这不代表 Nexus 没有该游戏专区。",
             }, ensure_ascii=False)
         # 粘贴 Nexus 链接或直接给 mod_id → 绕过受限的搜索索引，直接解析详情
-        m = _re.search(r"nexusmods\.com/(?:games/)?[\w-]+/mods/(\d+)", q) or _re.fullmatch(r"\d{2,7}", q)
+        link_match = _re.search(
+            r"nexusmods\.com/(?:games/)?([\w-]+)/mods/(\d+)", q
+        )
+        m = link_match or _re.fullmatch(r"\d{2,7}", q)
         if m:
-            mid = int(m.group(1) if m.lastindex else m.group(0))
+            direct_slug = link_match.group(1) if link_match else effective_slug
+            mid = int(link_match.group(2) if link_match else m.group(0))
             try:
-                d = nexus.get_detail(mid, effective_slug, api_key, cdp_port=cfg.chrome_cdp_port)
+                d = nexus.get_detail(mid, direct_slug, api_key, cdp_port=cfg.chrome_cdp_port)
                 return json.dumps({"direct": True, "results": [{
                     "mod_id": d.get("mod_id"), "name": d.get("name"), "summary": d.get("summary", ""),
                     "version": d.get("version", ""), "file_id": d.get("file_id"),
+                    "nexus_slug": direct_slug,
                 }]}, indent=2, ensure_ascii=False)
             except Exception as e:
                 return json.dumps({"error": f"按 ID/链接获取详情失败: {e}"}, ensure_ascii=False)
-        results = nexus.search(q, effective_slug, api_key, cdp_port=cfg.chrome_cdp_port,
-                               game_id=gid, tavily_key=cfg.tavily_api_key)
+        try:
+            results = nexus.search(
+                q, effective_slug, api_key,
+                cdp_port=cfg.chrome_cdp_port,
+                game_id=effective_gid,
+                tavily_key=cfg.tavily_api_key,
+            )
+        except nexus.NexusSearchUnavailable as e:
+            return json.dumps({
+                "status": e.status,
+                "searched": False,
+                "source": "nexus",
+                "game_slug": effective_slug,
+                "results": [],
+                "error": e.reason,
+                "note": (
+                    "本次未能连接或验证 Nexus，不能解释为“没搜到”，"
+                    "也不能据此判断游戏专区或相关 Mod 不存在。"
+                ),
+            }, ensure_ascii=False)
+        for result in results:
+            result.setdefault("nexus_slug", effective_slug)
+        if nexus.is_tool_query(q):
+            global_tools = nexus.search_tool_entries(
+                q, cfg.tavily_api_key, api_key, cfg.chrome_cdp_port
+            )
+            known = {
+                (str(item.get("nexus_slug") or effective_slug),
+                 int(item.get("mod_id") or 0))
+                for item in results
+            }
+            results.extend(
+                item for item in global_tools
+                if (str(item.get("nexus_slug") or ""),
+                    int(item.get("mod_id") or 0)) not in known
+            )
+            results = nexus.rank_duplicate_entries(results)
         if not results:
             return json.dumps({
                 "status": "search_empty",
@@ -405,10 +513,15 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "searched": True,
             "source": "nexus",
             "game_slug": effective_slug,
+            "tool_query_global_checked": nexus.is_tool_query(q),
             "results": [{
             "mod_id": r.get("mod_id"), "name": r.get("name"), "summary": r.get("summary", ""),
             "endorsements": r.get("endorsement_count", 0), "version": r.get("version", ""),
-            "updated": r.get("updated_time", ""),
+            "updated": r.get("updated_time", r.get("updated", "")),
+            "author": r.get("author", ""), "nexus_slug": r.get("nexus_slug", effective_slug),
+            "url": r.get("url", ""),
+            "canonical_candidate": r.get("canonical_candidate", False),
+            "superseded_by": r.get("superseded_by"),
             } for r in results[:10]],
         }, indent=2, ensure_ascii=False)
 
@@ -433,13 +546,44 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             return json.dumps({"error": f"获取 Thunderstore 社区失败: {e}"}, ensure_ascii=False)
         if not comm:
             return json.dumps({"error": f"《{cfg.game_name}》似乎不在 Thunderstore 上（社区名未匹配）。"}, ensure_ascii=False)
+        attempts = 1
         try:
             results = thunderstore.search(comm, q)
+            if not results:
+                attempts = 2
+                results = thunderstore.search(comm, q, force_refresh=True)
         except Exception as e:
-            return json.dumps({"error": f"Thunderstore 搜索失败: {e}"}, ensure_ascii=False)
+            return json.dumps({
+                "status": "source_unavailable",
+                "searched": False,
+                "source": "thunderstore",
+                "community": comm,
+                "attempts": attempts,
+                "results": [],
+                "error": f"Thunderstore 搜索失败: {e}",
+                "note": "本次来源不可用，不能解释为没有相关 Mod。",
+            }, ensure_ascii=False)
         if not results:
-            return json.dumps({"note": f"在 Thunderstore「{comm}」社区没搜到「{q}」。", "community": comm, "results": []}, ensure_ascii=False)
-        return json.dumps({"community": comm, "results": results}, ensure_ascii=False, indent=2)
+            return json.dumps({
+                "status": "search_empty",
+                "searched": True,
+                "source": "thunderstore",
+                "community": comm,
+                "attempts": attempts,
+                "results": [],
+                "note": (
+                    f"Thunderstore「{comm}」社区两次查询均未命中「{q}」；"
+                    "这不代表该社区或相关 Mod 不存在，可更换关键词重试。"
+                ),
+            }, ensure_ascii=False)
+        return json.dumps({
+            "status": "ok",
+            "searched": True,
+            "source": "thunderstore",
+            "community": comm,
+            "attempts": attempts,
+            "results": results,
+        }, ensure_ascii=False, indent=2)
 
     elif name == "workshop_search":
         from .sources import steam_workshop as sw
@@ -464,10 +608,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         except RuntimeError as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
         if not results:
-            return json.dumps({"note": f"GitHub 没搜到「{q}」相关仓库(已并入当前游戏名限定)。",
+            return json.dumps({"status": "search_empty",
+                               "note": f"GitHub 已先按当前游戏限定搜索，并自动用原关键词做全局回退；本次仍未搜到「{q}」相关仓库。这不等于仓库不存在。",
                                "results": []}, ensure_ascii=False)
         return json.dumps({"results": results,
-                           "note": "结果可能混入非 mod 仓库(工具/教程),凭 summary/星数判断后再推荐;"
+                           "note": "游戏限定为空时已自动回退全局搜索。结果可能混入非 mod 仓库(工具/教程),凭 summary/星数判断后再推荐;"
                                    "archived=true 表示作者已弃更。下载:download_from_url 直接吃仓库链接。"},
                           ensure_ascii=False, indent=1)
 
@@ -585,7 +730,18 @@ def execute(name: str, args: dict, cfg: Config) -> str:
 
     # T03
     elif name == "nexus_get_detail":
-        detail = nexus.get_detail(args["mod_id"], slug, api_key, cdp_port=cfg.chrome_cdp_port)
+        nexus_slug, _, discovery = current_nexus_identity()
+        nexus_slug = (args.get("nexus_slug") or nexus_slug).strip()
+        if not nexus_slug:
+            return json.dumps({
+                "error": "game_mapping_missing",
+                "status": discovery.get("status", "not_detected"),
+                "reason": discovery.get("reason", "Nexus game page was not resolved"),
+            }, ensure_ascii=False)
+        detail = nexus.get_detail(
+            args["mod_id"], nexus_slug, api_key,
+            cdp_port=cfg.chrome_cdp_port,
+        )
         return json.dumps(detail, indent=2, ensure_ascii=False)
 
     # T04
@@ -593,14 +749,58 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not Tier.can(cfg.tier, "download"):
             return json.dumps({"error": "当前层级不支持下载", "suggestion": "升级到 Pro 订阅"}, ensure_ascii=False)
         _mid = args["mod_id"]
+        nexus_slug, nexus_gid, discovery = current_nexus_identity()
+        requested_slug = (args.get("nexus_slug") or "").strip()
+        if requested_slug:
+            nexus_slug = requested_slug
+            nexus_gid = nexus.resolve_game_id(nexus_slug, api_key)
+        elif not nexus_gid:
+            nexus_gid = nexus.resolve_game_id(nexus_slug, api_key)
+        if not nexus_slug:
+            return json.dumps({
+                "error": "game_mapping_missing",
+                "status": discovery.get("status", "not_detected"),
+                "reason": discovery.get("reason", "Nexus game page was not resolved"),
+            }, ensure_ascii=False)
+        if not nexus_gid:
+            return json.dumps({
+                "error": "nexus_game_id_missing",
+                "nexus_slug": nexus_slug,
+                "note": "无法解析该 Nexus 来源的数字 game_id，已在打开下载页之前停止，避免重复开页。请稍后重试或检查 Nexus API Key。",
+            }, ensure_ascii=False)
         progress.start([{"mod_id": _mid, "name": f"mod {_mid}"}])
         progress.set_status(_mid, "downloading")
         try:
             result = asyncio.run(downloader.download_mod(
-                mod_id=_mid, game_slug=slug, game_id=gid,
+                mod_id=_mid, game_slug=nexus_slug, game_id=nexus_gid,
                 api_key=api_key, cdp_port=cfg.chrome_cdp_port,
                 progress_callback=lambda f: progress.set_pct(_mid, int(f * 100)),
                 file_id=args.get("file_id")))
+        except downloader.NexusManualDownloadRequired as e:
+            progress.set_status(
+                _mid,
+                "queued" if e.existing_gate else "failed",
+                "因前一项暂停，尚未尝试" if e.existing_gate else "等待 Nexus 页面人工确认",
+            )
+            progress.finish()
+            if e.existing_gate:
+                return json.dumps({
+                    "status": "skipped_due_to_previous_nexus_gate",
+                    "mod_id": _mid,
+                    "page_url": e.page_url,
+                    "message": "当前项尚未尝试下载；它因前一项 Nexus 下载尚未完成而被暂停。",
+                    "attempted": False,
+                    "stop_further_downloads": True,
+                }, ensure_ascii=False)
+            return json.dumps({
+                "error": "manual_download_required",
+                "status": "manual_action_required",
+                "mod_id": _mid,
+                "page_url": e.page_url,
+                "message": str(e),
+                "user_action_required": "请只处理已保留页面中的 Nexus 登录、成人内容确认或人机验证。ModAgent 会自动操作 Manual Download 和 Slow Download；完成验证后重试当前下载。",
+                "stop_further_downloads": True,
+            }, ensure_ascii=False)
         except Exception as e:
             progress.set_status(_mid, "failed", str(e))
             progress.finish()
@@ -626,8 +826,17 @@ def execute(name: str, args: dict, cfg: Config) -> str:
     # T05
     elif name == "batch_download":
         mods = args.get("mods", [])
+        nexus_slug, nexus_gid, discovery = current_nexus_identity()
+        if not nexus_slug:
+            return json.dumps({
+                "error": "game_mapping_missing",
+                "status": discovery.get("status", "not_detected"),
+                "reason": discovery.get("reason", "Nexus game page was not resolved"),
+            }, ensure_ascii=False)
         success, failed = [], []
         progress.start([{"mod_id": m["mod_id"], "name": m.get("mod_name", "")} for m in mods])
+
+        manual_action = []
 
         async def _batch():
             for m in mods:
@@ -635,18 +844,41 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 progress.set_status(mid, "downloading")
                 try:
                     await downloader.download_mod(
-                        mod_id=mid, game_slug=slug, game_id=gid,
+                        mod_id=mid, game_slug=nexus_slug, game_id=nexus_gid,
                         api_key=api_key, cdp_port=cfg.chrome_cdp_port,
                         progress_callback=lambda f, _m=mid: progress.set_pct(_m, int(f * 100)))
                     progress.set_status(mid, "done")
                     success.append(mid)
+                except downloader.NexusManualDownloadRequired as e:
+                    progress.set_status(
+                        mid,
+                        "queued" if e.existing_gate else "failed",
+                        "因前一项暂停，尚未尝试" if e.existing_gate else "等待 Nexus 页面人工确认",
+                    )
+                    failed.append({
+                        "mod_id": mid,
+                        "error": "skipped_due_to_previous_nexus_gate" if e.existing_gate else "manual_download_required",
+                        "attempted": not e.existing_gate,
+                    })
+                    manual_action.append({
+                        "mod_id": mid,
+                        "page_url": e.page_url,
+                        "message": str(e),
+                    })
+                    break
                 except Exception as e:
                     progress.set_status(mid, "failed", str(e))
                     failed.append({"mod_id": mid, "error": str(e)})
 
         asyncio.run(_batch())
         progress.finish()
-        return json.dumps({"success": success, "failed": failed}, ensure_ascii=False)
+        return json.dumps({
+            "success": success,
+            "failed": failed,
+            "status": "manual_action_required" if manual_action else "completed",
+            "manual_action": manual_action,
+            "stop_further_downloads": bool(manual_action),
+        }, ensure_ascii=False)
 
     # T06
     elif name == "mod_install_batch":
@@ -912,6 +1144,17 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             out["note"] = (f"投放文件夹和下载缓存里没有 mod 压缩包。请让用户把手动下载好的 mod"
                            f"(zip/rar/7z)放进投放文件夹: {dropbox},放好后重试。")
         return json.dumps(out, ensure_ascii=False, indent=1)
+
+    elif name == "tool_extract":
+        try:
+            result = downloader.extract_external_tool(
+                args.get("local_path", ""), args.get("display_name", "")
+            )
+        except Exception as e:
+            return json.dumps(
+                {"error": f"外部工具解压失败: {e}"}, ensure_ascii=False
+            )
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     # T09
     elif name == "snapshot_create":
@@ -1329,6 +1572,15 @@ def _recommend_nexus(query: str, slug: str, api_key: str) -> dict:
             "install_plan": all_deps + [r["mod_id"] for r in recs if r["dependencies"]]}
 
 
+def _recommend_thunderstore(community: str, query: str, limit: int = 5) -> list:
+    """Retry one forced refresh when Thunderstore unexpectedly returns empty."""
+    from .sources import thunderstore as ts
+    results = ts.search(community, query, limit)
+    if not results:
+        results = ts.search(community, query, limit, force_refresh=True)
+    return results
+
+
 def _recommend(query: str, cfg: Config) -> dict:
     """多源聚合推荐(#1):按 available_sources 挑当前游戏的可用源并发查询,
     按来源分组返回——各源热度口径不同(评分/订阅/下载量/星数),不做跨源硬排序,
@@ -1340,7 +1592,7 @@ def _recommend(query: str, cfg: Config) -> dict:
     from .sources import available_sources
     slug, api_key = cfg.game_slug, cfg.nexus_api_key
     src = available_sources(cfg.game_name or "", slug or "", cfg.game_root or "",
-                            getattr(cfg, "tavily_api_key", ""))
+                            getattr(cfg, "tavily_api_key", ""), api_key)
     effective_slug = src.get("nexus") or ""
 
     import concurrent.futures as cf
@@ -1353,8 +1605,9 @@ def _recommend(query: str, cfg: Config) -> dict:
         tasks["workshop"] = ex.submit(
             lambda: asyncio.run(sw.search(query, src["workshop"], cfg.chrome_cdp_port))[:5])
     if src.get("thunderstore"):
-        from .sources import thunderstore as ts
-        tasks["thunderstore"] = ex.submit(ts.search, src["thunderstore"], query, 5)
+        tasks["thunderstore"] = ex.submit(
+            _recommend_thunderstore, src["thunderstore"], query, 5
+        )
     if src.get("gamebanana"):
         from .sources import gamebanana as gb
         tasks["gamebanana"] = ex.submit(gb.search, src["gamebanana"], query, 5)
@@ -1399,8 +1652,16 @@ def _recommend(query: str, cfg: Config) -> dict:
 
     total = len(out["recommendations"]) + sum(
         len(out.get(k) or []) for k in ("workshop", "thunderstore", "gamebanana", "github"))
-    if total == 0:
-        out["note"] = "各来源都没找到匹配的 Mod,试试换个说法(英文关键词命中率更高)?"
+    if total == 0 and out["sources_failed"]:
+        out["note"] = (
+            "当前没有获得匹配结果，但存在查询失败的来源；"
+            "失败不能解释为该站没有游戏专区或相关 Mod，请检查网络/API 后重试。"
+        )
+    elif total == 0:
+        out["note"] = (
+            "已成功查询的来源暂未命中；不能据此断言相关 Mod 不存在，"
+            "可更换关键词重试。"
+        )
     else:
         out["note"] = ("已按来源分组(recommendations=Nexus 含依赖解析,其余各源独立)。"
                        "各源热度口径不同,不要跨源硬排序;GitHub 结果可能混入非 mod 仓库,凭 summary 判断。")
