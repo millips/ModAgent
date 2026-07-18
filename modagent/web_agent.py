@@ -21,6 +21,14 @@ ALLOWED_HOST_SUFFIXES = (
     "githubusercontent.com",
     "thunderstore.io",
     "gamebanana.com",
+    "moddb.com",
+    "curseforge.com",
+    "fluffyquack.com",
+    "loverslab.com",
+    "patreon.com",
+    "deviantart.com",
+    "3dmgame.com",
+    "sglynp.com",
     "mod.io",
     "itch.io",
 )
@@ -182,6 +190,40 @@ async def _native_click(tab: dict, target_id: str) -> dict:
 _OBSERVE_SCRIPT = r"""
 (() => {
   const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+  if (!window.__modAgentDownloadCaptureInstalled) {
+    window.__modAgentDownloadCaptureInstalled = true;
+    window.__modAgentDownloadUrl = window.__modAgentDownloadUrl || '';
+    const capture = value => {
+      try {
+        const data = typeof value === 'string' ? JSON.parse(value) : value;
+        const item = Array.isArray(data) ? data[0] : data;
+        const url = item && (item.url || item.URL);
+        if (url) window.__modAgentDownloadUrl = url;
+      } catch (_) {}
+    };
+    const originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+      const response = await originalFetch.apply(this, args);
+      try {
+        if (/GenerateDownloadUrl/i.test(String(args[0]))) {
+          capture(await response.clone().text());
+        }
+      } catch (_) {}
+      return response;
+    };
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      this.__modAgentUrl = String(url || '');
+      return originalOpen.call(this, method, url, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function(...args) {
+      if (/GenerateDownloadUrl/i.test(this.__modAgentUrl || '')) {
+        this.addEventListener('load', () => capture(this.responseText), {once:true});
+      }
+      return originalSend.apply(this, args);
+    };
+  }
   const visible = el => {
     const rect = el.getBoundingClientRect();
     const style = getComputedStyle(el);
@@ -190,6 +232,10 @@ _OBSERVE_SCRIPT = r"""
       Number(style.opacity || 1) > 0;
   };
   const selector = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"]';
+  document.querySelectorAll('[data-modagent-target]')
+    .forEach(el => el.removeAttribute('data-modagent-target'));
+  const observationId = (window.__modAgentObservationId || 0) + 1;
+  window.__modAgentObservationId = observationId;
   const main = document.querySelector('main,[role="main"],article,#mainContent,#main-content,.page-content,[class*="PageContent"]');
   const score = el => {
     const label = clean(el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title'));
@@ -204,7 +250,9 @@ _OBSERVE_SCRIPT = r"""
     .filter(visible)
     .sort((a, b) => score(b) - score(a))
     .slice(0, 180);
-  elements.forEach((el, index) => el.setAttribute('data-modagent-target', `ma-${index + 1}`));
+  elements.forEach((el, index) =>
+    el.setAttribute('data-modagent-target', `ma-${observationId}-${index + 1}`)
+  );
   const controls = elements.map(el => {
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute('type') || '').toLowerCase();
@@ -230,8 +278,8 @@ _OBSERVE_SCRIPT = r"""
     .filter(visible).map(el => clean(el.innerText)).filter(Boolean).slice(0, 30);
   const alerts = [...document.querySelectorAll('[role="alert"],.alert,.error,[class*="error"],[class*="warning"]')]
     .filter(visible).map(el => clean(el.innerText)).filter(Boolean).slice(0, 20);
-  const mainText = clean(main?.innerText).slice(0, 16000);
-  const bodyText = clean(document.body?.innerText).slice(0, 5000);
+  const mainText = clean(main?.innerText).slice(0, 12000);
+  const bodyText = mainText ? '' : clean(document.body?.innerText).slice(0, 8000);
   const capturedDownload = window.__modAgentDownloadUrl || '';
   const resources = performance.getEntriesByType('resource').map(x => x.name)
     .filter(x => /download|nexus-cdn|cf-files/i.test(x)).slice(-20);
@@ -268,9 +316,15 @@ def observe(cdp_port: int, tab_id: str = "") -> dict:
 def click(cdp_port: int, target_id: str, tab_id: str = "") -> dict:
     try:
         tab = _select_tab(cdp_port, tab_id)
+        before_tabs = {item.get("id") for item in _tabs(cdp_port)}
         result = asyncio.run(_native_click(tab, target_id))
         time.sleep(0.8)
-        snapshot = observe(cdp_port, tab.get("id"))
+        after_tabs = _tabs(cdp_port)
+        new_tabs = [item for item in after_tabs if item.get("id") not in before_tabs]
+        target_tab_id = new_tabs[0].get("id") if new_tabs else tab.get("id")
+        snapshot = observe(cdp_port, target_tab_id)
+        if snapshot.get("status") == "observe_failed" and after_tabs:
+            snapshot = observe(cdp_port, after_tabs[0].get("id", ""))
         return {"action": result, "page": snapshot}
     except Exception as exc:
         return {"status": "click_failed", "error": str(exc)}
@@ -330,6 +384,15 @@ def open_page(cdp_port: int, url: str) -> dict:
             "error": "只允许打开受支持的 Mod 分发站点",
         }
     try:
+        normalized = urllib.parse.urlsplit(url)._replace(fragment="").geturl()
+        for existing in _tabs(cdp_port):
+            existing_url = urllib.parse.urlsplit(
+                existing.get("url", "")
+            )._replace(fragment="").geturl()
+            if existing_url == normalized:
+                result = observe(cdp_port, existing.get("id", ""))
+                result["reused_tab"] = True
+                return result
         endpoint = f"http://127.0.0.1:{int(cdp_port)}/json/new?{url}"
         request = urllib.request.Request(endpoint, method="PUT")
         with urllib.request.urlopen(request, timeout=8) as response:
