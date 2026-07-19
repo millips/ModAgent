@@ -16,6 +16,15 @@ _GAME_DISCOVERY_CACHE: dict[str, tuple[float, dict]] = {}
 _GAME_DISCOVERY_TTL = 24 * 3600
 
 
+class NexusSearchUnavailable(RuntimeError):
+    """Nexus could not be queried; this is not an empty search result."""
+
+    def __init__(self, status: str, reason: str):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
+
+
 def _normalise_game_name(name: str) -> str:
     value = (name or "").strip()
     value = re.sub(r"[™®©]", "", value)
@@ -30,7 +39,47 @@ def _game_name_tokens(name: str) -> set[str]:
     }
 
 
-def discover_game(game_name: str, tavily_key: str = "") -> dict:
+def _match_game_catalog(game_name: str, games) -> dict | None:
+    """Match a display name against Nexus' official game catalogue."""
+    wanted = _game_name_tokens(game_name)
+    if not wanted:
+        return None
+    candidates = []
+    for item in games if isinstance(games, list) else []:
+        if not isinstance(item, dict):
+            continue
+        slug = str(
+            item.get("domain_name") or item.get("domainName")
+            or item.get("slug") or ""
+        ).strip().lower()
+        title = str(item.get("name") or "")
+        if not slug:
+            continue
+        seen = _game_name_tokens(f"{title} {slug}")
+        overlap = len(wanted & seen)
+        # Require all meaningful words for short names, and nearly all for long
+        # names. This avoids mapping similarly named sequels to each other.
+        required = len(wanted) if len(wanted) <= 3 else len(wanted) - 1
+        if overlap >= required:
+            exact = int(_normalise_game_name(title).casefold()
+                        == _normalise_game_name(game_name).casefold())
+            candidates.append((
+                exact, overlap, slug, title, int(item.get("id") or 0)
+            ))
+    if not candidates:
+        return None
+    _, _, slug, title, game_id = max(candidates)
+    return {
+        "status": "available",
+        "slug": slug,
+        "game_id": game_id,
+        "evidence": f"Nexus API games catalogue: {title}",
+        "reason": "verified in Nexus official game catalogue",
+    }
+
+
+def discover_game(game_name: str, tavily_key: str = "",
+                  nexus_api_key: str = "") -> dict:
     """Resolve an unknown game name to a Nexus game slug.
 
     A missing static mapping is not evidence that Nexus has no page.  Discovery
@@ -38,7 +87,10 @@ def discover_game(game_name: str, tavily_key: str = "") -> dict:
     claiming that a game is unavailable when search cannot prove it.
     """
     name = _normalise_game_name(game_name)
-    cache_key = name.casefold()
+    # Credential availability is part of the cache key. Otherwise an early
+    # credentials_missing result would hide a valid discovery for 24 hours
+    # after the user configured their API keys.
+    cache_key = (name.casefold(), bool(tavily_key), bool(nexus_api_key))
     now = time.time()
     cached = _GAME_DISCOVERY_CACHE.get(cache_key)
     if cached and now - cached[0] < _GAME_DISCOVERY_TTL:
@@ -52,10 +104,27 @@ def discover_game(game_name: str, tavily_key: str = "") -> dict:
     }
     if not name:
         result["reason"] = "game name is empty"
-    elif not tavily_key:
-        result["status"] = "credentials_missing"
-        result["reason"] = "Tavily API key is required for unknown-game Nexus discovery"
-    else:
+    elif nexus_api_key:
+        try:
+            catalog = _api("https://api.nexusmods.com/v1/games.json",
+                           nexus_api_key)
+            games = catalog if isinstance(catalog, list) else catalog.get("data", [])
+            matched = _match_game_catalog(name, games)
+            if matched:
+                result = matched
+        except Exception as exc:
+            result["status"] = "search_failed"
+            result["reason"] = f"Nexus game catalogue failed: {exc}"[:160]
+
+    if name and result.get("status") != "available" and tavily_key:
+        # Tavily remains a fallback when the official catalogue is unavailable
+        # or has not yet indexed a newly-created game page.
+        result = {
+            "status": "not_detected",
+            "slug": "",
+            "evidence": "",
+            "reason": "no verified Nexus game page was discovered",
+        }
         body = json.dumps({
             "query": f'site:nexusmods.com/games "{name}"',
             "search_depth": "basic",
@@ -106,6 +175,11 @@ def discover_game(game_name: str, tavily_key: str = "") -> dict:
         except Exception as exc:
             result["status"] = "search_failed"
             result["reason"] = (str(exc) or type(exc).__name__)[:160]
+    elif name and result.get("status") != "available" and not nexus_api_key:
+        result["status"] = "credentials_missing"
+        result["reason"] = (
+            "Nexus or Tavily API key is required for unknown-game discovery"
+        )
 
     _GAME_DISCOVERY_CACHE[cache_key] = (now, dict(result))
     return result
@@ -118,6 +192,20 @@ def _api(url: str, api_key: str) -> dict:
     })
     with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
         return json.loads(resp.read())
+
+
+def resolve_game_id(game_slug: str, api_key: str) -> int:
+    """Resolve Nexus' numeric game id for a domain slug (including ``site``)."""
+    if not (game_slug or "").strip() or not api_key:
+        return 0
+    try:
+        data = _api(
+            f"https://api.nexusmods.com/v1/games/{game_slug.strip()}.json",
+            api_key,
+        )
+        return int(data.get("id") or data.get("game_id") or 0)
+    except Exception:
+        return 0
 
 
 def search(query: str, game_slug: str, api_key: str, cdp_port: int = 18888, game_id: int = 0, tavily_key: str = "") -> list[dict]:
@@ -185,6 +273,149 @@ def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
     return results
 
 
+_TOOL_QUERY_WORDS = (
+    "manager", "mod manager", "loader", "mod loader", "framework",
+    "injector", "patcher", "tool", "utility", "ue4ss", "bepinex",
+    "melonloader", "reframework",
+    "管理器", "加载器", "框架", "注入器", "工具", "前置",
+)
+
+
+def is_tool_query(query: str) -> bool:
+    """Return whether a query likely names a cross-game tool/framework."""
+    text = (query or "").casefold()
+    return any(word in text for word in _TOOL_QUERY_WORDS)
+
+
+def search_tool_entries(query: str, tavily_key: str, api_key: str = "",
+                        cdp_port: int = 18888, limit: int = 10) -> list[dict]:
+    """Search Nexus globally for duplicate/canonical tool entries.
+
+    Game pages often retain an old copy while the maintained tool moves to
+    ``site/mods/<id>``. Each result therefore carries its own Nexus slug.
+    """
+    if not tavily_key or not (query or "").strip():
+        return []
+    body = json.dumps({
+        "query": f'site:nexusmods.com "{query.strip()}" mod manager tool',
+        "search_depth": "basic",
+        "include_domains": ["nexusmods.com"],
+        "max_results": max(1, min(limit, 20)),
+    }).encode()
+    ctx = ssl._create_unverified_context()
+    try:
+        req = urllib.request.Request(
+            "https://api.tavily.com/search", data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {tavily_key}",
+            },
+        )
+        payload = json.loads(
+            urllib.request.urlopen(req, context=ctx, timeout=10).read()
+        )
+    except Exception:
+        return []
+
+    found = []
+    seen = set()
+    for item in payload.get("results", []):
+        url = item.get("url", "")
+        match = re.search(
+            r"nexusmods\.com/(?:games/)?([a-z0-9_-]+)/mods/(\d+)",
+            url, re.IGNORECASE,
+        )
+        if not match:
+            continue
+        nexus_slug, mod_id = match.group(1).lower(), int(match.group(2))
+        key = (nexus_slug, mod_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        result = {
+            "mod_id": mod_id,
+            "nexus_slug": nexus_slug,
+            "url": f"https://www.nexusmods.com/{nexus_slug}/mods/{mod_id}",
+            "name": item.get("title", "").split(" at ")[0].strip()[:100],
+            "summary": item.get("content", "")[:240],
+            "source_scope": "nexus_global_tool_search",
+        }
+        if api_key:
+            try:
+                detail = get_detail(mod_id, nexus_slug, api_key, cdp_port)
+                result.update({
+                    "name": detail.get("name") or result["name"],
+                    "summary": detail.get("summary") or result["summary"],
+                    "version": detail.get("version", ""),
+                    "updated_time": detail.get("updated_at", ""),
+                    "author": detail.get("author", ""),
+                    "endorsement_count": detail.get("endorsements", 0),
+                    "downloads": detail.get("downloads", 0),
+                    "file_id": detail.get("file_id"),
+                    "staleness": detail.get("staleness"),
+                })
+            except Exception:
+                pass
+        found.append(result)
+    return found
+
+
+def rank_duplicate_entries(results: list[dict]) -> list[dict]:
+    """Mark the newest same-name/same-author Nexus entry as canonical."""
+    import datetime as _dt
+
+    def normalized(value):
+        return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
+
+    def timestamp(item):
+        raw = item.get("updated_time") or item.get("updated") or ""
+        try:
+            return _dt.datetime.fromisoformat(
+                str(raw).replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
+            return 0
+
+    groups = {}
+    for item in results:
+        name = normalized(item.get("name"))
+        if name:
+            groups.setdefault(name, []).append(item)
+
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        known_authors = {
+            normalized(item.get("author")) for item in group
+            if normalized(item.get("author"))
+        }
+        # Exact title plus matching/unknown author is enough to compare mirrors.
+        # If two explicitly different authors reused a generic title, leave them
+        # separate rather than declaring one superseded.
+        if len(known_authors) > 1:
+            continue
+        winner = max(group, key=lambda item: (
+            timestamp(item),
+            item.get("nexus_slug") == "site",
+            str(item.get("version") or ""),
+        ))
+        for item in group:
+            item["duplicate_group"] = True
+            item["canonical_candidate"] = item is winner
+            if item is not winner:
+                item["superseded_by"] = {
+                    "mod_id": winner.get("mod_id"),
+                    "nexus_slug": winner.get("nexus_slug"),
+                    "version": winner.get("version", ""),
+                    "updated": winner.get("updated_time")
+                               or winner.get("updated", ""),
+                }
+    return sorted(results, key=lambda item: (
+        not item.get("canonical_candidate", False),
+        -timestamp(item),
+    ))
+
+
 def _search_api(query: str, game_slug: str, api_key: str, game_id: int) -> list[dict]:
     """用 /mods/updated.json 拿全量 mod_id → 本地缓存 → 按名称匹配 → 补全详情。"""
     cache_key = f"{game_slug}_{game_id}"
@@ -211,8 +442,18 @@ def _search_api(query: str, game_slug: str, api_key: str, game_id: int) -> list[
                 del _MOD_CACHE[oldest]
             _MOD_CACHE[cache_key] = (now, mods)
             return _match_and_detail(query, mods, game_slug, api_key)
-    except Exception:
-        pass
+    except urllib.error.HTTPError as exc:
+        status = "authentication_failed" if exc.code in (401, 403) else "source_unavailable"
+        raise NexusSearchUnavailable(status, f"Nexus API HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
+        raise NexusSearchUnavailable(
+            "source_unavailable",
+            f"无法连接 Nexus API: {getattr(exc, 'reason', exc)}",
+        ) from exc
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise NexusSearchUnavailable(
+            "invalid_response", f"Nexus API 返回无法解析的数据: {exc}"
+        ) from exc
 
     return []
 

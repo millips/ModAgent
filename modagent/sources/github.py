@@ -8,14 +8,9 @@ from . import _http_json, _safe, _dest
 from .. import downloader
 
 
-def search(query: str, game_name: str = "", limit: int = 10) -> list:
-    """GitHub Search API 搜仓库(公开,无需 key;未登录限流约 10 次/分)。
-    把游戏名并入查询提高相关性;结果仍可能混入非 mod 仓库(教程/存档工具),
-    由调用方读 summary/stars 判断——这是 GitHub 没有'游戏→mod'分类的固有限制。"""
-    q = " ".join(x for x in [(query or "").strip(), (game_name or "").strip()] if x)
-    if not q:
-        raise RuntimeError("搜索词为空")
-    url = ("https://api.github.com/search/repositories?q=" + urllib.parse.quote(q)
+def _search_once(query: str, limit: int) -> list:
+    """Run one GitHub repository search and normalize its results."""
+    url = ("https://api.github.com/search/repositories?q=" + urllib.parse.quote(query)
            + f"&sort=stars&order=desc&per_page={max(1, min(limit, 30))}")
     try:
         data = _http_json(url)
@@ -31,9 +26,32 @@ def search(query: str, game_name: str = "", limit: int = 10) -> list:
             "url": r.get("html_url", ""),
             "summary": (r.get("description") or "")[:140],
             "stars": r.get("stargazers_count", 0),
-            "updated_at": (r.get("pushed_at") or "")[:10],   # 最近推送,陈旧判断用
-            "archived": r.get("archived", False),            # 已归档=作者弃更,如实标注
+            "updated_at": (r.get("pushed_at") or "")[:10],
+            "archived": r.get("archived", False),
         })
+    return out
+
+
+def search(query: str, game_name: str = "", limit: int = 10) -> list:
+    """GitHub Search API 搜仓库(公开,无需 key;未登录限流约 10 次/分)。
+    把游戏名并入查询提高相关性;结果仍可能混入非 mod 仓库(教程/存档工具),
+    由调用方读 summary/stars 判断——这是 GitHub 没有'游戏→mod'分类的固有限制。"""
+    base_query = (query or "").strip()
+    game_name = (game_name or "").strip()
+    if not base_query:
+        raise RuntimeError("搜索词为空")
+    scoped_query = " ".join(x for x in (base_query, game_name) if x)
+    out = _search_once(scoped_query, limit)
+    if out or not game_name:
+        for item in out:
+            item["search_scope"] = "game"
+        return out
+
+    # 通用管理器、加载器、框架通常不会把某个游戏名写进仓库元数据。
+    # 游戏限定搜索为空时自动退回全局原词，避免把“限定没命中”误报成“不在 GitHub”。
+    out = _search_once(base_query, limit)
+    for item in out:
+        item["search_scope"] = "global_fallback"
     return out
 
 

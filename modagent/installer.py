@@ -196,6 +196,15 @@ def extract_archive(archive_path: str, extract_to: str) -> list[str]:
     if fmt == "zip":
         try:
             with zipfile.ZipFile(archive_path, "r") as zf:
+                root = os.path.abspath(extract_to)
+                for member in zf.infolist():
+                    destination = os.path.abspath(
+                        os.path.join(root, member.filename)
+                    )
+                    if os.path.commonpath((root, destination)) != root:
+                        raise RuntimeError(
+                            f"压缩包包含越界路径，已拒绝解压: {member.filename}"
+                        )
                 zf.extractall(extract_to)
                 return zf.namelist()
         except Exception as e:

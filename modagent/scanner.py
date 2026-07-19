@@ -251,9 +251,14 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str) -> dict:
 def import_mods(mods_to_import: list[dict]) -> int:
     import hashlib
     count = 0
-    existing = db.get_installed_mods()
-    existing_names = {m.name.lower() for m in existing}
+    existing_names_by_game: dict[str, set[str]] = {}
     for m in mods_to_import:
+        game_slug = str(m.get("game_slug") or "")
+        if game_slug not in existing_names_by_game:
+            existing_names_by_game[game_slug] = {
+                item.name.lower() for item in db.get_installed_mods(game_slug)
+            }
+        existing_names = existing_names_by_game[game_slug]
         if m["name"].lower() in existing_names:
             continue
         mod_id = str(m.get("mod_id") or "")
@@ -269,7 +274,7 @@ def import_mods(mods_to_import: list[dict]) -> int:
             file_id=m.get("file_id", 0),
             files_installed=json.dumps(files),
             installed_by="imported",
-            game_slug=m.get("game_slug", ""),
+            game_slug=game_slug,
         )
         db.add_mod(mod)
         existing_names.add(m["name"].lower())

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput } from 'lucide-react'
+import { emitFeedback } from '../feedback/feedbackBus'
 
 const MOCK_MODS = [
   { id: '107', name: 'Cyber Engine Tweaks', name_cn: 'CET 脚本框架', version: '1.32.2', latest: null, category: '框架', desc: '所有脚本 mod 的前置依赖', size: '2.3MB', hasConflict: false, disabled: false },
@@ -60,9 +61,10 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       const d = await r.json()
       if (d.issues?.length) {
         const names = d.issues.slice(0, 3).map(i => `${i.name}(${i.problem})`).join('、')
+        emitFeedback('warning', { source: 'mod-reconcile', count: d.issues.length })
         toast(`发现 ${d.issues.length}/${d.checked} 个 mod 账实不符: ${names}${d.issues.length > 3 ? ' 等' : ''}`, 'error')
-      } else toast(`对账完成: ${d.checked} 个 mod 账实一致`)
-    } catch (_) { toast('对账失败', 'error') }
+      } else { emitFeedback('notice', { source: 'mod-reconcile' }); toast(`对账完成: ${d.checked} 个 mod 账实一致`) }
+    } catch (_) { emitFeedback('error', { source: 'mod-reconcile' }); toast('对账失败', 'error') }
   }
 
   // 检查更新：跑 mod_update_check，把"最新版本"标到对应 mod 上 → 可更新筛选/更新按钮变真
@@ -83,11 +85,13 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       const map = {}
       ups.forEach(u => { map[String(u.mod_id)] = u.latest })
       setMods(prev => prev.map(m => ({ ...m, latest: map[String(m.id)] || null })))
+      emitFeedback('notice', { source: 'update-check', count: ups.length })
       const failed = data.failed_checks?.length || 0
       const checked = data.checked_nexus || 0
       if (failed) toast(`检查完成：${checked} 个成功，${failed} 个暂时无法查询${ups.length ? `，发现 ${ups.length} 个更新` : ''}`, 'error')
       else toast(ups.length ? `发现 ${ups.length} 个可更新` : `检查完成：${checked} 个 Nexus Mod 均为最新`)
     } catch (error) {
+      emitFeedback('error', { source: 'update-check' })
       toast(error?.name === 'AbortError' ? '检查超时，已解除按钮锁定；请稍后重试' : '检查更新失败', 'error')
     } finally {
       window.clearTimeout(timeoutId)
@@ -106,18 +110,19 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       })
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
-      if (data.error) { toast(friendlyErr(data.error), 'error'); setDlBusy(false); return }
+      if (data.error) { emitFeedback('error', { source: 'download' }); toast(friendlyErr(data.error), 'error'); setDlBusy(false); return }
       toast(`已下载 ${data.name || ''}，正在安装...`)
+      emitFeedback('install-start', { source: 'direct-install', name: data.name || '' })
       const r2 = await fetch(api + '/tool/mod_install', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ local_path: data.local_path }),
       })
       const d2 = await r2.json()
       const data2 = JSON.parse(d2.result || '{}')
-      if (data2.error) toast(friendlyErr(data2.error), 'error')
-      else { toast(`已安装 ${data.name || ''}（${(data2.files_installed || []).length} 文件）`); loadFromApi(); onRefresh?.() }
+      if (data2.error) { emitFeedback('error', { source: 'install' }); toast(friendlyErr(data2.error), 'error') }
+      else { emitFeedback('install-complete', { name: data.name || '' }); toast(`已安装 ${data.name || ''}（${(data2.files_installed || []).length} 文件）`); loadFromApi(); onRefresh?.() }
       setShowDownload(false); setDlUrl('')
-    } catch (_) { toast('下载失败', 'error') }
+    } catch (_) { emitFeedback('error', { source: 'download' }); toast('下载失败', 'error') }
     setDlBusy(false)
   }
 
@@ -177,14 +182,15 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       })
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
-      if (data.error) { toast(friendlyErr(data.error), 'error') }
+      if (data.error) { emitFeedback('error', { source: 'uninstall' }); toast(friendlyErr(data.error), 'error') }
       else {
+        emitFeedback('remove-complete', { modId: mod.id, name: mod.name })
         toast(`${mod.name || mod.id} 已卸载 (${data.removed || 0} 个文件)`)
         loadFromApi()
         onRefresh?.()
         if (data.dependents_warned?.length) toast(`警告: ${data.dependents_warned.join(', ')} 依赖此 Mod`, 'warn')
       }
-    } catch (e) { toast('卸载失败', 'error') }
+    } catch (e) { emitFeedback('error', { source: 'uninstall' }); toast('卸载失败', 'error') }
     setActionLock(null)
   }
 
@@ -201,16 +207,23 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
       if (data.error) {
+        emitFeedback('error', { source: action })
         toast(friendlyErr(data.error), 'error')
       } else if (data.blocked || data.requires_confirmation) {
         setDependencyGate({ mod, action, enabling, data })
+        emitFeedback(data.blocked || !enabling ? 'warning' : 'notice', {
+          source: 'dependency-gate', modId: mod.id,
+          count: (data.dependencies || data.dependents || data.missing_dependencies || []).length,
+        })
       } else {
         const affected = (data.enabled_mods || data.disabled_mods || []).length
+        emitFeedback(enabling ? 'enable' : 'disable', { source: action, modId: mod.id, count: affected })
         toast(`${mod.name} 已${enabling ? '启用' : '禁用'}${affected > 1 ? `，共处理 ${affected} 个 Mod` : ''}`)
         await loadFromApi()
         onRefresh?.()
       }
     } catch (e) {
+      emitFeedback('error', { source: action })
       toast('操作失败', 'error')
     }
     setActionLock(null)
@@ -241,7 +254,9 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
         items.push({ mod, preview })
       }
       setBatchDelete({ items })
+      emitFeedback('warning', { source: 'batch-uninstall-preview', count: items.length })
     } catch (error) {
+      emitFeedback('error', { source: 'batch-uninstall-preview' })
       toast(friendlyErr(error?.message || '批量卸载预览失败'), 'error')
     } finally {
       setBatchBusy(false)
@@ -270,12 +285,17 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       }
     }
     if (succeeded.length) {
+      emitFeedback('remove-complete', { source: 'batch-uninstall', count: succeeded.length })
       setSelected(prev => new Set([...prev].filter(id => !succeeded.includes(id))))
       await loadFromApi()
       onRefresh?.()
     }
-    if (failed.length) toast(`已卸载 ${succeeded.length} 个；${failed.length} 个失败：${failed.slice(0, 3).join('、')}`, 'error')
-    else toast(`已卸载 ${succeeded.length} 个 Mod`)
+    if (failed.length) {
+      emitFeedback('error', { source: 'batch-uninstall', count: failed.length })
+      toast(`已卸载 ${succeeded.length} 个；${failed.length} 个失败：${failed.slice(0, 3).join('、')}`, 'error')
+    } else {
+      toast(`已卸载 ${succeeded.length} 个 Mod`)
+    }
     setBatchBusy(false)
   }
 
@@ -329,11 +349,33 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                 try {
                   const r = await fetch(api + '/dropbox/open', { method: 'POST' })
                   const d = await r.json()
-                  if (d.ok) toast('已打开投放文件夹，把下载好的 mod 拖进去，再让 ModAgent 扫描安装')
-                  else toast('打开失败: ' + (d.error || ''), 'error')
-                } catch (e) { toast('打开失败', 'error') }
+                  if (d.ok) { emitFeedback('notice', { source: 'dropbox' }); toast('已打开投放文件夹，把下载好的 mod 拖进去，再让 ModAgent 扫描安装') }
+                  else { emitFeedback('error', { source: 'dropbox' }); toast('打开失败: ' + (d.error || ''), 'error') }
+                } catch (e) { emitFeedback('error', { source: 'dropbox' }); toast('打开失败', 'error') }
               }}>
               <FolderInput size={14} /> 投放文件夹
+            </button>
+            <button className="btn-ghost flex items-center gap-1" title="打开 ModAgent 为当前游戏保存下载包的目录"
+              onClick={async () => {
+                try {
+                  const r = await fetch(api + '/downloads/open', { method: 'POST' })
+                  const d = await r.json()
+                  if (d.ok) { emitFeedback('notice', { source: 'downloads' }); toast('已打开 Mod 文件夹') }
+                  else { emitFeedback('error', { source: 'downloads' }); toast('打开失败: ' + (d.error || ''), 'error') }
+                } catch (e) { emitFeedback('error', { source: 'downloads' }); toast('打开失败', 'error') }
+              }}>
+              <FolderInput size={14} /> Mod 文件夹
+            </button>
+            <button className="btn-ghost flex items-center gap-1" title="打开独立 Mod 管理器、加载器等工具的受控解压目录"
+              onClick={async () => {
+                try {
+                  const r = await fetch(api + '/tools/open', { method: 'POST' })
+                  const d = await r.json()
+                  if (d.ok) { emitFeedback('notice', { source: 'tools' }); toast('已打开工具目录') }
+                  else { emitFeedback('error', { source: 'tools' }); toast('打开失败: ' + (d.error || ''), 'error') }
+                } catch (e) { emitFeedback('error', { source: 'tools' }); toast('打开失败', 'error') }
+              }}>
+              <FolderInput size={14} /> 工具目录
             </button>
             <button className="btn-ghost flex items-center gap-1" onClick={toggleAll}>
               <CheckSquare size={14} /> {selected.size === filtered.length ? '取消全选' : '全选'}
@@ -401,6 +443,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                   onClick={async () => {
                     setActionLock(mod.id)
                     toast(`更新 ${mod.name}...`)
+                    emitFeedback('install-start', { source: 'mod-update', modId: mod.id })
                     try {
                       const r = await fetch(api + '/tool/mod_update', {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -408,9 +451,9 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                       })
                       const d = await r.json()
                       const data = JSON.parse(d.result || '{}')
-                      if (data.error) toast(friendlyErr(data.error), 'error')
-                      else { toast(`${mod.name} 已更新`); loadFromApi(); onRefresh?.() }
-                    } catch (e) { toast('更新失败', 'error') }
+                      if (data.error) { emitFeedback('error', { source: 'mod-update' }); toast(friendlyErr(data.error), 'error') }
+                      else { emitFeedback('install-complete', { source: 'mod-update', modId: mod.id }); toast(`${mod.name} 已更新`); loadFromApi(); onRefresh?.() }
+                    } catch (e) { emitFeedback('error', { source: 'mod-update' }); toast('更新失败', 'error') }
                     setActionLock(null)
                   }} className="btn-ghost p-1.5" title="更新">
                   {actionLock === mod.id ? <RefreshCw size={14} className="animate-spin" /> : <RefreshCw size={14} className="text-cyber-cyan" />}
@@ -520,7 +563,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
         </div>
       )}
 
-      {/* 依赖链启停门禁（正式版：无订阅音效与中枢特效） */}
+      {/* 依赖链启停门禁 */}
       {dependencyGate && (
         <div className="fixed inset-0 bg-black/65 flex items-center justify-center z-50" onClick={() => setDependencyGate(null)}>
           <div className="bg-surface-800 border border-surface-600 rounded-lg p-6 max-w-md w-full shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>

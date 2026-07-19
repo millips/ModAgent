@@ -91,11 +91,55 @@ def _find_shipping_exe(game_root: str, max_depth: int = 4) -> str | None:
     return biggest[1] if biggest[0] > 20 * 1024 * 1024 else None
 
 
+def _find_unity_exe(game_root: str) -> tuple[str | None, list[str]]:
+    """Recognise Unity installs by structure instead of executable size."""
+    try:
+        entries = os.listdir(game_root)
+    except OSError:
+        return None, []
+
+    by_lower = {entry.casefold(): entry for entry in entries}
+    for entry in entries:
+        if not entry.lower().endswith(".exe"):
+            continue
+        stem = os.path.splitext(entry)[0]
+        data_name = by_lower.get(f"{stem}_data".casefold())
+        if not data_name:
+            continue
+        data_dir = os.path.join(game_root, data_name)
+        if not os.path.isdir(data_dir):
+            continue
+
+        evidence = [f"matching_data_dir:{data_name}"]
+        for marker in ("UnityPlayer.dll", "GameAssembly.dll"):
+            actual = by_lower.get(marker.casefold())
+            if actual and os.path.isfile(os.path.join(game_root, actual)):
+                evidence.append(actual)
+        for marker in ("globalgamemanagers", "resources.assets"):
+            if os.path.isfile(os.path.join(data_dir, marker)):
+                evidence.append(f"{data_name}/{marker}")
+        return os.path.join(game_root, entry), evidence
+    return None, []
+
+
 def verify_game_alive(game_root: str) -> dict:
     """活体验证:判断 game_root 是不是一个真实可玩的游戏安装(而非卸载残骸/空壳)。
     供安装前守卫和游戏体检使用。返回 {alive, shipping_exe, reason}。"""
     if not game_root or not os.path.isdir(game_root):
         return {"alive": False, "shipping_exe": None, "reason": "目录不存在"}
+    unity_exe, unity_evidence = _find_unity_exe(game_root)
+    if unity_exe:
+        stem = os.path.splitext(os.path.basename(unity_exe))[0]
+        return {
+            "alive": True,
+            "shipping_exe": unity_exe,
+            "engine": "unity",
+            "evidence": unity_evidence,
+            "reason": (
+                f"检测到 Unity 游戏结构: {os.path.basename(unity_exe)} + "
+                f"{stem}_Data"
+            ),
+        }
     exe = _find_shipping_exe(game_root)
     if exe:
         return {"alive": True, "shipping_exe": exe,

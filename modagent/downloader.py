@@ -2,7 +2,10 @@ import asyncio
 import glob
 import json
 import os
+import re
+import shutil
 import ssl
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -16,6 +19,7 @@ USER_AGENT = "ModAgent/1.0"
 # 投放文件夹(靶向文件夹):放在用户数据区,给"没法自动搜/下的站"(三宫六院/3DM/网盘/私享)
 # 一个统一入口——用户手动下载的 mod 扔进来,ModAgent 扫描→透视→mod_install_custom 安装。
 DROPBOX_DIR = os.path.join(CONFIG_DIR, "dropbox")
+TOOLS_DIR = os.path.join(CONFIG_DIR, "tools")
 
 
 def ensure_downloads_dir(game_slug: str) -> str:
@@ -28,6 +32,84 @@ def ensure_dropbox_dir(game_slug: str) -> str:
     path = os.path.join(DROPBOX_DIR, game_slug or "_unknown")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def ensure_tools_dir() -> str:
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    return TOOLS_DIR
+
+
+def extract_external_tool(archive_path: str, display_name: str = "") -> dict:
+    """Extract a standalone modding tool into ModAgent's managed tools folder."""
+    from . import installer
+
+    archive_path = os.path.abspath(archive_path or "")
+    allowed_roots = (
+        os.path.abspath(DOWNLOADS_DIR),
+        os.path.abspath(DROPBOX_DIR),
+    )
+    if not archive_path or not os.path.isfile(archive_path):
+        raise FileNotFoundError(f"外部工具压缩包不存在: {archive_path}")
+    if not any(
+        os.path.commonpath((archive_path, root)) == root
+        for root in allowed_roots
+    ):
+        raise RuntimeError("外部工具只允许从 ModAgent 下载缓存或投放文件夹解压")
+
+    raw_name = display_name or os.path.splitext(os.path.basename(archive_path))[0]
+    safe_name = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", raw_name).strip("._")
+    if not safe_name:
+        safe_name = "external_tool"
+    tools_root = ensure_tools_dir()
+    target = os.path.abspath(os.path.join(tools_root, safe_name[:100]))
+    if os.path.commonpath((target, os.path.abspath(tools_root))) != os.path.abspath(tools_root):
+        raise RuntimeError("外部工具目标目录越界")
+
+    if os.path.isdir(target):
+        executables = [
+            os.path.join(root, filename)
+            for root, _, files in os.walk(target)
+            for filename in files
+            if filename.lower().endswith(".exe")
+        ]
+        return {
+            "status": "already_extracted",
+            "archive_path": archive_path,
+            "tool_dir": target,
+            "executables": executables[:20],
+        }
+
+    temp_dir = tempfile.mkdtemp(prefix=".extract-", dir=tools_root)
+    try:
+        members = installer.extract_archive(archive_path, temp_dir)
+        entries = [
+            entry for entry in os.listdir(temp_dir)
+            if entry.lower() != "__macosx"
+        ]
+        source = temp_dir
+        if len(entries) == 1 and os.path.isdir(os.path.join(temp_dir, entries[0])):
+            source = os.path.join(temp_dir, entries[0])
+        os.replace(source, target)
+        if source != temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+    executables = [
+        os.path.join(root, filename)
+        for root, _, files in os.walk(target)
+        for filename in files
+        if filename.lower().endswith(".exe")
+    ]
+    return {
+        "status": "extracted",
+        "archive_path": archive_path,
+        "tool_dir": target,
+        "file_count": len(members),
+        "executables": executables[:20],
+        "note": "已解压但未自动运行可执行文件；首次启动和工具自身的游戏选择由用户确认。",
+    }
 
 
 # ── Preflight ──
@@ -710,26 +792,18 @@ async def download_mod(
     local_path = os.path.join(DOWNLOADS_DIR, game_slug, filename)
 
     last_err = None
-    consecutive_403 = 0
     for attempt in range(6):
         # 每次都重新生成直链（旧链可能已过期）。
         # 走"文件页上下文"通路:免费账号必须如此(从首页等其他页请求必 403),Premium 同样兼容。
         try:
             cdn_url = await get_download_url_filepage(cdp_port, game_slug, mod_id, file_id, game_id)
-            consecutive_403 = 0
         except RuntimeError as e:
             last_err = e
-            if "403" in str(e):
-                consecutive_403 += 1
-                if consecutive_403 >= 2:
-                    # 同一上下文连吃两次 403,重试无意义:快速失败并给出用户可执行的下一步
-                    raise RuntimeError(
-                        f"下载 mod {mod_id} 失败: 文件页上下文内仍返回 403。"
-                        f"可能原因:未登录 Nexus / 该文件需站内确认。请在 Chrome 里打开 "
-                        f"https://www.nexusmods.com/{game_slug}/mods/{mod_id}?tab=files "
-                        f"手动点一次 Slow download,之后重试本命令。") from e
-            await asyncio.sleep(2)
-            continue
+            # get_download_url_filepage 已在同一个标签内重试三次。继续外层循环
+            # 只会反复开 Files 页，并不能修复登录、参数或站方确认问题。
+            raise RuntimeError(
+                f"下载 mod {mod_id} 失败: {e}"
+            ) from e
         if not cdn_url or cdn_url == 'None':
             last_err = RuntimeError("获取下载链接失败")
             await asyncio.sleep(2)

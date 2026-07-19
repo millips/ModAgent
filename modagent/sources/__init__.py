@@ -34,7 +34,7 @@ _SRC_TTL = 3600
 
 
 def available_sources(game_name: str, game_slug: str, game_root: str,
-                      tavily_key: str = "") -> dict:
+                      tavily_key: str = "", nexus_api_key: str = "") -> dict:
     """当前游戏在哪些平台有 mod 可搜。CURRENT STATE 注入 + mod_recommend 选源共用。
     本地判断(nexus=slug 非 local_、工坊=acf 解析)零成本;联网探测(thunderstore 社区、
     gamebanana 收录)并发跑、单项限时 4 秒,失败按不可用处理——绝不阻塞对话首条消息。
@@ -43,6 +43,7 @@ def available_sources(game_name: str, game_slug: str, game_root: str,
     key = (
         (game_slug or game_name or "").lower(),
         bool(tavily_key),
+        bool(nexus_api_key),
     )
     hit = _SRC_CACHE.get(key)
     if hit and time.time() - hit[0] < _SRC_TTL:
@@ -70,7 +71,9 @@ def available_sources(game_name: str, game_slug: str, game_root: str,
     if not static_nexus:
         try:
             from .. import nexus
-            discovered = nexus.discover_game(game_name, tavily_key)
+            discovered = nexus.discover_game(
+                game_name, tavily_key, nexus_api_key
+            )
             out["source_status"]["nexus"] = discovered
             if discovered.get("status") == "available":
                 out["nexus"] = discovered.get("slug") or None

@@ -52,12 +52,14 @@ def find_community(game_name: str):
     return None
 
 
-def _packages(community: str) -> list:
+def _packages(community: str, force_refresh: bool = False) -> list:
     now = time.time()
     cached = _PKG_CACHE.get(community)
-    if cached and now - cached[0] < _PKG_TTL:
+    if not force_refresh and cached and now - cached[0] < _PKG_TTL:
         return cached[1]
     pkgs = _http_json(f"https://thunderstore.io/c/{community}/api/v1/package/")
+    if not isinstance(pkgs, list):
+        raise RuntimeError("Thunderstore package API returned an invalid response")
     _PKG_CACHE[community] = (now, pkgs)
     return pkgs
 
@@ -86,9 +88,10 @@ def download(url: str, game_slug: str, progress_callback=None) -> dict:
     return {"local_path": dest, "name": f"{ns}-{name}", "source": "thunderstore", "version": ver}
 
 
-def search(community: str, query: str, limit: int = 12) -> list:
+def search(community: str, query: str, limit: int = 12,
+           force_refresh: bool = False) -> list:
     """在某社区(=游戏)的包列表里按名称/作者/简介搜，按下载量排序。"""
-    pkgs = _packages(community)
+    pkgs = _packages(community, force_refresh=force_refresh)
     q = (query or "").strip().lower()
     out = []
     for p in pkgs:

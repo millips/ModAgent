@@ -22,6 +22,7 @@ def check(label, condition, detail=""):
 originals = {
     "discover_game": nexus.discover_game,
     "nexus_search": nexus.search,
+    "nexus_get_detail": nexus.get_detail,
     "resolve_deps": nexus.resolve_deps,
     "workshop_resolve": workshop.resolve_appid,
     "workshop_search": workshop.search,
@@ -31,7 +32,7 @@ originals = {
 }
 
 try:
-    nexus.discover_game = lambda name, key="": {
+    nexus.discover_game = lambda name, key="", nexus_key="": {
         "status": "available",
         "slug": "generic-unknown-game",
         "evidence": "https://www.nexusmods.com/games/generic-unknown-game",
@@ -41,7 +42,7 @@ try:
     thunderstore.find_community = lambda name: None
     gamebanana.find_game = lambda name: None
     github.search = lambda q, game, limit=5: []
-    nexus.search = lambda q, slug, key: []
+    nexus.search = lambda q, slug, key, **kwargs: []
     nexus.resolve_deps = lambda mid, slug, key: []
 
     sources._SRC_CACHE.clear()
@@ -64,6 +65,17 @@ try:
     check("B2 empty Nexus is consulted and empty, not unavailable",
           "nexus" in result["sources_consulted"]
           and "nexus" in result["sources_empty"])
+
+    detail_calls = []
+    nexus.get_detail = lambda mid, slug, key, cdp_port=18888: (
+        detail_calls.append((mid, slug)) or
+        {"mod_id": mid, "name": "Verified detail"}
+    )
+    detail = json.loads(tools.execute(
+        "nexus_get_detail", {"mod_id": 2429}, cfg))
+    check("B3 detail reuses dynamically discovered Nexus slug",
+          detail.get("name") == "Verified detail"
+          and detail_calls == [(2429, "generic-unknown-game")])
 
     persist = [
         {
@@ -93,6 +105,11 @@ try:
         "Nexus 没有专区，Steam 创意工坊也确定未收录。", persist)
     check("C3 unsupported platform absence blocked", not false_nexus.ok)
 
+    false_github_location = validator.validate_search_report(
+        "Fluffy Mod Manager 不在 GitHub 上，只能去作者官网。", persist)
+    check("C3b empty GitHub result cannot prove a project is not on GitHub",
+          not false_github_location.ok)
+
     uncalled = validator.validate_search_report(
         "GameBanana 已搜索，但没有结果。", persist)
     check("C4 unconsulted source claim blocked", not uncalled.ok)
@@ -105,9 +122,22 @@ try:
     check("C6 deterministic fallback distinguishes empty and skipped",
           "Nexus：已查询，本次未搜到" in fallback
           and "Steam 创意工坊：本轮未查询" in fallback)
+    detail_404 = persist + [
+        {"role": "assistant", "tool_calls": [{
+            "id": "detail-404", "type": "function",
+            "function": {"name": "nexus_get_detail", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "detail-404",
+         "content": json.dumps({"error": "HTTP Error 404: Not Found"})},
+    ]
+    invented_cause = validator.validate_search_report(
+        "Nexus API 对成人内容的访问受限，工具侧绕不过去。", detail_404)
+    check("C7 a 404 cannot become an adult-content restriction",
+          not invented_cause.ok)
 finally:
     nexus.discover_game = originals["discover_game"]
     nexus.search = originals["nexus_search"]
+    nexus.get_detail = originals["nexus_get_detail"]
     nexus.resolve_deps = originals["resolve_deps"]
     workshop.resolve_appid = originals["workshop_resolve"]
     workshop.search = originals["workshop_search"]
