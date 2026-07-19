@@ -102,3 +102,4 @@ ModAgent 普通版以 **GNU GPL v3.0 only** 发布，详见 [LICENSE.md](LICENSE
 ## 联系
 
 问题反馈、权利投诉与公开联系：`3387454098@qq.com`
+我的支持频道:https://afdian.com/a/catgirl_creator
