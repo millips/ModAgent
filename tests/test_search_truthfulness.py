@@ -32,7 +32,7 @@ originals = {
 }
 
 try:
-    nexus.discover_game = lambda name, key="": {
+    nexus.discover_game = lambda name, key="", nexus_key="": {
         "status": "available",
         "slug": "generic-unknown-game",
         "evidence": "https://www.nexusmods.com/games/generic-unknown-game",
@@ -42,7 +42,7 @@ try:
     thunderstore.find_community = lambda name: None
     gamebanana.find_game = lambda name: None
     github.search = lambda q, game, limit=5: []
-    nexus.search = lambda q, slug, key: []
+    nexus.search = lambda q, slug, key, **kwargs: []
     nexus.resolve_deps = lambda mid, slug, key: []
 
     sources._SRC_CACHE.clear()

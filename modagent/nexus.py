@@ -63,14 +63,16 @@ def _match_game_catalog(game_name: str, games) -> dict | None:
         if overlap >= required:
             exact = int(_normalise_game_name(title).casefold()
                         == _normalise_game_name(game_name).casefold())
-            candidates.append((exact, overlap, slug, title))
+            candidates.append((
+                exact, overlap, slug, title, int(item.get("id") or 0)
+            ))
     if not candidates:
         return None
-    _, _, slug, title = max(candidates)
+    _, _, slug, title, game_id = max(candidates)
     return {
         "status": "available",
         "slug": slug,
-        "game_id": int(item.get("id") or 0),
+        "game_id": game_id,
         "evidence": f"Nexus API games catalogue: {title}",
         "reason": "verified in Nexus official game catalogue",
     }
