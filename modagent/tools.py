@@ -1684,12 +1684,16 @@ def execute(name: str, args: dict, cfg: Config) -> str:
 
     # T15b:框架日志诊断(export=true 额外打脱敏诊断包)
     elif name == "game_diagnose":
+        installed = db.get_installed_mods(slug)
         if args.get("export"):
             r = diagnostics.export_diag_bundle(
-                root, slug, cfg, db.get_installed_mods(slug),
+                root, slug, cfg, installed,
                 db.get_operation_log(limit=500), app_version=__import__("modagent").__version__)
         else:
-            r = diagnostics.game_diagnose(root, slug, db.get_installed_mods(slug))
+            r = diagnostics.game_diagnose(root, slug, installed)
+            from .diagnostic_impact import build_diagnostic_strategy
+            bindings = {str(item["mod_id"]): item for item in db.get_mod_source_bindings(slug)}
+            r["diagnostic_strategy"] = build_diagnostic_strategy(r, installed, bindings)
         return json.dumps(r, ensure_ascii=False, indent=1)
 
     # T16
@@ -2027,25 +2031,41 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not mod:
             return json.dumps({"error": f"未找到 Mod: {args['mod_id']}"}, ensure_ascii=False)
         dependents = db.get_dependent_chain(mod.id, slug)
-        dependent_info = [_toggle_mod_info(item) for item in dependents]
-        plan = dependents + [mod]
+        full_plan = dependents + [mod]
+        plan = [item for item in full_plan if not installer.is_mod_disabled(_mod_files(item))]
+        already_disabled = [item for item in full_plan if installer.is_mod_disabled(_mod_files(item))]
+        dependent_info = [
+            _toggle_mod_info(item) for item in dependents
+            if not installer.is_mod_disabled(_mod_files(item))
+        ]
         if not args.get("confirmed"):
+            from .diagnostic_impact import build_disable_impact
+            bindings = {str(item["mod_id"]): item for item in db.get_mod_source_bindings(slug)}
             return json.dumps({
                 "requires_confirmation": True,
                 "action": "disable",
                 "target": _toggle_mod_info(mod),
                 "dependents": dependent_info,
                 "will_disable": [_toggle_mod_info(item) for item in plan],
+                "already_disabled": [_toggle_mod_info(item) for item in already_disabled],
                 "file_count": sum(len(_mod_files(item)) for item in plan),
                 "external_configs": user_config.preview_toggle_mod_configs(slug, [str(item.id) for item in plan]),
+                "decision_support": build_disable_impact(
+                    mod, plan, already_disabled, db.get_installed_mods(slug), bindings),
                 "confirmation_token": confirmation.issue("mod_disable", str(mod.id)),
-                "note": "继续会改名禁用列出的文件，并同步停用这些 Mod 写入 Documents/AppData 的受管配置。请展示影响并等待下一轮明确确认。",
+                "note": "请先说明会失去和保留的功能、诊断理由、恢复方法及下一步，再等待用户下一轮明确确认；文件数只作技术附注。",
             }, indent=2, ensure_ascii=False)
         if not confirmation.consume(args.get("confirmation_token", ""), "mod_disable", str(mod.id)):
             return json.dumps({
                 "error": "mod_disable_confirmation_invalid",
                 "message": "禁用确认令牌缺失、过期或已使用；请重新生成禁用预览并让用户确认。",
             }, ensure_ascii=False)
+        if not plan:
+            return json.dumps({
+                "disabled": 0, "disabled_mods": [], "already_disabled": True,
+                "verified": True,
+                "message": "目标及其依赖项已经禁用，本次未重复修改文件。",
+            }, indent=2, ensure_ascii=False)
         operation = _execute_toggle_plan(plan, enabling=False, game_slug=slug)
         if operation.get("error"):
             return json.dumps(operation, indent=2, ensure_ascii=False)

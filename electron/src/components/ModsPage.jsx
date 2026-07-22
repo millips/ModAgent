@@ -227,7 +227,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     setActionLock(null)
   }
 
-  const toggleMod = async (mod, confirmed = false) => {
+  const toggleMod = async (mod, confirmed = false, confirmationToken = '') => {
     const enabling = !!mod.disabled
     const action = enabling ? 'mod_enable' : 'mod_disable'
     setActionLock(mod.id)
@@ -235,7 +235,10 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     try {
       const r = await fetch(api + '/tool/' + action, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mod_id: mod.id, ...(confirmed ? { confirmed: true } : {}) })
+        body: JSON.stringify({
+          mod_id: mod.id,
+          ...(confirmed ? { confirmed: true, confirmation_token: confirmationToken } : {}),
+        })
       })
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
@@ -266,7 +269,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     const gate = dependencyGate
     if (!gate || gate.data.blocked) return
     setDependencyGate(null)
-    await toggleMod(gate.mod, true)
+    await toggleMod(gate.mod, true, gate.data.confirmation_token || '')
   }
 
   const previewBatchDelete = async () => {
@@ -617,6 +620,21 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
             </div>
             <div className="bg-surface-900 rounded-md p-3 mb-4 text-xs text-surface-400 space-y-2">
               <p>{dependencyGate.data.note}</p>
+              {!!dependencyGate.data.decision_support && (
+                <div className="space-y-2 border-l-2 border-cyber-yellow/60 pl-3">
+                  <p className="text-white">{dependencyGate.data.decision_support.summary}</p>
+                  <p><span className="text-cyber-yellow">你会暂时失去：</span>{dependencyGate.data.decision_support.player_impact?.map(item => `${item.name}（${item.role_label}）：${item.functionality_lost}`).join('；')}</p>
+                  {!!dependencyGate.data.decision_support.already_inactive?.length && (
+                    <p><span className="text-surface-500">无需重复处理：</span>{dependencyGate.data.decision_support.already_inactive.map(item => item.name).join('、')} 已经禁用</p>
+                  )}
+                  {!!dependencyGate.data.decision_support.retained?.length && (
+                    <p><span className="text-cyber-cyan">仍会保留：</span>{dependencyGate.data.decision_support.retained.map(item => item.name).join('、')}</p>
+                  )}
+                  <p><span className="text-white/80">为什么建议这样试：</span>{dependencyGate.data.decision_support.why_this_step}</p>
+                  <p><span className="text-white/80">建议：</span>{dependencyGate.data.decision_support.recommendation}</p>
+                  <p className="text-surface-500">{dependencyGate.data.decision_support.recovery}</p>
+                </div>
+              )}
               {!!dependencyGate.data.dependents?.length && (
                 <div>
                   <p className="text-cyber-yellow mb-1">依赖它、将被连带禁用：</p>

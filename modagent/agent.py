@@ -275,6 +275,9 @@ class Agent:
                 return "回滚未完整完成，请查看待处理文件"
             return (f"回滚并复核完成：删除 {data.get('deleted', 0)} 个、"
                     f"还原 {data.get('restored', 0)} 个文件")
+        if name == "mod_disable" and data.get("requires_confirmation"):
+            support = data.get("decision_support") or {}
+            return str(support.get("summary") or "禁用影响预览已生成；等待你的确认")
         if name == "batch_download":
             return f"下载进度：成功 {len(data.get('success') or [])} 项，待处理 {len(data.get('failed') or [])} 项"
         if name == "mod_install_batch":
@@ -285,6 +288,67 @@ class Agent:
         if data.get("already_installed"):
             return "已存在，已跳过重复操作"
         return labels.get(name, ("已完成 " if ok else "未完成 ") + name)
+
+    @staticmethod
+    def _ensure_disable_decision_support(reply: str, persisted: list[dict]) -> str:
+        """Deterministic guardrail for player-impact-aware disable confirmations.
+
+        The model may occasionally reduce a rich preview back to file counts.  The
+        backend already supplied verified structured facts, so append those facts
+        instead of asking the model to invent a second explanation.
+        """
+        support = None
+        for message in reversed(persisted):
+            if message.get("role") != "tool":
+                continue
+            try:
+                data = json.loads(message.get("content") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if data.get("requires_confirmation") and isinstance(data.get("decision_support"), dict):
+                support = data["decision_support"]
+                break
+        if not support:
+            return reply
+        required_markers = ("暂时失去", "仍会保留", "恢复")
+        if all(marker in reply for marker in required_markers):
+            return reply
+
+        impacts = []
+        for item in support.get("player_impact") or []:
+            impacts.append(
+                f"- {item.get('name') or item.get('id')}（{item.get('role_label') or 'Mod'}）："
+                f"{item.get('functionality_lost') or '对应功能将暂时不可用。'}"
+            )
+        retained = "、".join(
+            str(item.get("name") or item.get("id"))
+            for item in (support.get("retained") or [])[:12]
+        ) or "未列入本次计划的其他 Mod"
+        inactive = "、".join(
+            str(item.get("name") or item.get("id"))
+            for item in support.get("already_inactive") or []
+        )
+        block = [
+            "\n\n### 这次诊断变更的实际影响",
+            "",
+            "你会暂时失去：",
+            *(impacts or ["- 目标 Mod 对应的功能将暂时不可用。"]),
+            "",
+            f"仍会保留：{retained}。",
+        ]
+        if inactive:
+            block.extend(["", f"无需重复处理：{inactive} 已经禁用，本次不会再次修改。"])
+        block.extend([
+            "",
+            f"为什么这样试：{support.get('why_this_step') or ''}",
+            f"建议：{support.get('recommendation') or ''}",
+            f"如何恢复：{support.get('recovery') or ''}",
+            f"如果故障消失：{support.get('next_if_fixed') or ''}",
+            f"如果故障仍在：{support.get('next_if_not_fixed') or ''}",
+            "",
+            "如果你同意按这个范围做一次可逆隔离测试，请明确回复确认禁用；在你确认前不会修改文件。",
+        ])
+        return reply.rstrip() + "\n".join(block)
 
     # ── helpers ────────────────────────────────────────────────────────────
 
@@ -459,6 +523,7 @@ class Agent:
                     continue
                 if not search_res.ok:
                     reply = build_search_fallback(persist)
+            reply = self._ensure_disable_decision_support(reply, persist)
             persist.append({"role": "assistant", "content": reply})
             self.history.extend(persist)
             return reply
@@ -686,6 +751,7 @@ class Agent:
                     if not search_res.ok:
                         final_text = build_search_fallback(persist)
 
+                final_text = self._ensure_disable_decision_support(final_text, persist)
                 recommendation_set = {}
                 if (
                     current_edition() == "subscription"
