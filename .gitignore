@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+node_modules/
+downloads/
+dist/
+build/
+*.log
+.DS_Store
+snapshots/
+*.egg-info/
+
+# Local workspace state and historical copies must never enter releases.
+.claude/settings.local.json
+backups/
+_stage_backup/
+electron/release/

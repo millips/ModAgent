@@ -1,0 +1,25 @@
+{
+  "theme": "technology-core",
+  "asset": "nav-active-frame.9.png",
+  "role": "sidebar-navigation-active-frame",
+  "canvas": {
+    "width": 768,
+    "height": 160,
+    "scale": 4,
+    "logicalWidth": 192,
+    "logicalHeight": 40
+  },
+  "nineSlice": {
+    "left": 96,
+    "right": 64,
+    "top": 0,
+    "bottom": 0,
+    "unit": "physical-px",
+    "logicalLeft": 24,
+    "logicalRight": 16
+  },
+  "textAndIcon": {
+    "renderedByProgram": true,
+    "recommendedIconSize": 16
+  }
+}

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ModAgent · Feedback Lab</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="overrides.css">
+</head>
+<body>
+  <header>
+    <div><span class="eyebrow">MODAGENT / EXPERIMENTAL</span><h1>FEEDBACK LAB</h1></div>
+    <div class="header-actions"><div class="sound-version" aria-label="Sound version"><button id="soundV1" class="active">V1 CURRENT</button><button id="soundV2">V2 ORIGINAL</button><button id="soundV21">V2.1 CLOSER</button><button id="soundPaid">PAID / 商用候选</button></div><span id="audioState">音频引擎待命</span><button id="addAudio">＋ 添加素材</button><button id="savePreset">保存方案</button></div>
+  </header>
+  <main>
+    <aside class="library panel">
+      <div class="panel-title"><div><small>01</small><h2>声音素材库</h2></div><span id="assetCount">0</span></div>
+      <input id="search" placeholder="搜索 coin / mechanical / 科技…">
+      <div id="assetList" class="asset-list"></div>
+    </aside>
+
+    <section class="workspace">
+      <div class="stage panel">
+        <div class="panel-title"><div><small>02</small><h2>交互舞台</h2></div><span class="live">LIVE</span></div>
+        <div class="stage-space" id="stageSpace">
+          <div class="orbital o1"></div><div class="orbital o2"></div>
+          <div class="guide-rail rail-left"></div><div class="guide-rail rail-right"></div>
+          <div id="dataModule"><i></i><b>MOD</b></div>
+          <div id="snapshotMembrane"><span>STATE COPY</span></div>
+          <div id="batchLanes"><i></i><i></i><i></i></div>
+          <div id="resultFeedback" aria-hidden="true"><i></i><span></span></div>
+          <div id="comboFeedback" aria-hidden="true"><b>×<span>1</span></b><small>CHAIN</small><i></i><i></i><i></i></div>
+          <button id="heroButton" aria-label="触发反馈"><span class="core"></span><span class="label">PRESS TO TEST</span></button>
+          <div id="particles"></div>
+        </div>
+        <div class="event-tabs" id="eventTabs">
+          <button data-event="startup">启动</button><button data-event="hover">悬浮</button><button class="active" data-event="press">按下</button>
+          <button data-event="downloadStart">下载开始</button><button data-event="downloadComplete">下载完成</button>
+          <button data-event="install">安装</button><button data-event="success">安装完成</button><button data-event="notice">轻提示</button>
+          <button data-event="remove">卸载</button><button data-event="snapshot">快照</button><button data-event="rollback">回滚</button>
+          <button data-event="warning">冲突警告</button><button data-event="error">操作失败</button>
+          <button data-event="destructive">危险警告</button><button data-event="cancel">取消撤销</button>
+          <button data-event="enable">启用</button><button data-event="disable">禁用</button>
+          <button data-event="scanStart">扫描开始</button><button data-event="scanComplete">扫描完成</button>
+          <button data-event="batchComplete">批量完成</button>
+        </div>
+      </div>
+
+      <div class="timeline panel">
+        <div class="panel-title"><div><small>03</small><h2>声音分层</h2></div><div class="timeline-actions"><label id="batchCountWrap">批量数 <input id="batchCount" type="number" min="1" max="999" value="12"></label><button id="playSequence">▶ 播放组合</button></div></div>
+        <div id="layers"></div>
+        <div class="ruler"><span>0ms</span><span>250</span><span>500</span><span>750</span><span>1000ms</span></div>
+      </div>
+    </section>
+
+    <aside class="controls panel">
+      <div class="panel-title"><div><small>04</small><h2>反馈参数</h2></div><button id="reset">重置</button></div>
+      <div class="control-group"><h3>AUDIO</h3>
+        <label>主音量 <output id="volumeOut">72%</output><input id="volume" type="range" min="0" max="100" value="72"></label>
+        <label>播放速率 <output id="rateOut">1.00×</output><input id="rate" type="range" min="60" max="140" value="100"></label>
+        <label>随机变调 <output id="jitterOut">0%</output><input id="jitter" type="range" min="0" max="12" value="0"></label>
+      </div>
+      <div class="control-group"><h3>MOTION</h3>
+        <label>时长 <output id="durationOut">420ms</output><input id="duration" type="range" min="120" max="1200" value="420"></label>
+        <label>按压深度 <output id="depthOut">8%</output><input id="depth" type="range" min="1" max="20" value="8"></label>
+        <label>辉光强度 <output id="glowOut">65%</output><input id="glow" type="range" min="0" max="100" value="65"></label>
+        <label>粒子数量 <output id="particleOut">16</output><input id="particle" type="range" min="0" max="40" value="16"></label>
+      </div>
+      <div class="control-group"><h3>FEEL</h3><div class="feel-grid">
+        <button data-feel="precise" class="active">精密</button><button data-feel="heavy">沉重</button>
+        <button data-feel="elastic">弹性</button><button data-feel="glitch">脉冲</button>
+      </div></div>
+      <div class="meter"><div id="meterFill"></div></div>
+      <p class="hint">点击素材试听；点击“＋层”加入当前事件。所有参数和组合仅保存在本机。</p>
+    </aside>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

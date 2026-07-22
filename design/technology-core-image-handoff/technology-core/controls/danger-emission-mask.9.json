@@ -1,0 +1,25 @@
+{
+  "theme": "technology-core",
+  "canvas": {
+    "width": 1024,
+    "height": 152,
+    "scale": 4,
+    "logicalHeight": 38
+  },
+  "nineSlice": {
+    "left": 64,
+    "right": 64,
+    "top": 0,
+    "bottom": 0,
+    "unit": "physical-px",
+    "logicalLeft": 16,
+    "logicalRight": 16
+  },
+  "textAndIcon": {
+    "renderedByProgram": true,
+    "recommendedIconSize": 14
+  },
+  "asset": "danger-emission-mask.9.png",
+  "role": "danger-action-button-emission-mask",
+  "maskSemantics": "white/gray alpha only; program recolors red or amber"
+}

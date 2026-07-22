@@ -1,0 +1,42 @@
+{
+  "name": "modagent",
+  "productName": "ModAgent Pro",
+  "description": "AI-assisted game mod manager",
+  "modagentEdition": "subscription",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "dev": "vite --port 3000",
+    "backend": "python -m modagent.api",
+    "verify:audio": "node scripts/verify-commercial-audio.js",
+    "build": "npm run verify:audio && node scripts/clean-dist.js && vite build",
+    "start": "electron .",
+    "lab": "electron feedback-lab/main.js",
+    "electron:dev": "concurrently --names \"VITE,ELECTRON\" \"npm run dev\" \"electron . --dev\"",
+    "dev:full": "concurrently --names \"API,VITE,ELECTRON\" \"npm run backend\" \"npm run dev\" \"electron . --dev\"",
+    "build:backend": "node scripts/build-backend.js",
+    "pack:win": "npm run build && npm run build:backend && electron-builder --win dir --config electron-builder.config.cjs",
+    "dist:win": "npm run build && npm run build:backend && electron-builder --win nsis --config electron-builder.config.cjs",
+    "release:all": "node scripts/release-all.js",
+    "release:github-free": "node scripts/prepare-github-free.js",
+    "release:promote": "node scripts/promote-verified.js"
+  },
+  "dependencies": {
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9",
+    "lucide-react": "^0.344.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.0",
+    "autoprefixer": "^10.4.17",
+    "concurrently": "^8.2.2",
+    "electron": "^30.0.0",
+    "electron-builder": "^26.15.3",
+    "postcss": "^8.4.35",
+    "tailwindcss": "^3.4.1",
+    "vite": "^5.1.0"
+  },
+  "author": "ModAgent Project"
+}
