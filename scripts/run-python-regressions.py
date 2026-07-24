@@ -9,6 +9,7 @@ interpreter here.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -34,13 +35,17 @@ def main() -> int:
         return 1
 
     failures: list[str] = []
+    child_env = os.environ.copy()
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
+
     for path in test_files:
         print(f"\n=== {path.name} ===", flush=True)
         if uses_pytest_functions(path):
             command = [sys.executable, "-m", "pytest", "-q", str(path)]
         else:
             command = [sys.executable, str(path)]
-        result = subprocess.run(command, cwd=ROOT, check=False)
+        result = subprocess.run(command, cwd=ROOT, env=child_env, check=False)
         if result.returncode != 0:
             failures.append(f"{path.name} (exit {result.returncode})")
 
