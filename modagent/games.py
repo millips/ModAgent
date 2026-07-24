@@ -547,6 +547,120 @@ def detect_wegame_games() -> list[dict]:
     return results
 
 
+def _xbox_library_root(drive_root: str) -> str:
+    """Read Xbox Gaming Services' drive marker (RGBX + UTF-16LE path)."""
+    marker = os.path.join(drive_root, ".GamingRoot")
+    try:
+        with open(marker, "rb") as handle:
+            raw = handle.read(4096)
+    except OSError:
+        return ""
+    if len(raw) < 10 or raw[:4] != b"RGBX":
+        return ""
+    try:
+        relative = raw[8:].decode("utf-16-le").rstrip("\0").strip()
+    except UnicodeDecodeError:
+        return ""
+    if not relative or os.path.isabs(relative):
+        return ""
+    candidate = os.path.abspath(os.path.join(drive_root, relative))
+    try:
+        if os.path.commonpath([os.path.abspath(drive_root), candidate]) != os.path.abspath(drive_root):
+            return ""
+    except ValueError:
+        return ""
+    return candidate
+
+
+def _xbox_manifest_metadata(game_root: str) -> dict:
+    """Read the authoritative display name and executable from GDK metadata."""
+    try:
+        names = {
+            name.casefold(): name for name in os.listdir(game_root)
+            if name.casefold() == "microsoftgame.config"
+        }
+        manifest_name = names.get("microsoftgame.config")
+        if not manifest_name:
+            return {}
+        import xml.etree.ElementTree as ET
+        root = ET.parse(os.path.join(game_root, manifest_name)).getroot()
+    except (OSError, ET.ParseError):
+        return {}
+
+    shell = root.find(".//ShellVisuals")
+    executable = root.find(".//ExecutableList/Executable")
+    identity = root.find(".//Identity")
+    store = root.find(".//StoreId")
+    executable_name = (
+        str(executable.attrib.get("Name") or "") if executable is not None else ""
+    )
+    executable_path = os.path.join(game_root, executable_name) if executable_name else ""
+    if executable_path and not os.path.isfile(executable_path):
+        executable_path = ""
+    return {
+        "display_name": (
+            str(shell.attrib.get("DefaultDisplayName") or "")
+            if shell is not None else ""
+        ),
+        "executable": executable_path,
+        "package_identity": (
+            str(identity.attrib.get("Name") or "") if identity is not None else ""
+        ),
+        "store_id": str(store.text or "").strip() if store is not None else "",
+    }
+
+
+def detect_xbox_games(drive_roots: list[str] | None = None) -> list[dict]:
+    """Detect mod-accessible Xbox/Microsoft Store installs.
+
+    Modern Xbox installs expose a per-drive .GamingRoot marker and place each
+    title below <library>/<title>/Content.  The Content directory is the real
+    game root used by mod tools.  Legacy WindowsApps packages are deliberately
+    not crawled: their ACL/virtualisation makes direct file modification unsafe.
+    """
+    roots = set()
+    for drive in drive_roots or _get_drives():
+        library = _xbox_library_root(drive)
+        if library:
+            roots.add(library)
+        # Older "enable advanced management features" installs used this
+        # conventional location without a readable marker.
+        roots.add(os.path.join(drive, "XboxGames"))
+        roots.add(os.path.join(drive, "Program Files", "ModifiableWindowsApps"))
+
+    results = []
+    for library in roots:
+        if not os.path.isdir(library):
+            continue
+        try:
+            children = os.listdir(library)
+        except OSError:
+            continue
+        for child in children:
+            package_dir = os.path.join(library, child)
+            if not os.path.isdir(package_dir):
+                continue
+            content_dir = os.path.join(package_dir, "Content")
+            game_root = content_dir if os.path.isdir(content_dir) else package_dir
+            metadata = _xbox_manifest_metadata(game_root)
+            record = _game_record(
+                metadata.get("display_name") or child,
+                game_root,
+                "xbox_gaming_root",
+                executable=metadata.get("executable") or "",
+                xbox_library=library,
+                xbox_package_dir=package_dir,
+                xbox_store_id=metadata.get("store_id") or "",
+                xbox_package_identity=metadata.get("package_identity") or "",
+                platform="xbox",
+            )
+            # Component/DLC packages share the library but generally contain no
+            # playable executable.  Only expose independently verifiable games.
+            if record and record["real"]:
+                results.append(record)
+    return results
+
+
 def normalize_manual_game(entry: dict) -> dict | None:
     path = str(entry.get("path") or entry.get("game_root") or "")
     executable = str(entry.get("executable") or "")
@@ -577,6 +691,7 @@ def detect_installed_games(manual_games: list[dict] | None = None) -> list[dict]
         detect_ea_games,
         detect_gog_games,
         detect_wegame_games,
+        detect_xbox_games,
     )
     for detector in detectors:
         try:

@@ -5,10 +5,12 @@
 工坊是平台托管，安装=订阅，卸载=取消订阅。需要：Steam 客户端在运行 + 浏览器登录 Steam。"""
 import asyncio
 import glob
+import html
 import json
 import os
 import re
 import urllib.request
+from datetime import datetime, timezone
 
 
 # ── AppID 与工坊目录 ──
@@ -36,8 +38,19 @@ def workshop_content_dir(game_root: str, appid: int) -> str:
     return os.path.join(steamapps, "workshop", "content", str(appid))
 
 
-def get_titles(ids: list) -> dict:
-    """批量查工坊物品标题（公开 API，无需 key/登录）。返回 {id: title}。"""
+def _plain_description(value: str) -> str:
+    """Turn Steam's HTML/BBCode description into a compact plain-text summary."""
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"\[(?:img|previewimg).*?\].*?\[/(?:img|previewimg)\]", " ", text,
+                  flags=re.I | re.S)
+    text = re.sub(r"\[/?(?:b|i|u|strike|h\d|quote|code|list|olist|table|tr|td|url|spoiler|noparse)(?:=[^\]]*)?\]",
+                  " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:600]
+
+
+def get_details(ids: list) -> dict:
+    """批量查公开工坊详情（无需 key/登录）。返回 {id: metadata}。"""
     import ssl
     out = {}
     ids = [re.sub(r"\D", "", str(i)) for i in ids if str(i).strip()]
@@ -53,11 +66,37 @@ def get_titles(ids: list) -> dict:
             data = json.loads(urllib.request.urlopen(req, context=ctx, timeout=15).read())
             for d in data.get("response", {}).get("publishedfiledetails", []):
                 pid = str(d.get("publishedfileid", ""))
-                if pid and d.get("title"):
-                    out[pid] = d["title"]
+                if not pid or int(d.get("result") or 0) != 1:
+                    continue
+                updated_at = ""
+                if d.get("time_updated"):
+                    try:
+                        updated_at = datetime.fromtimestamp(
+                            int(d["time_updated"]), timezone.utc
+                        ).isoformat()
+                    except (TypeError, ValueError, OSError):
+                        pass
+                summary = _plain_description(d.get("description") or "")
+                out[pid] = {
+                    "id": pid,
+                    "name": str(d.get("title") or "").strip(),
+                    "summary": summary,
+                    "updated_at": updated_at,
+                    "views": int(d.get("views") or 0),
+                    "_detail_verified": bool(summary),
+                }
         except Exception:
             continue
     return out
+
+
+def get_titles(ids: list) -> dict:
+    """批量查工坊物品标题（公开 API，无需 key/登录）。返回 {id: title}。"""
+    return {
+        pid: detail["name"]
+        for pid, detail in get_details(ids).items()
+        if detail.get("name")
+    }
 
 
 # ── CDP：找到已登录的 Steam 标签页 ──
@@ -118,10 +157,30 @@ async def search(query: str, appid: int, cdp_port: int = 18888) -> list:
     val = await _eval(ws_url, expr)
     if isinstance(val, str):
         try:
-            return json.loads(val)
+            val = json.loads(val)
         except json.JSONDecodeError:
             return []
-    return val or []
+    rows = val or []
+    if not isinstance(rows, list) or not rows:
+        return []
+
+    # The browse page only exposes title/link. Enrich the result through
+    # Steam's public Published File Details endpoint so the decision table can
+    # explain what an item actually does.
+    details = await asyncio.to_thread(
+        get_details, [row.get("id") for row in rows if isinstance(row, dict)]
+    )
+    enriched = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        detail = details.get(str(row.get("id") or ""), {})
+        merged = dict(row)
+        for key, value in detail.items():
+            if value not in (None, "", [], {}):
+                merged[key] = value
+        enriched.append(merged)
+    return enriched
 
 
 # ── 订阅 / 取消订阅 ──

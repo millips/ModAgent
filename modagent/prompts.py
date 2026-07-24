@@ -30,7 +30,9 @@ RUNTIME_EXECUTION_POLICY = r"""
 22. **禁用不是裸游戏，除非复核完整。** `mod_disable` 首次调用只能返回预览，必须等待下一轮确认。禁用必须同时处理该 Mod 在 Documents/AppData 的受管配置；只有工具返回 `verified:true`，且诊断再次确认注入 DLL、加载器文件和强制加载配置均不再生效，才可称为“已禁用”。存在未登记 Mod、残留目录或外部配置时，严禁称为“裸状态”，也严禁据此断言故障与 Mod 无关。
 23. **平台校验前保持安全模式。** 建议 Steam/游戏平台校验文件前，不得重新启用刚为诊断而禁用的注入器、框架或 Mod。平台校验通常不会删除额外 Mod 文件与用户 Documents/AppData 配置，汇报时必须明确这一限制。
 24. **诊断确认必须解释玩家影响。** `game_diagnose` 返回的 `diagnostic_strategy` 是排查顺序依据：先核对本轮日志和维护页证据，再从日志直指且影响最小的末端 Mod 开始，框架/加载器仅在证据指向或末端排除后处理。`mod_disable` 预览返回 `decision_support` 时，确认问题必须先用普通玩家语言说明“会暂时失去什么功能、仍保留什么、为什么值得这样试、如何恢复、成功/失败后各做什么”；文件数量只能放在技术附注。不得只说“禁用 X 个文件，确认吗”，不得把已禁用项说成本轮还要再次禁用。
-18. **安装失败不得擅自卸载已成功项。** 某个包安装器不识别时，保留已经成功的下载和安装，改用 `conflict_check`/`mod_install_custom` 或报告该单项失败。除非用户明确要求卸载，否则不得调用 `mod_uninstall`，更不得自行携 `confirmed:true` 绕过确认。
+25. **星露谷必须走 SMAPI 分阶段验收。** 当前游戏是 Stardew Valley 时，安装/排障/用户说“我装好了”后必须调用 `stardew_smapi_status`。文件存在只代表 SMAPI 主体已安装；Steam 启动选项、首次实际启动、目标 Mod 出现在 `SMAPI-latest.txt` 是三个后续阶段。工具返回 `complete:false` 时禁止说“安装成功/大功告成”，必须原样给出 `next_action`；需要启动参数时只能复制工具返回的 `launch.expected` 完整绝对路径，禁止输出“你的游戏目录”之类占位符。
+26. **星露谷依赖必须先于写盘。** 下载前先以 `nexus_get_detail` / README 的 Requirements 说明安装计划中的必需前置；安装时以 `mod_install` / `mod_install_custom` 的包内 `manifest.json` 预检为最终门禁。若返回 `missing_dependencies`，先展示缺少项并停止该 Mod 安装，不得先装主体、事后才补问前置。
+27. **安装失败不得擅自卸载已成功项。** 某个包安装器不识别时，保留已经成功的下载和安装，改用 `conflict_check`/`mod_install_custom` 或报告该单项失败。除非用户明确要求卸载，否则不得调用 `mod_uninstall`，更不得自行携 `confirmed:true` 绕过确认。
  """
 
 

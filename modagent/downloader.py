@@ -175,12 +175,22 @@ def cleanup_stale_downloads(
     """Bound cache age and size without touching files outside owned roots."""
     now = time.time() if now is None else now
     entries = []
+    orphan_metadata = []
     for root in managed_cache_roots():
         if not os.path.isdir(root):
             continue
         for current, _, files in os.walk(root):
             for filename in files:
                 path = os.path.join(current, filename)
+                if filename.lower().endswith(".modagent.json"):
+                    archive_path = path[:-len(".modagent.json")]
+                    if not os.path.isfile(archive_path):
+                        try:
+                            os.remove(path)
+                            orphan_metadata.append(path)
+                        except OSError:
+                            pass
+                        continue
                 try:
                     stat = os.stat(path)
                 except OSError:
@@ -216,10 +226,24 @@ def cleanup_stale_downloads(
                 removed.append(item)
             except OSError:
                 continue
+    removed_dirs = 0
+    for root in managed_cache_roots():
+        if not os.path.isdir(root):
+            continue
+        for current, dirs, _ in os.walk(root, topdown=False):
+            for dirname in dirs:
+                path = os.path.join(current, dirname)
+                try:
+                    os.rmdir(path)
+                    removed_dirs += 1
+                except OSError:
+                    pass
     return {
-        "removed_files": len(removed),
+        "removed_files": len(removed) + len(orphan_metadata),
         "bytes_freed": sum(item["size"] for item in removed),
         "remaining_bytes": total,
+        "orphan_metadata_removed": len(orphan_metadata),
+        "empty_directories_removed": removed_dirs,
     }
 
 
@@ -442,7 +466,7 @@ def get_download_url_api(
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
         "Application-Name": "ModAgent",
-        "Application-Version": "1.0.0",
+        "Application-Version": "1.10.0",
     })
     try:
         with urllib.request.urlopen(

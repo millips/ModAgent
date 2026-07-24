@@ -13,6 +13,11 @@ def current_edition() -> str:
     return value if value in {"free", "subscription"} else "free"
 
 
+def entitlement_tier() -> str:
+    """Return the capability tier owned by the signed desktop edition."""
+    return "pro" if current_edition() == "subscription" else "free"
+
+
 def edition_data_dir(*parts: str) -> str:
     return os.path.join(CONFIG_DIR, "editions", current_edition(), *parts)
 
@@ -32,6 +37,7 @@ class Config:
     tier: str = "free"
     tavily_api_key: str = ""
     workshop_dir: str = ""
+    recommendation_limit: int = 10
     manual_games: list[dict] = field(default_factory=list)
     # Per-game Vortex/MO2/Fluffy/custom mod roots.
     manual_mod_dirs: dict[str, list[str]] = field(default_factory=dict)
@@ -56,6 +62,12 @@ def load() -> Config:
             data = json.load(f)
     filtered = {k: v for k, v in data.items() if k in Config.__dataclass_fields__}
     cfg = Config(**filtered)
+    try:
+        cfg.recommendation_limit = max(2, min(int(cfg.recommendation_limit), 20))
+    except (TypeError, ValueError):
+        cfg.recommendation_limit = 10
+    # Edition is authoritative: stale config cannot downgrade Pro or unlock free.
+    cfg.tier = entitlement_tier()
     for field, env_name in _SECRET_ENV.items():
         value = os.environ.get(env_name)
         if value:
@@ -66,6 +78,7 @@ def load() -> Config:
 def save(cfg: Config):
     ensure_config_dir()
     data = asdict(cfg)
+    data["tier"] = entitlement_tier()
     if os.environ.get("MODAGENT_SECURE_SECRETS") == "1":
         for field in _SECRET_ENV:
             data.pop(field, None)

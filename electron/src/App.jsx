@@ -207,7 +207,7 @@ export default function App() {
           <main className="app-page-stage flex-1 overflow-hidden bg-surface-900">
             {status.online ? (
               <>
-                <div aria-hidden={page !== 'chat'} className={`app-page-layer ${page === 'chat' ? 'is-active' : ''}`}><ChatPage status={status} games={games} onGameChange={onGameChange} onGameImport={onGameImport} toast={toast} api={API} onRefresh={doRefresh} /></div>
+                <div aria-hidden={page !== 'chat'} className={`app-page-layer ${page === 'chat' ? 'is-active' : ''}`}><ChatPage status={status} games={games} onGameChange={onGameChange} onGameImport={onGameImport} onGamesRefresh={refreshGames} toast={toast} api={API} onRefresh={doRefresh} /></div>
                 <div aria-hidden={page !== 'mods'} className={`app-page-layer ${page === 'mods' ? 'is-active' : ''}`}><ModsPage toast={toast} api={API} onRefresh={doRefresh} refreshKey={refreshKey} status={status} /></div>
                 <div aria-hidden={page !== 'snaps'} className={`app-page-layer ${page === 'snaps' ? 'is-active' : ''}`}><SnapshotsPage toast={toast} api={API} status={status} onRefresh={doRefresh} /></div>
                 <div aria-hidden={page !== 'settings'} className={`app-page-layer ${page === 'settings' ? 'is-active' : ''}`}><SettingsPage toast={toast} api={API} /></div>

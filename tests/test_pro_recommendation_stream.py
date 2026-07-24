@@ -53,8 +53,8 @@ class FakeAgent(Agent):
     def _exec(self, _name, _args):
         return json.dumps({
             "recommendations": [
-                {"mod_id": 1, "name": "One"},
-                {"mod_id": 2, "name": "Two"},
+                {"mod_id": 1, "name": "One", "summary": "Adds the first feature."},
+                {"mod_id": 2, "name": "Two", "summary": "Adds the second feature."},
             ],
         })
 

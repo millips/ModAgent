@@ -17,7 +17,9 @@ from . import patcher
 from . import user_config
 from . import confirmation
 from . import games as games_mod
+from . import stardew
 from . import web_agent
+from .inventory_match import find_installed_duplicate
 
 
 def _resolve_github_release_url(url: str) -> dict:
@@ -76,7 +78,7 @@ def _resolve_github_release_url(url: str) -> dict:
 from . import scanner
 
 
-def _refresh_local_inventory(cfg: Config) -> dict:
+def refresh_local_inventory(cfg: Config) -> dict:
     """Fast offline preflight used before downloads.
 
     It acknowledges disk state first, without website calls, so an unscanned
@@ -93,41 +95,14 @@ def _refresh_local_inventory(cfg: Config) -> dict:
     return result
 
 
+_refresh_local_inventory = refresh_local_inventory
+
+
 def _installed_duplicate(slug: str, source: str, source_key: str,
                          target_name: str = ""):
-    try:
-        direct = db.get_mod(str(source_key), slug) or db.get_mod_by_source(
-            slug, source, str(source_key)
-        )
-    except Exception:
-        # Database initialization/permission failures are surfaced elsewhere;
-        # duplicate protection must not crash an otherwise valid download.
-        return None
-    if direct or not target_name:
-        return direct
-    from difflib import SequenceMatcher
-    from .source_alignment import normalize_name
-    target = normalize_name(target_name)
-    if len(target) < 5:
-        return None
-    best = None
-    best_score = 0.0
-    try:
-        installed_mods = db.get_installed_mods(slug)
-    except Exception:
-        return None
-    for mod in installed_mods:
-        candidate = normalize_name(mod.name)
-        if not candidate:
-            continue
-        score = 1.0 if candidate == target else SequenceMatcher(None, candidate, target).ratio()
-        if min(len(candidate), len(target)) >= 8 and (
-            candidate in target or target in candidate
-        ):
-            score = max(score, .97)
-        if score > best_score:
-            best, best_score = mod, score
-    return best if best_score >= .96 else None
+    return find_installed_duplicate(
+        slug, source, source_key, target_name=target_name
+    )
 
 
 def _url_source_identity(url: str) -> tuple[str, str, str]:
@@ -333,6 +308,10 @@ def build_tools_definitions(tier: str) -> list[dict]:
            "path 为相对游戏根目录的路径,禁止越界。",
            {"path": {"type": "string", "description": "相对游戏根目录的路径,如 SB/Binaries/Win64/ue4ss/UE4SS.log"},
             "tail": {"type": "integer", "description": "可选:读取文本文件末尾 N 行(上限200)"}}, ["path"]),
+        _t("stardew_smapi_status", "星露谷物语专用只读验收：区分 SMAPI 文件已安装、Steam 启动选项已配置、"
+           "SMAPI 已实际启动、目标 Mod 已被日志加载四个阶段。返回可直接复制的完整启动参数、"
+           "SMAPI-latest.txt 证据和下一步；只有 complete=true 才能宣布大功告成。",
+           {}, []),
         _t("list_downloads", "列出当前游戏【下载缓存目录】里已下载的所有 mod 压缩包(文件名、mod_id、大小)。"
            "用户说\"把我下好的都装上\"这类批量安装需求时,先调此工具看清有哪些已下载文件,再逐个 mod_install,"
            "不要反过来让用户手动列出文件清单。",
@@ -843,7 +822,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not sub.get("ok"):
             return json.dumps({"error": f"订阅失败（status={sub.get('status')} {sub.get('error', '')}）。请确认 Chrome 已登录 Steam 且账号拥有该游戏。"}, ensure_ascii=False)
         key = "ws_" + wid
-        progress.start([{"mod_id": key, "name": f"工坊 {wid}（Steam 下载中）"}])
+        progress.start([{
+            "mod_id": key,
+            "name": f"工坊项目 {wid}",
+            "source": "workshop",
+        }])
         progress.set_status(key, "downloading")
         dl = asyncio.run(sw.wait_for_download(root, appid, wid, timeout=180,
                                               progress_callback=lambda f: progress.set_pct(key, int(f * 100))))
@@ -917,7 +900,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             url = gh["url"]
             gh_note = gh.get("note")
         key = "url"
-        progress.start([{"mod_id": key, "name": url[:48]}])
+        progress.start([{
+            "mod_id": key,
+            "name": name_hint or source_key or "下载文件",
+            "source": source_name,
+        }])
         progress.set_status(key, "downloading")
         try:
             r = sources.download_from_url(url, slug, progress_callback=lambda f: progress.set_pct(key, int(f * 100)))
@@ -960,6 +947,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         preflight = _refresh_local_inventory(cfg)
         already = _installed_duplicate(slug, "nexus", str(_mid))
         if already:
+            cached_path = find_download(_mid, args.get("file_id"))
+            cache_cleanup = (
+                downloader.cleanup_installed_archive(cached_path)
+                if cached_path else {"removed": False, "reason": "not_found"}
+            )
             return json.dumps({
                 "status": "already_installed",
                 "already_installed": True,
@@ -969,6 +961,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "name": already.name,
                 "version": already.version,
                 "preflight_detected": preflight.get("detected", 0),
+                "cache_cleanup": cache_cleanup,
                 "message": "已在当前游戏的统一管理清单中，已跳过重复下载。需要升级时请使用 mod_update。",
             }, ensure_ascii=False)
         nexus_slug, nexus_gid, discovery = current_nexus_identity()
@@ -1010,6 +1003,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 str(requested_detail.get("version") or ""),
                 {"nexus_slug": nexus_slug, "matched_name": requested_detail.get("name", "")},
             )
+            cached_path = find_download(_mid, args.get("file_id"))
+            cache_cleanup = (
+                downloader.cleanup_installed_archive(cached_path)
+                if cached_path else {"removed": False, "reason": "not_found"}
+            )
             return json.dumps({
                 "status": "already_installed", "already_installed": True,
                 "download_skipped": True, "mod_id": str(_mid),
@@ -1017,9 +1015,14 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "version": already.version,
                 "matched_upstream_name": requested_detail.get("name", ""),
                 "binding_created": True,
+                "cache_cleanup": cache_cleanup,
                 "message": "下载前扫描发现本地已有同一 Mod，已绑定维护来源并跳过重复下载。",
             }, ensure_ascii=False)
-        progress.start([{"mod_id": _mid, "name": f"mod {_mid}"}])
+        progress.start([{
+            "mod_id": _mid,
+            "name": requested_detail.get("name", "") or f"Nexus Mod {_mid}",
+            "source": "nexus",
+        }])
         progress.set_status(_mid, "downloading")
         try:
             result = asyncio.run(downloader.download_mod(
@@ -1131,9 +1134,14 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                         slug, str(installed.id), "nexus", mid, "", .96,
                         "download_preflight_name", str(item.get("version") or ""),
                     )
+                cached_path = find_download(mid, item.get("file_id"))
                 skipped_installed.append({
                     "mod_id": mid, "installed_id": str(installed.id),
                     "name": installed.name, "version": installed.version,
+                    "cache_cleanup": (
+                        downloader.cleanup_installed_archive(cached_path)
+                        if cached_path else {"removed": False, "reason": "not_found"}
+                    ),
                 })
             else:
                 mods.append(item)
@@ -1145,7 +1153,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "reason": discovery.get("reason", "Nexus game page was not resolved"),
             }, ensure_ascii=False)
         success, failed = [], []
-        progress.start([{"mod_id": m["mod_id"], "name": m.get("mod_name", "")} for m in mods])
+        progress.start([{
+            "mod_id": m["mod_id"],
+            "name": m.get("mod_name", "") or f"Nexus Mod {m['mod_id']}",
+            "source": "nexus",
+        } for m in mods])
 
         manual_action = []
 
@@ -1209,6 +1221,30 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             return json.dumps({"error": "请提供 mod_ids 列表"}, ensure_ascii=False)
         if len(ids) > 30:
             return json.dumps({"error": f"单批最多 30 个(收到 {len(ids)}),请分批"}, ensure_ascii=False)
+        dependency_blocks = []
+        if stardew.is_stardew(getattr(cfg, "game_name", ""), slug, root):
+            for mid in ids:
+                local_path = find_download(mid)
+                if not local_path:
+                    continue
+                try:
+                    checked = stardew.archive_dependency_preflight(
+                        local_path, root, getattr(cfg, "game_name", ""), slug
+                    )
+                except Exception as exc:
+                    return json.dumps({
+                        "error": f"星露谷批量安装前依赖检查失败，安装未开始: {exc}",
+                        "install_blocked": True,
+                    }, ensure_ascii=False)
+                if checked.get("install_blocked"):
+                    dependency_blocks.append({"mod_id": str(mid), **checked})
+        if dependency_blocks:
+            return json.dumps({
+                "status": "missing_dependencies",
+                "install_blocked": True,
+                "items": dependency_blocks,
+                "message": "批量安装前发现必需前置未满足；尚未创建快照，也未写入游戏目录。",
+            }, ensure_ascii=False, indent=2)
         # 整批共享一张安装前快照(治 22 连发时每装一个拍一张的浪费)
         try:
             batch_snap = snapshot.snapshot_create(root, slug,
@@ -1239,11 +1275,17 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if mid not in (None, ""):
             installed = db.get_mod(str(mid), slug) or db.get_mod_by_source(slug, "nexus", str(mid))
             if installed:
+                supplied_path = args.get("local_path") or find_download(mid)
+                cache_cleanup = (
+                    downloader.cleanup_installed_archive(supplied_path)
+                    if supplied_path else {"removed": False, "reason": "not_found"}
+                )
                 return json.dumps({
                     "status": "already_installed", "already_installed": True,
                     "install_skipped": True, "mod_id": str(mid),
                     "installed_id": str(installed.id), "name": installed.name,
                     "version": installed.version,
+                    "cache_cleanup": cache_cleanup,
                     "message": "当前游戏已安装该 Mod，未重复覆盖。需要升级时请使用 mod_update。",
                 }, ensure_ascii=False)
         local_path = args.get("local_path") or ""
@@ -1281,11 +1323,36 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                         "更正为真实安装位置(可用游戏体检/重新检测),确认能找到游戏本体 exe 后再安装。",
             }, ensure_ascii=False)
 
+        try:
+            dependency_preflight = stardew.archive_dependency_preflight(
+                local_path, root, getattr(cfg, "game_name", ""), slug
+            )
+        except Exception as exc:
+            return json.dumps({
+                "error": f"星露谷安装前依赖检查失败，未写入任何文件: {exc}",
+                "install_blocked": True,
+            }, ensure_ascii=False)
+        if dependency_preflight.get("install_blocked"):
+            return json.dumps({
+                "status": "missing_dependencies",
+                **dependency_preflight,
+                "hint": "请先补齐 missing_dependencies，并升级 incompatible_dependencies 中版本不足的前置，再重新执行安装。",
+            }, ensure_ascii=False, indent=2)
+
         snap_id = args.get("snapshot_id", "")
         if not snap_id:
             snap_id = snapshot.snapshot_create(root, slug, trigger_mod_name=f"安装前快照")
         lo = db.get_max_load_order(slug) + 1
-        result = installer.install_mod(local_path, root, slug, lo)
+        try:
+            result = installer.install_mod(local_path, root, slug, lo)
+        except Exception as exc:
+            rollback = snapshot.snapshot_restore(snap_id)
+            return json.dumps({
+                "error": f"安装事务失败，已恢复安装前快照: {exc}",
+                "snapshot_id": snap_id,
+                "rollback_complete": bool(rollback.get("complete")),
+                "rollback": rollback,
+            }, ensure_ascii=False, indent=1)
         files_installed = [f["dest"] for f in result.get("installed", [])]
         # 自动落位规则没接住任何文件(开放模式/非常规结构包)→ 引导 agent 走通用安装,不写空账
         if not files_installed:
@@ -1318,7 +1385,16 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             dependencies=json.dumps(mod_deps),
             game_slug=slug,
         )
-        db.add_mod(mod)
+        try:
+            db.add_mod(mod)
+        except Exception as exc:
+            rollback = snapshot.snapshot_restore(snap_id)
+            return json.dumps({
+                "error": f"安装文件已复核，但数据库登记失败，已恢复安装前快照: {exc}",
+                "snapshot_id": snap_id,
+                "rollback_complete": bool(rollback.get("complete")),
+                "rollback": rollback,
+            }, ensure_ascii=False, indent=1)
         cache_cleanup = downloader.cleanup_installed_archive(local_path)
         return json.dumps({"snapshot_id": snap_id, "files_installed": files_installed,
                            "load_order": lo, "name": mod_name,
@@ -1349,6 +1425,22 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "error": f"拒绝安装:当前游戏目录未通过活体检测。{alive.get('reason','')}",
                 "hint": "请在设置中把游戏根目录更正为真实安装位置后再装。"}, ensure_ascii=False)
 
+        try:
+            dependency_preflight = stardew.archive_dependency_preflight(
+                local_path, root, getattr(cfg, "game_name", ""), slug
+            )
+        except Exception as exc:
+            return json.dumps({
+                "error": f"星露谷安装前依赖检查失败，未写入任何文件: {exc}",
+                "install_blocked": True,
+            }, ensure_ascii=False)
+        if dependency_preflight.get("install_blocked"):
+            return json.dumps({
+                "status": "missing_dependencies",
+                **dependency_preflight,
+                "hint": "请先补齐 missing_dependencies，并升级 incompatible_dependencies 中版本不足的前置，再重新执行安装。",
+            }, ensure_ascii=False, indent=2)
+
         mid = "custom_" + os.path.splitext(os.path.basename(local_path))[0][:40]
         explicit_deps = None
         if "dependencies" in args:
@@ -1377,13 +1469,22 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "rejected": plan.get("rejected", []),
                 "warnings": result.get("warnings", [])}, ensure_ascii=False, indent=1)
 
-        db.add_mod(db.InstalledMod(
-            id=mid, name=mid, version="", snapshot_id=snap_id,
-            load_order=db.get_max_load_order(slug) + 1,
-            files_installed=json.dumps(files_installed),
-            dependencies=json.dumps(explicit_deps or []),
-            installed_by="custom", game_slug=slug,
-        ))
+        try:
+            db.add_mod(db.InstalledMod(
+                id=mid, name=mid, version="", snapshot_id=snap_id,
+                load_order=db.get_max_load_order(slug) + 1,
+                files_installed=json.dumps(files_installed),
+                dependencies=json.dumps(explicit_deps or []),
+                installed_by="custom", game_slug=slug,
+            ))
+        except Exception as exc:
+            rollback = snapshot.snapshot_restore(snap_id)
+            return json.dumps({
+                "error": f"安装文件已复核，但数据库登记失败，已恢复安装前快照: {exc}",
+                "snapshot_id": snap_id,
+                "rollback_complete": bool(rollback.get("complete")),
+                "rollback": rollback,
+            }, ensure_ascii=False, indent=1)
         cache_cleanup = downloader.cleanup_installed_archive(local_path)
         return json.dumps({
             "snapshot_id": snap_id, "installed": len(files_installed),
@@ -1498,6 +1599,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             return json.dumps(
                 {"error": f"外部工具解压失败: {e}"}, ensure_ascii=False
             )
+        result["cache_cleanup"] = downloader.cleanup_installed_archive(
+            args.get("local_path", "")
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     # T09
@@ -2117,6 +2221,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "external_configs": operation.get("external_configs"),
         }, indent=2, ensure_ascii=False)
 
+    elif name == "stardew_smapi_status":
+        return json.dumps(
+            stardew.smapi_status(root, getattr(cfg, "game_name", ""), slug),
+            ensure_ascii=False,
+            indent=2,
+        )
+
     elif name == "game_file_check":
         rel = (args.get("path") or "").strip().replace("\\", "/").lstrip("/")
         gr = os.path.realpath(root or "")
@@ -2126,8 +2237,19 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not (full == gr or full.startswith(gr + os.sep)):
             return json.dumps({"error": "路径越界:只允许查看游戏目录内的文件"}, ensure_ascii=False)
         if not os.path.exists(full):
-            return json.dumps({"exists": False, "path": rel}, ensure_ascii=False)
-        info = {"exists": True, "path": rel, "is_dir": os.path.isdir(full)}
+            return json.dumps({
+                "exists": False,
+                "path": rel,
+                "absolute_path": full,
+                "game_root": gr,
+            }, ensure_ascii=False)
+        info = {
+            "exists": True,
+            "path": rel,
+            "absolute_path": full,
+            "game_root": gr,
+            "is_dir": os.path.isdir(full),
+        }
         if info["is_dir"]:
             try:
                 info["entries"] = sorted(os.listdir(full))[:60]
@@ -2180,11 +2302,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
     return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
 
 
-def _recommend_nexus(query: str, slug: str, api_key: str) -> dict:
+def _recommend_nexus(
+    query: str, slug: str, api_key: str, limit: int = 10,
+) -> dict:
     """Nexus discovery. Dependency expansion is deferred until selection."""
     results = nexus.search(query[:60], slug, api_key)
     recs = []
-    for r in (results or [])[:5]:
+    for r in (results or [])[:max(2, min(int(limit or 10), 20))]:
         mod_id = r.get("mod_id", 0)
         recs.append({
             "mod_id": mod_id,
@@ -2223,6 +2347,9 @@ def _recommend(query: str, cfg: Config) -> dict:
 
     from .sources import available_sources
     slug, api_key = cfg.game_slug, cfg.nexus_api_key
+    per_source_limit = max(
+        2, min(int(getattr(cfg, "recommendation_limit", 10) or 10), 20)
+    )
     src = available_sources(cfg.game_name or "", slug or "", cfg.game_root or "",
                             getattr(cfg, "tavily_api_key", ""), api_key)
     effective_slug = src.get("nexus") or ""
@@ -2231,20 +2358,29 @@ def _recommend(query: str, cfg: Config) -> dict:
     tasks = {}
     ex = cf.ThreadPoolExecutor(max_workers=5)
     if effective_slug:
-        tasks["nexus"] = ex.submit(_recommend_nexus, query, effective_slug, api_key)
+        tasks["nexus"] = ex.submit(
+            _recommend_nexus, query, effective_slug, api_key, per_source_limit
+        )
     if src.get("workshop"):
         from .sources import steam_workshop as sw
         tasks["workshop"] = ex.submit(
-            lambda: asyncio.run(sw.search(query, src["workshop"], cfg.chrome_cdp_port))[:5])
+            lambda: asyncio.run(
+                sw.search(query, src["workshop"], cfg.chrome_cdp_port)
+            )[:per_source_limit]
+        )
     if src.get("thunderstore"):
         tasks["thunderstore"] = ex.submit(
-            _recommend_thunderstore, src["thunderstore"], query, 5
+            _recommend_thunderstore, src["thunderstore"], query, per_source_limit
         )
     if src.get("gamebanana"):
         from .sources import gamebanana as gb
-        tasks["gamebanana"] = ex.submit(gb.search, src["gamebanana"], query, 5)
+        tasks["gamebanana"] = ex.submit(
+            gb.search, src["gamebanana"], query, per_source_limit
+        )
     from .sources import github as gh
-    tasks["github"] = ex.submit(gh.search, query, cfg.game_name or slug or "", 5)
+    tasks["github"] = ex.submit(
+        gh.search, query, cfg.game_name or slug or "", per_source_limit
+    )
 
     source_status = src.get("source_status", {})
     out = {"recommendations": [], "install_plan": [],

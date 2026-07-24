@@ -7,13 +7,15 @@ from modagent import progress
 def test_batch_progress_is_aggregated_and_eta_waits_for_signal():
     with patch.object(progress.time, "time", return_value=100.0):
         progress.start([
-            {"mod_id": 1, "name": "one"},
+            {"mod_id": 1, "name": "one", "source": "nexus"},
             {"mod_id": 2, "name": "two"},
         ])
         initial = progress.snapshot()
     assert initial["overall_pct"] == 0
     assert initial["eta_seconds"] == 150
     assert initial["eta_kind"] == "baseline"
+    assert initial["items"][0]["source"] == "nexus"
+    assert initial["items"][0]["source_label"] == "Nexus"
 
     with patch.object(progress.time, "time", return_value=105.0):
         progress.set_pct(1, 50)

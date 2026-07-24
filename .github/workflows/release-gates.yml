@@ -1,0 +1,48 @@
+name: Release gates
+
+on: [push, pull_request]
+
+jobs:
+  python-regression:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pip install -e . pytest
+      - run: python scripts/run-python-regressions.py
+
+  electron-build-and-release-text:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: electron
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
+      - run: npm ci
+      - run: npm run test:browser
+      - run: npm run test:diagnostics
+      - run: npm run verify:text
+      - run: npm run build
+
+  clean-tree-gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject tracked build products and local state
+        shell: pwsh
+        run: |
+          $bad = git ls-files | Select-String -Pattern '(^|/)(__pycache__|tmp-asar-|release/|baks/)|\.pyc$'
+          if ($bad) { $bad; throw 'Tracked local/build artifacts are forbidden in a release commit.' }
+      - name: Require clean checkout
+        shell: pwsh
+        run: |
+          if (git status --porcelain) { git status --short; throw 'Checkout is not clean.' }

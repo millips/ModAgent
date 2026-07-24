@@ -7,7 +7,7 @@ const os = require('os');
 const fs = require('fs');
 const { getAppIdentity } = require('./appIdentity');
 const { createSecurityStore } = require('./securityStore');
-const { createRuntimeDiagnostics } = require('./runtimeDiagnostics');
+const { createRuntimeDiagnostics, buildDiagnosticReport } = require('./runtimeDiagnostics');
 const { setupAutoUpdater } = require('./updater');
 const { findInstalledBrowser, profileDirectory } = require('./browserLauncher');
 
@@ -160,7 +160,7 @@ function startBackend() {
   const command = backendCommand();
   if (app.isPackaged && !fs.existsSync(command.executable)) {
     logger.error('Packaged backend executable is missing', command.executable);
-    dialog.showErrorBox(`${IDENTITY.productName} ????`, '?????????????????');
+    dialog.showErrorBox(`${IDENTITY.productName} 启动失败`, '应用后端组件缺失，请重新安装完整发行包。');
     return;
   }
   securityStore.applyToEnvironment(activeSecrets, process.env);
@@ -215,10 +215,10 @@ function verifyBuiltEdition() {
   try {
     const marker = require(path.join(__dirname, 'dist', 'edition.json'));
     if (marker.edition === APP_EDITION) return true;
-    dialog.showErrorBox(`${IDENTITY.productName} ???????`, `????? ${APP_EDITION}?????? ${marker.edition || 'unknown'}???????`);
+    dialog.showErrorBox(`${IDENTITY.productName} 版本校验失败`, `当前程序要求 ${APP_EDITION} 资源，但检测到 ${marker.edition || 'unknown'}。为防止版本资产混用，应用已停止启动。`);
   } catch (error) {
     logger.error('Edition marker missing', error);
-    dialog.showErrorBox(`${IDENTITY.productName} ??????`, '???????????????');
+    dialog.showErrorBox(`${IDENTITY.productName} 版本校验失败`, '未找到版本标记文件，请重新安装完整发行包。');
   }
   return false;
 }
@@ -227,12 +227,12 @@ async function offerRollbackIfNeeded() {
   if (!launchState.shouldOfferRollback) return false;
   const result = await dialog.showMessageBox({
     type: 'warning',
-    title: `${IDENTITY.productName} ????`,
-    message: '??????????????',
+    title: `${IDENTITY.productName} 启动恢复`,
+    message: '检测到新版本连续启动失败。',
     detail: launchState.previousVersion
-      ? `???????????? ${launchState.previousVersion}?`
-      : '?????????????',
-    buttons: ['??', '????'],
+      ? `是否运行已验证的安装程序，回退到 ${launchState.previousVersion}？`
+      : '是否运行上一个已验证版本的安装程序？',
+    buttons: ['回退', '暂不回退'],
     defaultId: 0,
     cancelId: 1,
     noLink: true,
@@ -246,7 +246,7 @@ async function offerRollbackIfNeeded() {
     return true;
   } catch (error) {
     logger.error('Rollback installer failed to launch', error);
-    dialog.showErrorBox('??????', '????????????????????????');
+    dialog.showErrorBox('回退失败', '无法启动回退安装程序。请导出诊断信息后联系支持。');
     return false;
   }
 }
@@ -348,7 +348,7 @@ if (gotSingleInstanceLock) {
     });
   }).catch(error => {
     logger.error('Fatal startup error', error);
-    dialog.showErrorBox(`${IDENTITY.productName} ????`, error.message || String(error));
+    dialog.showErrorBox(`${IDENTITY.productName} 启动失败`, error.message || String(error));
     app.quit();
   });
 }
@@ -454,22 +454,28 @@ ipcMain.handle('open-legal-document', (_, filename) => {
   return shell.openPath(legalPath);
 });
 ipcMain.handle('export-runtime-diagnostics', async () => {
+  const report = buildDiagnosticReport({
+    diagnostics, productName: IDENTITY.productName,
+    version: PACKAGE_INFO.version, edition: APP_EDITION,
+  });
+  const preview = await dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '预览脱敏后的诊断信息',
+    message: '诊断内容已统一脱敏。请在保存前检查以下预览。',
+    detail: report.slice(0, 12000) + (report.length > 12000 ? '\n\n[预览已截断，导出文件包含完整脱敏内容]' : ''),
+    buttons: ['继续保存', '取消'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (preview.response !== 0) return null;
   const result = await dialog.showSaveDialog(mainWindow, {
-    title: '?? ModAgent ????',
+    title: '导出 ModAgent 诊断信息',
     defaultPath: path.join(app.getPath('documents'), `${IDENTITY.artifactPrefix}-diagnostics.txt`),
     filters: [{ name: 'Text', extensions: ['txt'] }],
   });
   if (result.canceled || !result.filePath) return null;
-  const sections = [];
-  sections.push(`${IDENTITY.productName} ${PACKAGE_INFO.version}`);
-  sections.push(`Generated: ${new Date().toISOString()}`);
-  sections.push(`Edition: ${APP_EDITION}`);
-  for (const filename of ['desktop.log', 'updater.log']) {
-    const filePath = path.join(diagnostics.logsDir, filename);
-    if (fs.existsSync(filePath)) sections.push(`\n===== ${filename} =====\n${fs.readFileSync(filePath, 'utf8').slice(-500000)}`);
-  }
-  if (fs.existsSync(diagnostics.stateFile)) sections.push(`\n===== runtime-state.json =====\n${fs.readFileSync(diagnostics.stateFile, 'utf8')}`);
-  fs.writeFileSync(result.filePath, sections.join('\n'), 'utf8');
+  fs.writeFileSync(result.filePath, report, 'utf8');
   return result.filePath;
 });
 
@@ -486,7 +492,7 @@ ipcMain.handle('get-bg-data-url', (_, filename) => {
 
 ipcMain.handle('select-bg', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: '??????',
+    title: '选择背景图片',
     filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp'] }],
     properties: ['openFile'],
   });

@@ -22,7 +22,7 @@ const QUIET_TOOLS = new Set([
   'browser_pages', 'browser_observe', 'browser_click', 'browser_input',
   'browser_wait', 'browser_open', 'browser_doctor',
   'nexus_get_detail', 'list_downloads', 'list_local_mods',
-  'conflict_check', 'game_file_check', 'get_installed', 'read_readme',
+  'conflict_check', 'game_file_check', 'stardew_smapi_status', 'get_installed', 'read_readme',
 ])
 
 const TOOL_LABELS = {
@@ -31,6 +31,7 @@ const TOOL_LABELS = {
   browser_open: '打开下载页面', browser_observe: '识别页面状态',
   browser_click: '操作下载页面', browser_input: '填写页面信息', browser_wait: '等待页面响应',
   conflict_check: '检查冲突与落位', game_file_check: '检查游戏文件', game_config_write: '写入游戏配置',
+  stardew_smapi_status: '验收 SMAPI 启动状态',
   get_installed: '读取已安装 Mod', list_downloads: '检查下载缓存',
   list_local_mods: '检查本地 Mod', scan_existing_mods: '扫描已有 Mod',
   mod_update_check: '检查可用更新', import_existing_mods: '绑定已有 Mod',
@@ -48,7 +49,48 @@ const TOOL_STAGE_SECONDS = {
   snapshot_create: 12, snapshot_restore: 25,
   mod_install: 35, mod_install_batch: 75, mod_install_custom: 40,
   scan_existing_mods: 25, get_installed: 10, mod_update_check: 35,
-  conflict_check: 12, game_file_check: 15, game_config_write: 8,
+  conflict_check: 12, game_file_check: 15, stardew_smapi_status: 8, game_config_write: 8,
+}
+
+const RECOMMENDATION_ANCHOR_MARKER = '请在下方清单中调整选择'
+
+function textMessageCount(messages) {
+  return messages.filter(message =>
+    message.role === 'user' || message.role === 'agent'
+  ).length
+}
+
+function insertRecommendationAtAnchor(messages, payload, createId) {
+  const card = { id: createId(), role: 'edition', payload }
+  const requested = Number(payload?.anchor_after_text_count)
+  let insertAt = -1
+
+  if (Number.isInteger(requested) && requested >= 0) {
+    let seen = 0
+    for (let index = 0; index < messages.length; index += 1) {
+      if (messages[index].role === 'user' || messages[index].role === 'agent') seen += 1
+      if (seen >= requested) {
+        insertAt = index + 1
+        break
+      }
+    }
+    if (requested === 0) insertAt = 0
+  }
+
+  // Migration path for recommendation states saved before positional anchors
+  // existed. Their companion assistant message contains this stable footer.
+  if (insertAt < 0) {
+    const markerIndex = messages.findIndex(message =>
+      message.role === 'agent'
+      && String(message.content || '').includes(RECOMMENDATION_ANCHOR_MARKER)
+    )
+    if (markerIndex >= 0) insertAt = markerIndex + 1
+  }
+
+  if (insertAt < 0) return [...messages, card]
+  const result = [...messages]
+  result.splice(insertAt, 0, card)
+  return result
 }
 
 function formatProgressTime(value) {
@@ -65,11 +107,18 @@ function ActiveTaskProgress({ task, now }) {
   const stageElapsed = Math.max(0, (now - task.stageStartedAt) / 1000)
   const actual = task.mode === 'determinate'
   const pct = Math.max(0, Math.min(100, Number(task.pct) || 0))
-  const estimated = task.etaSeconds != null
-    ? `预计剩余 ${formatProgressTime(task.etaSeconds)}`
-    : task.expectedSeconds
-      ? `本阶段预计约 ${formatProgressTime(Math.max(3, task.expectedSeconds - stageElapsed))}`
-      : '预计时间正在估算'
+  let estimated = '任务仍在进行，可随时停止'
+  if (task.etaSeconds != null) {
+    // Download progress has real byte counts and speed, so a remaining-time
+    // estimate is meaningful here.
+    estimated = `按当前速度约剩 ${formatProgressTime(task.etaSeconds)}`
+  } else if (task.expectedSeconds) {
+    // Search, browser and LLM stages have no trustworthy throughput signal.
+    // Keep the heuristic internal and only use it to explain a long wait.
+    estimated = stageElapsed > Math.max(30, task.expectedSeconds * 1.8)
+      ? '外部响应较慢，任务仍在进行'
+      : '正在处理，可随时停止'
+  }
 
   return (
     <div className="mx-auto w-full max-w-2xl rounded-xl border border-cyber-cyan/25 bg-surface-800/75 backdrop-blur-sm px-3.5 py-3 animate-fade-in">
@@ -257,7 +306,7 @@ function UpdateReportCard({ payload, api, toast, onRefresh }) {
   )
 }
 
-export default function ChatPage({ status, games, onGameChange, onGameImport, toast, api, onRefresh }) {
+export default function ChatPage({ status, games, onGameChange, onGameImport, onGamesRefresh, toast, api, onRefresh }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState(() => sessionStorage.getItem('chat_draft') || '')
   const [loading, setLoading] = useState(false)
@@ -277,6 +326,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
   const [gameOpen, setGameOpen] = useState(false)
   const [gameImportOpen, setGameImportOpen] = useState(false)
   const [gameImportBusy, setGameImportBusy] = useState(false)
+  const [gameScanBusy, setGameScanBusy] = useState(false)
   const [gameImportForm, setGameImportForm] = useState({
     game_name: '',
     game_root: '',
@@ -293,6 +343,35 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
   const activeSessionRef = useRef(null)
 
   const mkId = () => `m${Date.now()}_${++idRef.current}`
+
+  const rescanGames = async () => {
+    if (gameScanBusy || !status.online) return
+    setGameScanBusy(true)
+    emitFeedback('scan-start', { source: 'game-library' })
+    try {
+      const before = new Set(
+        games.map(game => String(game.path || '').replace(/\\/g, '/').toLowerCase())
+      )
+      const detected = await onGamesRefresh?.()
+      const list = Array.isArray(detected) ? detected : []
+      const added = list.filter(game => (
+        !before.has(String(game.path || '').replace(/\\/g, '/').toLowerCase())
+      ))
+      setGameOpen(false)
+      setGameSearch('')
+      emitFeedback('scan-complete', { source: 'game-library', count: added.length })
+      toast(
+        added.length
+          ? `游戏扫描完成：发现 ${added.length} 款新游戏，共 ${list.length} 款`
+          : `游戏扫描完成：共 ${list.length} 款，未发现新增`
+      )
+    } catch (_) {
+      emitFeedback('error', { source: 'game-library' })
+      toast('重新扫描游戏失败，请检查本地服务后重试', 'error')
+    } finally {
+      setGameScanBusy(false)
+    }
+  }
 
   // 让流式回复只写入"发送时所属的会话"，切走后不串味
   useEffect(() => { activeSessionRef.current = activeSession }, [activeSession])
@@ -318,9 +397,12 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
         const download = await response.json()
         if (cancelled || !download?.active || !Array.isArray(download.items)) return
         const current = download.items.find(item => item.status === 'downloading')
+        const currentLabel = current?.name
+          ? `${current.name}${current.source_label ? `（${current.source_label}）` : ''}`
+          : ''
         setTaskProgress(previous => ({
           ...(previous || {}),
-          label: current?.name ? `正在下载：${current.name}` : `正在下载 ${download.items.length} 个 Mod`,
+          label: currentLabel ? `正在下载：${currentLabel}` : `正在下载 ${download.items.length} 个 Mod`,
           mode: 'determinate',
           pct: Number(download.overall_pct) || 0,
           etaSeconds: download.eta_seconds,
@@ -392,7 +474,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
       if (d.ui_state?.kind === 'recommendation_set'
           && Array.isArray(d.ui_state.items)
           && ['recommendation', 'confirm', 'executing'].includes(d.ui_state.phase || 'recommendation')) {
-        norm.push({ id: mkId(), role: 'edition', payload: d.ui_state })
+        const positioned = insertRecommendationAtAnchor(norm, d.ui_state, mkId)
+        norm.splice(0, norm.length, ...positioned)
       }
       setMessages(norm)
     } catch (_) { toast('加载会话失败', 'error') }
@@ -440,9 +523,15 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
       }
       if (data.recommendations?.kind === 'recommendation_set') {
         recoveryAgentRef.current = { id: null, text: '' }
-        setMessages(prev => [...prev, {
-          id: mkId(), role: 'edition', payload: { ...data.recommendations, phase: 'recommendation' },
-        }])
+        setMessages(prev => {
+          if (prev.some(message => message.role === 'edition')) return prev
+          const payload = {
+            ...data.recommendations,
+            phase: 'recommendation',
+            anchor_after_text_count: textMessageCount(prev),
+          }
+          return insertRecommendationAtAnchor(prev, payload, mkId)
+        })
         continue
       }
       if (Array.isArray(data.update_report?.items)) {
@@ -706,6 +795,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
 
     let curAgentId = null   // 当前正在流式的 agent 消息 id
     let segText = ''        // 当前段落累计文本
+    let transcriptTextCount = textMessageCount(baseMessages || messages) + 1
     let streamCompleted = false
     let streamFailed = false
 
@@ -790,7 +880,11 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
             }
             if (data.recommendations?.kind === 'recommendation_set') {
               curAgentId = null
-              const payload = { ...data.recommendations, phase: 'recommendation' }
+              const payload = {
+                ...data.recommendations,
+                phase: 'recommendation',
+                anchor_after_text_count: transcriptTextCount,
+              }
               guardedSet(prev => [...prev, { id: mkId(), role: 'edition', payload }])
               persistEditionState(sendSid, payload)
               continue
@@ -816,6 +910,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
                 const id = mkId()
                 curAgentId = id
                 segText = data.chunk
+                transcriptTextCount += 1
                 guardedSet(prev => [...prev, { id, role: 'agent', content: segText }])
               } else {
                 segText += data.chunk
@@ -1057,6 +1152,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
     gog_registry: 'GOG',
     gog_library: 'GOG',
     wegame_rail: 'WeGame',
+    xbox_gaming_root: 'Xbox',
     manual: '手动',
   })[source] || ''
 
@@ -1232,6 +1328,16 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
               {/* Click outside to close */}
               {gameOpen && <div className="fixed inset-0 z-40" onClick={() => { setGameOpen(false); setGameSearch('') }} />}
             </div>
+            <button
+              type="button"
+              disabled={!status.online || gameScanBusy}
+              onClick={rescanGames}
+              className="tc-icon-button shrink-0 rounded border border-surface-600 p-1.5 text-surface-400 hover:border-cyber-cyan/40 hover:text-cyber-cyan disabled:cursor-wait disabled:opacity-45"
+              title="重新扫描 Steam、Epic、EA、GOG、WeGame、Xbox 和手动导入的游戏"
+              aria-label="重新扫描游戏"
+            >
+              <RefreshCw size={13} className={gameScanBusy ? 'animate-spin' : ''} />
+            </button>
             {currentGame && !currentGame.adapted && (
               <span className="shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-amber-400/10 text-amber-400 border border-amber-400/30"
                 title="该游戏未特化适配:搜索/安装走通用兜底规则,落位不保证;快照走目录嗅探。结果请自行核对。">
@@ -1316,6 +1422,16 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, to
               ))}
             </optgroup>
           </select>
+          <button
+            type="button"
+            onClick={rescanGames}
+            disabled={!status.online || gameScanBusy}
+            className="mt-2 w-full px-2 py-1.5 rounded text-xs border border-surface-500 text-surface-300 hover:border-cyber-cyan/40 hover:text-cyber-cyan disabled:cursor-wait disabled:opacity-40 flex items-center justify-center gap-1.5"
+            title="无需重启 ModAgent，重新读取所有受支持游戏平台的已安装游戏"
+          >
+            <RefreshCw size={13} className={gameScanBusy ? 'animate-spin' : ''} />
+            {gameScanBusy ? '正在扫描游戏…' : '重新扫描游戏'}
+          </button>
           <button
             onClick={openGameImport}
             className="mt-2 w-full px-2 py-1.5 rounded text-xs border border-cyber-cyan/30 text-cyber-cyan hover:bg-cyber-cyan/10 flex items-center justify-center gap-1.5"

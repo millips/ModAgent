@@ -8,6 +8,9 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from . import db
+from .inventory_match import find_installed_duplicate
+
 
 SOURCE_LABELS = {
     "nexus": "Nexus",
@@ -33,7 +36,7 @@ _MARKDOWN_TABLE_SEPARATOR_RE = re.compile(
 RECOMMENDATION_FALLBACK_TEXT = (
     "已根据本轮搜索与详情核验整理候选，并综合考虑更新时间、版本、依赖和潜在冲突。"
 )
-MISSING_CONTENT_TEXT = "该来源未提供功能简介"
+MISSING_CONTENT_TEXT = "来源未返回功能简介；目前只能确认标题，功能与适配性尚未核验。"
 
 
 def _text(value: Any, fallback: str = "") -> str:
@@ -41,7 +44,21 @@ def _text(value: Any, fallback: str = "") -> str:
     return value if value else fallback
 
 
-def recommendation_analysis_text(value: Any) -> str:
+def _source_coverage_text(payload: dict | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    counts = payload.get("source_counts") or {}
+    parts = [
+        f"{SOURCE_LABELS.get(source, source)} {int(count)} 项"
+        for source, count in counts.items()
+        if int(count or 0) > 0
+    ]
+    if not parts:
+        return ""
+    return "本轮各来源返回候选：" + "、".join(parts) + "。"
+
+
+def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str:
     """Keep a compact model analysis while removing its duplicate table."""
     text = _text(value)
     result: list[str] = []
@@ -66,21 +83,28 @@ def recommendation_analysis_text(value: Any) -> str:
     # The structured card already carries versions, activity and source metadata.
     # Keep only a small decision-oriented preface in chat.
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", cleaned) if part.strip()]
-    cleaned = "\n\n".join(paragraphs[:3])
-    if len(cleaned) > 520:
-        cleaned = cleaned[:517].rstrip("，。；:： ") + "…"
+    cleaned = "\n\n".join(paragraphs[:6])
+    if len(cleaned) > 1200:
+        cleaned = cleaned[:1197].rstrip("，。；:： ") + "…"
     if len(cleaned) < 20:
         cleaned = RECOMMENDATION_FALLBACK_TEXT
+    coverage = _source_coverage_text(payload)
     return (
-        f"{cleaned}\n\n"
+        f"{cleaned}"
+        + (f"\n\n{coverage}" if coverage and coverage not in cleaned else "")
+        + "\n\n"
         "请在下方清单中调整选择；优先候选已默认勾选，也可以取消、增添或全选。"
     )
 
 
 def needs_chinese_localization(value: Any) -> bool:
-    """True when a description is missing or still contains no Chinese."""
+    """True only when an existing description still contains no Chinese."""
     text = _text(value)
-    return not text or text == MISSING_CONTENT_TEXT or not _CHINESE_RE.search(text)
+    # Missing evidence must stay visibly missing. Asking the model to infer a
+    # function from the title turns uncertainty into a fabricated description.
+    if not text or text == MISSING_CONTENT_TEXT:
+        return False
+    return not _CHINESE_RE.search(text)
 
 
 def apply_chinese_descriptions(payload: dict, translations: Any) -> dict:
@@ -113,7 +137,7 @@ def apply_chinese_descriptions(payload: dict, translations: Any) -> dict:
         key = _text(item.get("selection_key"))
         item["content"] = localized.get(
             key,
-            "该模组用于调整或扩展游戏内容；中文详情暂缺，安装前请核对版本、依赖与兼容性。",
+            "原始简介暂未完成中文转换；请打开来源页面核对功能、版本与兼容性。",
         )
     return payload
 
@@ -172,7 +196,9 @@ def _freshness(value: Any) -> str:
     return f"约 {max(1, days // 30)} 个月未更新"
 
 
-def _recommendation_reason(item: dict, updated: Any, detail_verified: bool) -> str:
+def _recommendation_reason(
+    item: dict, updated: Any, detail_verified: bool, has_function_summary: bool,
+) -> str:
     explicit = _text(item.get("recommendation_reason") or item.get("reason"))
     facts = []
     downloads = item.get("downloads") or item.get("mod_downloads")
@@ -189,6 +215,8 @@ def _recommendation_reason(item: dict, updated: Any, detail_verified: bool) -> s
         return " · ".join(facts)[:160]
     if explicit and not re.fullmatch(r"评分\s*0[，,]\s*最近更新\s*", explicit):
         return explicit[:160]
+    if not has_function_summary:
+        return "目前仅匹配到标题，暂无足够信息支持功能推荐"
     return "来自本轮搜索候选，建议结合功能与风险信息判断"
 
 
@@ -199,6 +227,8 @@ def _normalize_item(source: str, item: dict) -> dict:
     archived = bool(item.get("archived"))
     has_files = item.get("has_files")
     detail_verified = bool(item.get("_detail_verified"))
+    content = item.get("summary") or item.get("description")
+    has_function_summary = bool(_text(content))
     staleness = item.get("staleness") if isinstance(item.get("staleness"), dict) else {}
     if archived:
         conflict_status = "danger"
@@ -209,6 +239,9 @@ def _normalize_item(source: str, item: dict) -> dict:
     elif staleness.get("stale"):
         conflict_status = "warning"
         conflict = staleness.get("note") or "较长时间未更新，需核对兼容性"
+    elif not has_function_summary:
+        conflict_status = "unknown"
+        conflict = "仅确认标题，功能、依赖与兼容性待核验"
     elif detail_verified:
         conflict_status = "clear"
         conflict = "基础详情已核验，安装包仍需检查"
@@ -216,10 +249,6 @@ def _normalize_item(source: str, item: dict) -> dict:
         conflict_status = "unknown"
         conflict = "仅有搜索摘要，待详情核验"
 
-    content = (
-        item.get("summary") or item.get("description")
-        or ("Steam 创意工坊条目" if source == "workshop" else "")
-    )
     version = item.get("version") or item.get("latest_version")
     updated = item.get("updated_at") or item.get("updated_time") or item.get("updated")
     source_id = (
@@ -235,7 +264,10 @@ def _normalize_item(source: str, item: dict) -> dict:
         "mod_id": item.get("mod_id"),
         "name": _text(item.get("name") or item.get("full_name"), "未命名 Mod")[:120],
         "content": _text(content, MISSING_CONTENT_TEXT)[:280],
-        "recommendation_reason": _recommendation_reason(item, updated, detail_verified),
+        "has_function_summary": has_function_summary,
+        "recommendation_reason": _recommendation_reason(
+            item, updated, detail_verified, has_function_summary
+        ),
         "updated_at": _format_updated(updated),
         "freshness": _freshness(updated),
         "version": _text(version, "待详情核验")[:48],
@@ -331,7 +363,7 @@ def _merge_evidence(broad: list[dict], verified: list[dict]) -> list[dict]:
 
 
 def recommendations_from_tool_evidence(
-    evidence: list[tuple[str, Any]], limit: int = 6,
+    evidence: list[tuple[str, Any]], limit: int = 10, game_slug: str = "",
 ) -> dict:
     """Build the final Pro table from all search evidence in this turn."""
     broad = {source: [] for source in SOURCE_LABELS}
@@ -374,10 +406,12 @@ def recommendations_from_tool_evidence(
         "thunderstore": combined["thunderstore"],
         "gamebanana": combined["gamebanana"],
         "github": combined["github"],
-    }, limit=limit)
+    }, limit=limit, game_slug=game_slug)
 
 
-def normalize_recommendations(payload: Any, limit: int = 6) -> dict:
+def normalize_recommendations(
+    payload: Any, limit: int = 10, game_slug: str = "",
+) -> dict:
     """Return a stable six-row payload for the Pro recommendation table."""
     if isinstance(payload, str):
         try:
@@ -394,14 +428,44 @@ def normalize_recommendations(payload: Any, limit: int = 6) -> dict:
         "gamebanana": payload.get("gamebanana") or [],
         "github": payload.get("github") or [],
     }
-    normalized_groups = {
-        source: [_normalize_item(source, item) for item in items if isinstance(item, dict)]
-        for source, items in groups.items()
+    source_counts = {
+        source: len(rows) for source, rows in groups.items() if isinstance(rows, list)
     }
+    try:
+        installed_mods = db.get_installed_mods(game_slug) if game_slug else []
+    except Exception:
+        installed_mods = []
+    installed_skipped = []
+    normalized_groups = {}
+    for source, rows in groups.items():
+        normalized_groups[source] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            item = _normalize_item(source, raw)
+            installed = find_installed_duplicate(
+                game_slug,
+                source,
+                item.get("source_id") or "",
+                target_name=item.get("name") or "",
+                installed_mods=installed_mods,
+            ) if game_slug else None
+            if installed:
+                installed_skipped.append({
+                    "selection_key": item["selection_key"],
+                    "source": source,
+                    "source_id": item.get("source_id") or "",
+                    "name": item.get("name") or "",
+                    "installed_id": installed.id,
+                    "installed_name": installed.name,
+                    "installed_version": installed.version,
+                })
+                continue
+            normalized_groups[source].append(item)
 
     # Round-robin sources so Nexus' first five rows cannot hide every other
     # source in a six-row table.
-    normalized_limit = max(1, min(int(limit or 6), 12))
+    normalized_limit = max(2, min(int(limit or 10), 20))
     items = []
     index = 0
     source_order = tuple(groups)
@@ -420,7 +484,7 @@ def normalize_recommendations(payload: Any, limit: int = 6) -> dict:
 
     selected = 0
     for item in items:
-        if item["installable"] and selected < 4:
+        if item["installable"] and item["has_function_summary"] and selected < 4:
             item["default_selected"] = True
             selected += 1
 
@@ -432,4 +496,7 @@ def normalize_recommendations(payload: Any, limit: int = 6) -> dict:
         ],
         "sources_failed": payload.get("sources_failed") or {},
         "note": _text(payload.get("note")),
+        "installed_skipped": installed_skipped,
+        "installed_skipped_count": len(installed_skipped),
+        "source_counts": source_counts,
     }

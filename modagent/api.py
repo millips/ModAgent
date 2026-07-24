@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modagent.config import (
     Config, load as load_config, save as save_config, CONFIG_DIR,
-    edition_data_dir, current_edition,
+    edition_data_dir, current_edition, entitlement_tier,
 )
 from modagent import db, games, installer, scanner, downloader, __version__
 from modagent import snapshot, confirmation        # ← 快照预览 + 一次性回滚确认令牌
@@ -41,7 +41,8 @@ PROMPT_REFERENCED_TOOLS = {
     "mod_disable", "mod_enable", "mod_dependency_set",
     "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete", "conflict_check",
     "list_local_mods", "tool_extract",
-    "get_installed", "read_readme", "game_diagnose", "mod_patch", "game_config_write",
+    "get_installed", "read_readme", "game_diagnose", "game_file_check",
+    "stardew_smapi_status", "mod_patch", "game_config_write",
     "scan_games", "scan_existing_mods", "import_existing_mods",
     "collection_view", "download_from_url", "thunderstore_search",
     "workshop_search", "workshop_install", "workshop_uninstall",
@@ -221,10 +222,10 @@ class ConfigUpdate(BaseModel):
     llm_endpoint: Optional[str] = None
     llm_model: Optional[str] = None
     llm_api_key: Optional[str] = None
-    tier: Optional[str] = None
     mod_loader: Optional[str] = None
     tavily_api_key: Optional[str] = None
     dev_mode: Optional[bool] = None
+    recommendation_limit: Optional[int] = Field(default=None, ge=2, le=20)
 
 
 def _get_agent(session_id: str) -> Agent:
@@ -259,6 +260,9 @@ def get_status():
         "bg": bg,
         "tavily_set": bool(cfg.tavily_api_key),
         "dev_mode": bool(getattr(cfg, "dev_mode", False)),
+        "recommendation_limit": max(
+            2, min(int(getattr(cfg, "recommendation_limit", 10) or 10), 20)
+        ),
     }
 
 
@@ -412,6 +416,7 @@ def update_config(body: ConfigUpdate):
         cfg.nexus_api_key = data.pop("api_key")
     for key, value in data.items():
         setattr(cfg, key, value)
+    cfg.tier = entitlement_tier()
     save_config(cfg)
     if rebuild_llm_client:
         for agent in agents.values():
@@ -831,7 +836,11 @@ def update_session_ui_state(sid: str, req: SessionUiStateUpdate):
     encoded = json.dumps(req.state, ensure_ascii=False)
     if len(encoded.encode("utf-8")) > 100_000:
         raise HTTPException(400, "UI state is too large")
-    allowed = {"kind", "phase", "items", "selected_keys"}
+    allowed = {
+        "kind", "phase", "items", "selected_keys",
+        "anchor_after_text_count", "source_counts",
+        "installed_skipped", "installed_skipped_count",
+    }
     clean = {key: value for key, value in req.state.items() if key in allowed}
     if clean and clean.get("kind") != "recommendation_set":
         raise HTTPException(400, "Unsupported UI state")

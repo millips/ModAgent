@@ -39,10 +39,10 @@ function setupAutoUpdater({ identity, diagnostics, getMainWindow }) {
     send('downloaded', { version: info.version });
     const result = await dialog.showMessageBox(getMainWindow(), {
       type: 'info',
-      title: `${identity.productName} ?????`,
-      message: `?? ${info.version} ??????`,
-      detail: '?????????????????????',
-      buttons: ['????', '??'],
+      title: `${identity.productName} 更新已下载`,
+      message: `版本 ${info.version} 已准备就绪。`,
+      detail: '现在重启将安装更新；也可以稍后在退出应用时安装。',
+      buttons: ['立即重启安装', '稍后'],
       defaultId: 0,
       cancelId: 1,
       noLink: true,

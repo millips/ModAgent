@@ -5,6 +5,8 @@ import zipfile
 import re
 import tempfile
 import subprocess
+import hashlib
+import uuid
 from typing import Optional
 
 from .config import CONFIG_DIR
@@ -13,6 +15,113 @@ from .config import CONFIG_DIR
 # CNS 等 mod 框架用非锚定子串扫描配置(string.find(name,'dekcns.json')),
 # 原地备份会被当成正经配置产生"重影",且每次覆盖安装都复发。
 BACKUPS_DIR = os.path.join(CONFIG_DIR, "backups")
+
+
+def _file_fingerprint(path: str) -> tuple[int, str]:
+    """Return size and SHA-256 for an on-disk commit verification."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+def _commit_files_transactionally(operations: list[dict], game_root: str,
+                                  game_slug: str) -> list[dict]:
+    """Stage and atomically commit a complete install plan.
+
+    Every source is copied and hashed before the game directory is changed. Existing
+    destinations are moved into a same-volume rollback area, staged files are then
+    moved into place with ``os.replace``, and every committed file is re-hashed. Any
+    failure restores all previous files and removes newly-created files.
+    """
+    if not operations:
+        return []
+    real_root = os.path.realpath(game_root)
+    seen = set()
+    for operation in operations:
+        src = os.path.realpath(operation["src"])
+        dest = os.path.realpath(operation["dest"])
+        if not os.path.isfile(src):
+            raise RuntimeError(f"安装预检失败，源文件不存在: {operation['src']}")
+        try:
+            if os.path.commonpath([real_root, dest]) != real_root:
+                raise RuntimeError(f"安装预检失败，目标越出游戏目录: {operation['dest']}")
+        except ValueError as exc:
+            raise RuntimeError(f"安装预检失败，目标路径无效: {operation['dest']}") from exc
+        key = os.path.normcase(dest)
+        if key in seen:
+            raise RuntimeError(f"安装预检失败，多个文件映射到同一目标: {operation['dest']}")
+        seen.add(key)
+
+    transaction_root = os.path.join(game_root, f".modagent-transaction-{uuid.uuid4().hex}")
+    stage_root = os.path.join(transaction_root, "stage")
+    rollback_root = os.path.join(transaction_root, "rollback")
+    committed = []
+    moved_originals = []
+    cleanup_transaction = True
+    try:
+        os.makedirs(stage_root, exist_ok=False)
+        os.makedirs(rollback_root, exist_ok=False)
+        for index, operation in enumerate(operations):
+            staged = os.path.join(stage_root, str(index))
+            shutil.copy2(operation["src"], staged)
+            operation["staged"] = staged
+            operation["fingerprint"] = _file_fingerprint(staged)
+
+        for index, operation in enumerate(operations):
+            dest = operation["dest"]
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            existed = os.path.exists(dest)
+            operation["existed"] = existed
+            if existed:
+                _backup_file(dest, game_root, game_slug)
+                rollback = os.path.join(rollback_root, str(index))
+                os.replace(dest, rollback)
+                moved_originals.append((dest, rollback))
+            os.replace(operation["staged"], dest)
+            committed.append(dest)
+            if _file_fingerprint(dest) != operation["fingerprint"]:
+                raise RuntimeError(f"安装落盘复核失败: {dest}")
+
+        installed = []
+        for operation in operations:
+            record = dict(operation.get("record", {}))
+            record["dest"] = operation["dest"]
+            record.setdefault("overwrote", operation["existed"])
+            record["size"] = operation["fingerprint"][0]
+            record["sha256"] = operation["fingerprint"][1]
+            installed.append(record)
+        return installed
+    except Exception as original_error:
+        restore_errors = []
+        for dest in reversed(committed):
+            try:
+                if os.path.exists(dest):
+                    os.remove(dest)
+            except OSError as exc:
+                restore_errors.append(f"无法移除失败提交 {dest}: {exc}")
+        for dest, rollback in reversed(moved_originals):
+            try:
+                if os.path.exists(rollback):
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    os.replace(rollback, dest)
+            except OSError as exc:
+                restore_errors.append(f"无法恢复原文件 {dest}: {exc}")
+        if restore_errors:
+            # Never delete the only remaining copy of an original file. Keeping the
+            # transaction directory makes the failure recoverable and diagnosable.
+            cleanup_transaction = False
+            raise RuntimeError(
+                "安装提交失败且自动恢复不完整；回滚文件已保留在 "
+                f"{transaction_root}: {'; '.join(restore_errors)}"
+            ) from original_error
+        raise
+    finally:
+        if cleanup_transaction:
+            shutil.rmtree(transaction_root, ignore_errors=True)
 
 
 def _backup_file(dest: str, game_root: str, game_slug: str) -> None:
@@ -301,19 +410,17 @@ def _install_ff7r(archive_path: str, game_root: str, game_slug: str) -> dict:
             m.replace("\\", "/").split("/", 1)[0].lower()
             for m in members if m.lower().endswith(".uplugin") and "/" in m.replace("\\", "/")
         }
+        operations = []
         for member in members:
             dest = _ff7r_dest(member, plugin_roots, game_root)
             if not dest:
                 result["skipped"].append(member)
                 continue
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if os.path.exists(dest):
-                _backup_file(dest, game_root, game_slug)
-            try:
-                shutil.copy2(os.path.join(walk_root, member), dest)
-                result["installed"].append({"file": member, "dest": dest})
-            except Exception as exc:
-                result["errors"].append({"file": member, "error": str(exc)})
+            operations.append({
+                "src": os.path.join(walk_root, member), "dest": dest,
+                "record": {"file": member},
+            })
+        result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
     if not result["installed"]:
         raise RuntimeError("未识别到 FF7 Rebirth 的 End/Mods、注入器或 pak 文件，已停止安装。")
     return result
@@ -405,6 +512,7 @@ def install_mod(
             result.setdefault("notes", []).append(
                 f"已自动剥离压缩包顶层目录: {os.path.relpath(walk_root, tmp)}")
 
+        operations = []
         for root, _, files in os.walk(walk_root):
             for f in files:
                 full_src = os.path.join(root, f)
@@ -415,18 +523,9 @@ def install_mod(
                     result["skipped"].append(member)
                     continue
 
-                dest_dir = os.path.dirname(dest)
-                os.makedirs(dest_dir, exist_ok=True)
+                operations.append({"src": full_src, "dest": dest, "record": {"file": member}})
 
-                if os.path.exists(dest):
-                    # 覆盖前备份到集中区(C-0:绝不在游戏目录留 .modagent_bak)
-                    _backup_file(dest, game_root, game_slug)
-
-                try:
-                    shutil.copy2(full_src, dest)
-                    result["installed"].append({"file": member, "dest": dest})
-                except Exception as e:
-                    result["errors"].append({"file": member, "error": str(e)})
+        result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
 
     if layout.get("load_order_file"):
         _update_load_order(game_root, game_slug, layout, load_order)
@@ -516,6 +615,7 @@ def _install_bepinex(archive_path: str, game_root: str, game_slug: str = "") -> 
                 return f"{subdir}/{pkg}/{tail}" if namespaced else f"{subdir}/{tail}"
             return f"BepInEx/plugins/{pkg}/{norm}"               # 散 dll 兜底
 
+        operations = []
         for member in members:
             norm = member.replace("\\", "/")
             rel_dest = _route(norm)
@@ -532,14 +632,12 @@ def _install_bepinex(archive_path: str, game_root: str, game_slug: str = "") -> 
                 result["skipped"].append(member)
                 continue
 
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if os.path.exists(dest):
-                _backup_file(dest, game_root, game_slug)
-            try:
-                shutil.copy2(os.path.join(walk_root, member), dest)
-                result["installed"].append({"file": member, "dest": dest})
-            except Exception as e:
-                result["errors"].append({"file": member, "error": str(e)})
+            operations.append({
+                "src": os.path.join(walk_root, member), "dest": dest,
+                "record": {"file": member},
+            })
+
+        result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
 
         if not has_bep and not game_has_loader:
             result.setdefault("notes", []).append(
@@ -607,6 +705,7 @@ def install_mod_custom(archive_path: str, game_root: str, game_slug: str,
             raise RuntimeError(f"解压失败: {e}") from e
         walk_root = _strip_wrapper_dirs(tmp)   # 与 conflict_check 同款剥壳,保证包内路径对得上
 
+        operations = []
         for src_rel, dst_rel in mapping.items():
             src_norm = str(src_rel).replace("\\", "/").lstrip("/")
             src_full = os.path.join(walk_root, src_norm.replace("/", os.sep))
@@ -625,23 +724,23 @@ def install_mod_custom(archive_path: str, game_root: str, game_slug: str,
             existed = os.path.exists(dest)
             if existed:
                 result["warnings"].append(f"覆盖已存在文件: {rel}")
-                _backup_file(dest, game_root, game_slug)   # 覆盖前备份(C-0 集中区)
             if os.path.splitext(dest)[1].lower() in _EXEC_EXTS and rel.count("/") == 0:
                 result["warnings"].append(
                     f"可执行文件落游戏根: {rel}(疑似注入器/替换官方文件,请确认来源可信)")
 
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            try:
-                shutil.copy2(src_full, dest)
-                result["installed"].append({
-                    "src": src_rel, "dest": dest, "rel": rel, "overwrote": existed,
-                })
-            except Exception as e:
-                entry = {"src": src_rel, "error": str(e)}
-                if isinstance(e, OSError):
-                    from .diagnostics import classify_oserror
-                    entry.update(classify_oserror(e, dest))   # 可行动归因(游戏在跑/磁盘满…)
-                result["errors"].append(entry)
+            operations.append({
+                "src": src_full, "dest": dest,
+                "record": {"src": src_rel, "rel": rel, "overwrote": existed},
+            })
+
+        try:
+            result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
+        except Exception as e:
+            entry = {"src": "<transaction>", "error": str(e)}
+            if isinstance(e, OSError):
+                from .diagnostics import classify_oserror
+                entry.update(classify_oserror(e, game_root))
+            result["errors"].append(entry)
 
     return result
 

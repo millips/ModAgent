@@ -4,7 +4,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as _ToolTimeout
 from .config import Config
 from .config import current_edition
 from .prompts import build_prompt
-from .tools import build_tools_definitions, execute
+from .tools import build_tools_definitions, execute, refresh_local_inventory
+from . import db
 from .recommendation_ui import (
     apply_chinese_descriptions,
     needs_chinese_localization,
@@ -122,6 +123,37 @@ REGENERATE_BLOCKED_TOOLS = {
     "mod_dependency_set", "mod_source_align",
 }
 
+# A question about current state is not authorization to change that state.
+# Keep this separate from regeneration: it applies to ordinary user turns too.
+STATUS_QUESTION_BLOCKED_TOOLS = REGENERATE_BLOCKED_TOOLS | {
+    "mod_update_check",
+}
+
+
+def is_status_only_question(value: str) -> bool:
+    text = str(value or "").strip().casefold().replace(" ", "")
+    if not text:
+        return False
+    status_terms = (
+        "已安装", "已经安装", "安装了吗", "装了吗", "装过", "已经有", "已有",
+        "有没有装", "是否安装", "是不是有", "哪些安装", "当前状态",
+        "installed", "alreadyinstalled",
+    )
+    question_terms = ("吗", "么", "是否", "是不是", "有没有", "哪些", "?", "？")
+    explicit_actions = (
+        "帮我安装", "给我安装", "直接安装", "开始安装", "继续安装",
+        "帮我装", "给我装", "直接装", "开始装",
+        "帮我下载", "给我下载", "直接下载", "开始下载",
+        "帮我更新", "给我更新", "直接更新", "开始更新",
+        "没装就装", "没有就装", "未安装就安装",
+        "installit", "downloadit", "updateit",
+    )
+    return (
+        any(term in text for term in status_terms)
+        and any(term in text for term in question_terms)
+        and not any(term in text for term in explicit_actions)
+    )
+
 
 class Agent:
     def __init__(self, cfg: Config):
@@ -135,6 +167,7 @@ class Agent:
         self._prior_assistant_text = ""
         self._turn_result_cache: dict[str, str] = {}
         self._destructive_preview_turns: dict[str, str | None] = {}
+        self._status_only_turn = False
 
     @property
     def client(self):
@@ -156,6 +189,12 @@ class Agent:
         self.history = []
 
     def _exec(self, name: str, args: dict) -> str:
+        if self._status_only_turn and name in STATUS_QUESTION_BLOCKED_TOOLS:
+            return json.dumps({
+                "error": "status_question_side_effect_blocked",
+                "tool": name,
+                "message": "用户本轮是在询问当前状态，并未授权下载、安装、更新或来源绑定。请只用只读工具核实后直接回答。",
+            }, ensure_ascii=False)
         if self._regenerating and name in REGENERATE_BLOCKED_TOOLS:
             return json.dumps({
                 "error": "regenerate_side_effect_blocked",
@@ -418,7 +457,7 @@ class Agent:
         prompt = (
             "把下面 Mod 的 content 准确改写成简体中文功能介绍。"
             "保留专有名词，不翻译 selection_key，不虚构未提供的功能。"
-            "若 content 很短，可结合 Mod 名称解释其明显用途。"
+            "只翻译或压缩 content 中明确存在的信息，不可根据 Mod 名称猜测用途。"
             "每项 15-70 个中文字，只返回 JSON："
             '{"items":[{"selection_key":"原值","content":"中文功能介绍"}]}。\n'
             + json.dumps(pending, ensure_ascii=False)
@@ -441,6 +480,7 @@ class Agent:
 
     def chat(self, user_msg: str) -> str:
         self._current_user_msg = user_msg
+        self._status_only_turn = is_status_only_question(user_msg)
         self._prior_assistant_text = next((str(m.get("content") or "") for m in reversed(self.history)
                                            if m.get("role") == "assistant" and m.get("content")), "")
         self._turn_result_cache = {}
@@ -550,9 +590,42 @@ class Agent:
                 tool for tool in tools
                 if tool.get("function", {}).get("name") not in REGENERATE_BLOCKED_TOOLS
             ]
+        if self._status_only_turn:
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name")
+                not in STATUS_QUESTION_BLOCKED_TOOLS
+            ]
         messages = [{"role": "system", "content": system}]
         self.history = sanitize_tool_history(self.history)
         messages.extend(self.history)
+        if self._status_only_turn:
+            recommendation_context = {}
+            try:
+                session = db.get_session(getattr(self, "session_id", ""))
+                recommendation_context = json.loads(
+                    (session or {}).get("ui_state") or "{}"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                recommendation_context = {}
+            context_items = []
+            if recommendation_context.get("kind") == "recommendation_set":
+                for item in (recommendation_context.get("items") or [])[:12]:
+                    if isinstance(item, dict):
+                        context_items.append({
+                            "source": item.get("source"),
+                            "source_id": item.get("source_id"),
+                            "name": item.get("name"),
+                        })
+            messages.append({
+                "role": "system",
+                "content": (
+                    "本轮是状态核实问题，不是执行授权。只能调用只读检查工具，"
+                    "禁止下载、安装、更新、卸载、创建快照或绑定来源；核实后先直接回答用户的问题。"
+                    "\n当前界面推荐候选（可能为空）："
+                    + json.dumps(context_items, ensure_ascii=False)
+                ),
+            })
         if regenerate:
             effects = [str(item)[:240] for item in (completed_effects or [])[:20]]
             effect_text = "；".join(effects) if effects else "上一轮已经执行的操作"
@@ -757,14 +830,28 @@ class Agent:
                     current_edition() == "subscription"
                     and not selection_action
                 ):
+                    try:
+                        refresh_local_inventory(self.cfg)
+                    except Exception:
+                        pass
                     recommendation_set = recommendations_from_tool_evidence(
-                        recommendation_evidence
+                        recommendation_evidence,
+                        limit=max(
+                            2,
+                            min(
+                                int(getattr(self.cfg, "recommendation_limit", 10) or 10),
+                                20,
+                            ),
+                        ),
+                        game_slug=str(getattr(self.cfg, "game_slug", "") or ""),
                     )
                 if recommendation_set.get("items"):
                     recommendation_set = self._localize_recommendation_set(
                         recommendation_set
                     )
-                    final_text = recommendation_analysis_text(final_text)
+                    final_text = recommendation_analysis_text(
+                        final_text, recommendation_set
+                    )
                     yield self._emit({"chunk": final_text})
                     yield self._emit({"recommendations": recommendation_set})
                 else:
@@ -789,5 +876,6 @@ class Agent:
             self._turn_id = None
             self._regenerating = False
             self._current_user_msg = ""
+            self._status_only_turn = False
             self._prior_assistant_text = ""
             self._turn_result_cache = {}

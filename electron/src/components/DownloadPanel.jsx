@@ -10,6 +10,12 @@ function formatDuration(value) {
   return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`
 }
 
+function downloadItemLabel(item) {
+  const name = String(item?.name || '').trim() || `Mod ${item?.mod_id ?? ''}`.trim()
+  const source = String(item?.source_label || '').trim()
+  return source ? `${name}（${source}）` : name
+}
+
 export default function DownloadPanel({ api }) {
   const [state, setState] = useState({ active: false, items: [], updated: 0, overall_pct: 0 })
   const [dismissed, setDismissed] = useState(false)
@@ -98,7 +104,12 @@ export default function DownloadPanel({ api }) {
                   : it.status === 'downloading' ? <Loader2 size={12} className="text-cyber-cyan animate-spin" />
                   : <span className="block w-3 h-3 rounded-full border border-surface-500" />}
               </span>
-              <span className="flex-1 truncate text-[11px] text-surface-200" title={it.name}>{it.name}</span>
+              <span
+                className="flex-1 truncate text-[11px] text-surface-200"
+                title={downloadItemLabel(it)}
+              >
+                {downloadItemLabel(it)}
+              </span>
               <span className="text-[10px] text-surface-500 shrink-0">
                 {it.status === 'done' ? '完成' : it.status === 'failed' ? '失败' : it.status === 'downloading' ? `${it.pct}%` : '等待'}
               </span>

@@ -11,6 +11,14 @@ _state = {
     "samples": [],
 }
 
+_SOURCE_LABELS = {
+    "nexus": "Nexus",
+    "workshop": "Steam 创意工坊",
+    "github": "GitHub",
+    "thunderstore": "Thunderstore",
+    "gamebanana": "GameBanana",
+}
+
 
 def _overall_pct() -> float:
     items = _state["items"]
@@ -30,11 +38,18 @@ def _record_sample(now: float) -> None:
 
 
 def start(mods: list):
-    """mods: [{mod_id, name}]，开始一批下载。"""
+    """mods: [{mod_id, name, source?, source_label?}]，开始一批下载。"""
     with _lock:
         _state["items"] = [{
             "mod_id": m.get("mod_id"),
             "name": m.get("name", "") or f"mod {m.get('mod_id')}",
+            "source": str(m.get("source") or "").strip().lower(),
+            "source_label": (
+                str(m.get("source_label") or "").strip()
+                or _SOURCE_LABELS.get(
+                    str(m.get("source") or "").strip().lower(), ""
+                )
+            ),
             "status": "queued",  # queued | downloading | done | failed
             "pct": 0,
             "error": "",

@@ -580,6 +580,14 @@ body[data-ma-theme="kawaii"] .pro-recommendation-table thead {
   border-radius: 999px;
   background: rgba(var(--ma-bg0, 8,12,18), .32);
 }
+
+/* Recommendation cards can become narrow while the desktop window itself is
+   still wide (sidebars, split panes, restored layouts). Responsive behavior
+   must therefore follow the card, not only the viewport. */
+.pro-recommendation-panel {
+  container-name: recommendation-card;
+  container-type: inline-size;
+}
 .pro-recommendation-stat.is-warning {
   color: var(--ma-accent3, #f6c85f);
   border-color: color-mix(in srgb, var(--ma-accent3, #f6c85f) 32%, transparent);
@@ -2961,6 +2969,48 @@ body[data-ma-theme="tactical"] .pro-recommendation-header::after {
   body[data-ma-theme="tactical"] .pro-recommendation-header::after,
   body[data-ma-theme="abyssal"] .pro-recommendation-header::after {
     display: none;
+  }
+}
+
+@container recommendation-card (max-width: 860px) {
+  body[data-ma-theme="cat"] .pro-recommendation-header,
+  body[data-ma-theme="gothic"] .pro-recommendation-header,
+  body[data-ma-theme="tactical"] .pro-recommendation-header,
+  body[data-ma-theme="abyssal"] .pro-recommendation-header {
+    min-height: auto;
+    padding: 16px !important;
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 12px;
+  }
+  body[data-ma-theme="cat"] .pro-recommendation-header::after,
+  body[data-ma-theme="gothic"] .pro-recommendation-header::after,
+  body[data-ma-theme="tactical"] .pro-recommendation-header::after,
+  body[data-ma-theme="abyssal"] .pro-recommendation-header::after {
+    display: none !important;
+  }
+  .pro-recommendation-header > :first-child {
+    min-width: 0;
+  }
+  .pro-recommendation-header > :first-child > :first-child {
+    font-size: 0.95rem;
+    line-height: 1.35;
+  }
+  .pro-recommendation-header .pro-recommendation-stat {
+    white-space: nowrap;
+  }
+}
+
+@container recommendation-card (max-width: 620px) {
+  body[data-ma-theme="cat"] .pro-recommendation-header,
+  body[data-ma-theme="gothic"] .pro-recommendation-header,
+  body[data-ma-theme="tactical"] .pro-recommendation-header,
+  body[data-ma-theme="abyssal"] .pro-recommendation-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pro-recommendation-header > :last-child {
+    justify-self: start;
   }
 }
 

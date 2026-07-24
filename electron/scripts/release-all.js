@@ -99,6 +99,12 @@ function inspectAsar(edition) {
   }
 
   const entries = asar.listPackage(archive)
+  for (const sourceFile of ['main.js', 'updater.js', 'runtimeDiagnostics.js']) {
+    const packedText = asar.extractFile(archive, sourceFile).toString('utf8')
+    if (/\?{4,}|\uFFFD/.test(packedText)) {
+      throw new Error(`${edition} app.asar contains corrupted user text in ${sourceFile}`)
+    }
+  }
   const mp3 = entries.filter(entry => entry.toLowerCase().endsWith('.mp3'))
   const paidRaster = entries.filter(entry =>
     /core-shell|frame-base|emission-mask/i.test(entry)

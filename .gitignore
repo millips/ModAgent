@@ -3,7 +3,7 @@ __pycache__/
 node_modules/
 downloads/
 dist/
-build/
+/build/
 *.log
 .DS_Store
 snapshots/
@@ -14,3 +14,4 @@ snapshots/
 backups/
 _stage_backup/
 electron/release/
+electron/tmp-asar-*/

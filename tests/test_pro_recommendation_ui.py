@@ -60,13 +60,38 @@ assert len(result["items"]) == 6
 assert [item["source"] for item in result["items"][:5]] == [
     "nexus", "workshop", "thunderstore", "gamebanana", "github",
 ]
-assert len(result["selected_keys"]) == 4
+assert len(result["selected_keys"]) == 3
 assert len(set(item["selection_key"] for item in result["items"])) == 6
+
+many = normalize_recommendations({
+    "recommendations": [
+        {"mod_id": index, "name": f"Candidate {index}", "summary": "Feature"}
+        for index in range(1, 16)
+    ],
+})
+assert len(many["items"]) == 10
+assert len(normalize_recommendations({
+    "recommendations": [
+        {"mod_id": index, "name": f"Candidate {index}", "summary": "Feature"}
+        for index in range(1, 25)
+    ],
+}, limit=20)["items"]) == 20
+assert len(normalize_recommendations({
+    "recommendations": [
+        {"mod_id": index, "name": f"Candidate {index}", "summary": "Feature"}
+        for index in range(1, 8)
+    ],
+}, limit=1)["items"]) == 2
 
 framework = result["items"][0]
 assert framework["version"] == "1.2.0"
 assert framework["dependencies"] == ["9"]
 assert framework["content"] == "Loads costume mods"
+
+workshop_item = next(item for item in result["items"] if item["name"] == "Workshop item")
+assert "功能与适配性尚未核验" in workshop_item["content"]
+assert workshop_item["has_function_summary"] is False
+assert workshop_item["selection_key"] not in result["selected_keys"]
 
 no_files = next(item for item in result["items"] if item["name"] == "No files")
 assert no_files["installable"] is False
@@ -106,7 +131,7 @@ assert evidence_result["items"][0]["dependency_status"] == "known"
 assert evidence_result["items"][0]["conflict_status"] == "clear"
 assert "详情已核验" in evidence_result["items"][0]["recommendation_reason"]
 assert evidence_result["items"][1]["version"] == "待详情核验"
-assert len(evidence_result["selected_keys"]) == 4
+assert len(evidence_result["selected_keys"]) == 2
 
 detail_only = recommendations_from_tool_evidence([
     ("nexus_get_detail", json.dumps({"mod_id": 810, "name": "Physics"})),

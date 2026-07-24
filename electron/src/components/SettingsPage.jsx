@@ -27,6 +27,7 @@ export default function SettingsPage({ toast, api }) {
   })
   const [model, setModel] = useState('deepseek-v4-pro')
   const [endpoint, setEndpoint] = useState('https://api.deepseek.com/v1')
+  const [recommendationLimit, setRecommendationLimit] = useState(10)
   const [bg, setBg] = useState(null)
   const [bgUrl, setBgUrl] = useState(null)
 
@@ -35,6 +36,7 @@ export default function SettingsPage({ toast, api }) {
       setCfg(s)
       setModel(s.llm_model || 'deepseek-v4-pro')
       setEndpoint(s.llm_endpoint || 'https://api.deepseek.com/v1')
+      setRecommendationLimit(Math.max(2, Math.min(Number(s.recommendation_limit) || 10, 20)))
       setBg(s.bg || null)
       if (s.bg) window.modagent.getBgDataUrl(s.bg).then(setBgUrl).catch(() => {})
     }).catch(() => {})
@@ -99,7 +101,13 @@ export default function SettingsPage({ toast, api }) {
   }
 
   const save = async () => {
-    const body = { llm_model: model, llm_endpoint: endpoint }
+    const body = {
+      llm_model: model,
+      llm_endpoint: endpoint,
+      ...(__MODAGENT_SUBSCRIPTION__
+        ? { recommendation_limit: Math.max(2, Math.min(Number(recommendationLimit) || 10, 20)) }
+        : {}),
+    }
     const secrets = {}
     if (nexusKey && nexusKey !== '********') { body.api_key = nexusKey; secrets.nexus_api_key = nexusKey }
     if (llmKey && llmKey !== '********') { body.llm_api_key = llmKey; secrets.llm_api_key = llmKey }
@@ -215,6 +223,38 @@ export default function SettingsPage({ toast, api }) {
           </div>
         </div>
 
+        {__MODAGENT_SUBSCRIPTION__ && (
+          <div className="card-cyber space-y-3">
+            <div className="flex items-center gap-2">
+              <Cpu size={14} className="text-cyber-cyan" />
+              <span className="text-sm font-medium">智能推荐</span>
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <label htmlFor="recommendation-limit" className="text-xs text-surface-400">
+                  最大候选数
+                </label>
+                <p className="mt-1 text-[11px] leading-relaxed text-surface-500">
+                  默认 10 个，可设置为 2–20 个；实际数量取决于本轮有效搜索结果。
+                </p>
+              </div>
+              <input
+                id="recommendation-limit"
+                type="number"
+                min="2"
+                max="20"
+                step="1"
+                className="input-cyber w-20 text-center"
+                value={recommendationLimit}
+                onChange={event => setRecommendationLimit(event.target.value)}
+                onBlur={() => setRecommendationLimit(
+                  Math.max(2, Math.min(Number(recommendationLimit) || 10, 20))
+                )}
+              />
+            </div>
+          </div>
+        )}
+
         <SettingsEditionPanel toast={toast} />
 
         <div className="card-cyber space-y-3">
@@ -278,7 +318,7 @@ export default function SettingsPage({ toast, api }) {
             ))}
           </div>
           <div className="text-[11px] text-surface-500 border-t border-surface-600/60 pt-2">
-            {__MODAGENT_SUBSCRIPTION__ ? 'ModAgent Pro' : 'ModAgent'} v1.0.0 · 发布者：ModAgent Project
+            {__MODAGENT_SUBSCRIPTION__ ? 'ModAgent Pro' : 'ModAgent'} v1.10 · 发布者：ModAgent Project
           </div>
         </div>
 
