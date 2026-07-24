@@ -33,6 +33,8 @@ _agent_last_used: dict[str, float] = {}            # ← 补回:被 _get_agent �
 _AGENT_TTL = 3600                                  # ← 补回:agent 空闲回收时间(秒)
 _chat_tasks: dict[str, dict] = {}
 _chat_tasks_lock = threading.RLock()
+_inventory_scan_jobs: dict[str, dict] = {}
+_inventory_scan_jobs_lock = threading.RLock()
 
 PROMPT_REFERENCED_TOOLS = {
     # 与 I 盘真身 tools.py 的 build_tools_definitions 保持一致(32 个)
@@ -326,6 +328,90 @@ def _public_scan_result(result: dict, imported: int = 0) -> dict:
     }
 
 
+def _inventory_scan_public_state(game_slug: str) -> dict:
+    with _inventory_scan_jobs_lock:
+        job = dict(_inventory_scan_jobs.get(game_slug) or {})
+    state = {
+        "game_slug": game_slug,
+        "status": job.get("status", "idle"),
+        "queued": job.get("status") == "running",
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+    }
+    if job.get("result"):
+        state.update(job["result"])
+    if job.get("error"):
+        state["error"] = job["error"]
+    return state
+
+
+def _inventory_scan_worker(game_slug: str) -> None:
+    while True:
+        with _inventory_scan_jobs_lock:
+            job = _inventory_scan_jobs.get(game_slug)
+            if not job:
+                return
+            generation = int(job["generation"])
+            request = dict(job["request"])
+        try:
+            result = scanner.scan_existing_mods(
+                request["game_root"],
+                game_slug,
+                request.get("api_key", ""),
+                request.get("extra_roots", []),
+            )
+            imported = scanner.import_mods(result.get("identified", []))
+            public_result = _public_scan_result(result, imported)
+            error = ""
+        except Exception as exc:
+            public_result = {}
+            error = f"Mod 扫描失败：{exc}"
+
+        with _inventory_scan_jobs_lock:
+            job = _inventory_scan_jobs.get(game_slug)
+            if not job:
+                return
+            # If a newer directory was saved during this pass, repeat using
+            # the latest roots instead of silently losing that request.
+            if int(job["generation"]) != generation:
+                continue
+            job["status"] = "failed" if error else "completed"
+            job["completed_at"] = time.time()
+            job["result"] = public_result
+            job["error"] = error
+            job["worker_alive"] = False
+            job.pop("request", None)
+            return
+
+
+def _queue_inventory_scan(game_root: str, game_slug: str, api_key: str = "",
+                          extra_roots: list[str] | None = None) -> dict:
+    request = {
+        "game_root": os.path.abspath(game_root),
+        "api_key": api_key,
+        "extra_roots": list(extra_roots or []),
+    }
+    with _inventory_scan_jobs_lock:
+        job = _inventory_scan_jobs.setdefault(game_slug, {})
+        job["generation"] = int(job.get("generation", 0)) + 1
+        job["request"] = request
+        job["status"] = "running"
+        job["started_at"] = time.time()
+        job["completed_at"] = None
+        job["result"] = {}
+        job["error"] = ""
+        should_start = not job.get("worker_alive", False)
+        job["worker_alive"] = True
+    if should_start:
+        threading.Thread(
+            target=_inventory_scan_worker,
+            args=(game_slug,),
+            name=f"modagent-inventory-{game_slug[:24]}",
+            daemon=True,
+        ).start()
+    return _inventory_scan_public_state(game_slug)
+
+
 @app.post("/games/import")
 def import_game(body: GameImport):
     """Validate, persist and immediately scan a manually imported game."""
@@ -360,19 +446,12 @@ def import_game(body: GameImport):
     save_config(cfg)
     resp["saved"] = True
     resp["game"] = games.normalize_manual_game(saved)
-    try:
-        full_scan = scanner.scan_existing_mods(
-            saved["path"], saved["slug"], getattr(cfg, "nexus_api_key", ""),
-            (getattr(cfg, "manual_mod_dirs", {}) or {}).get(saved["slug"], []),
-        )
-        imported = scanner.import_mods(full_scan.get("identified", []))
-        resp["mod_scan"] = _public_scan_result(full_scan, imported)
-    except Exception as exc:
-        resp["mod_scan"] = {
-            "identified": [],
-            "unidentified": [],
-            "error": f"游戏已导入，但首次 Mod 扫描失败：{exc}",
-        }
+    resp["mod_scan"] = _queue_inventory_scan(
+        saved["path"],
+        saved["slug"],
+        getattr(cfg, "nexus_api_key", ""),
+        (getattr(cfg, "manual_mod_dirs", {}) or {}).get(saved["slug"], []),
+    )
     return resp
 
 
@@ -397,13 +476,19 @@ def import_mod_directory(body: ModDirectoryImport):
     mapping[cfg.game_slug] = roots
     cfg.manual_mod_dirs = mapping
     save_config(cfg)
-    result = scanner.scan_existing_mods(
+    public = _queue_inventory_scan(
         cfg.game_root, cfg.game_slug, getattr(cfg, "nexus_api_key", ""), roots
     )
-    imported = scanner.import_mods(result.get("identified", []))
-    public = _public_scan_result(result, imported)
     public["directories"] = roots
     return public
+
+
+@app.get("/mods/scan-status")
+def mod_scan_status(game_slug: str = ""):
+    slug = game_slug or getattr(cfg, "game_slug", "")
+    if not slug:
+        raise HTTPException(status_code=400, detail="请先选择游戏")
+    return _inventory_scan_public_state(slug)
 
 
 @app.post("/config")

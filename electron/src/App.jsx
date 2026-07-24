@@ -184,10 +184,19 @@ export default function App() {
     if (!response.ok || !result.saved) {
       throw new Error(result.detail || result.error || '导入失败')
     }
-    const detected = await refreshGames()
     const norm = value => (value || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
-    const imported = detected.find(game => norm(game.path) === norm(payload.game_root)) || result.game
+    const imported = result.game
+    if (imported?.path) {
+      setGames(previous => [
+        imported,
+        ...previous.filter(game => norm(game.path) !== norm(imported.path)),
+      ])
+    }
     if (imported) await onGameChange(imported)
+    // Full launcher discovery can touch several large libraries. The manual
+    // game is already authoritative, so refresh the remaining list without
+    // making the import dialog wait for that scan.
+    refreshGames().catch(() => {})
     return result
   }
 

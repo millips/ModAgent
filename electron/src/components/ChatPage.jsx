@@ -1172,6 +1172,38 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     }))
   }
 
+  const monitorInventoryScan = async (gameSlug, label) => {
+    if (!gameSlug) return
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      await new Promise(resolve => window.setTimeout(resolve, 1000))
+      try {
+        const response = await fetch(
+          `${api}/mods/scan-status?game_slug=${encodeURIComponent(gameSlug)}`
+        )
+        if (!response.ok) continue
+        const state = await response.json()
+        if (state.status === 'completed') {
+          const imported = Number(state.imported || 0)
+          const detected = Number(state.detected || 0)
+          toast(
+            imported > 0
+              ? `${label}扫描完成：已导入 ${imported} 个 Mod`
+              : `${label}扫描完成：发现 ${detected} 项，清单无需新增`
+          )
+          onRefresh?.()
+          return
+        }
+        if (state.status === 'failed') {
+          toast(state.error || `${label}扫描失败`, 'error')
+          return
+        }
+      } catch (_) {
+        // The backend may be restarting; the next poll can still recover.
+      }
+    }
+    toast(`${label}目录较大，仍在后台扫描；你可以继续使用其他功能`)
+  }
+
   const submitGameImport = async () => {
     if (!gameImportForm.game_name.trim() || !gameImportForm.game_root.trim()) {
       toast('请填写游戏名称并选择游戏目录或主程序', 'error')
@@ -1189,7 +1221,10 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       setGameImportForm({ game_name: '', game_root: '', executable: '', game_slug: '' })
       const scan = result.mod_scan || {}
       const scanCount = Number(scan.identified_count ?? scan.imported ?? (scan.identified || []).length)
-      if (scan.error) {
+      if (scan.queued) {
+        toast(`已导入 ${result.game?.name || gameImportForm.game_name}；正在后台扫描 Mod`)
+        void monitorInventoryScan(result.game?.slug, '游戏 Mod')
+      } else if (scan.error) {
         toast(scan.error, 'error')
       } else {
         toast(`已导入并扫描 ${result.game?.name || gameImportForm.game_name}：发现 ${scanCount} 个已有 Mod`)
@@ -1215,7 +1250,10 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       if (!response.ok) throw new Error(result.detail || result.error || 'Mod 目录导入失败')
       const imported = Number(result.imported || 0)
       const detected = Number(result.detected || 0)
-      if (imported > 0) toast(`已保存目录并导入 ${imported} 个 Mod`)
+      if (result.queued) {
+        toast('Mod 目录已保存；正在后台扫描，大型目录不会阻塞界面')
+        void monitorInventoryScan(status.game_slug, '外部 Mod')
+      } else if (imported > 0) toast(`已保存目录并导入 ${imported} 个 Mod`)
       else if (detected > 0) toast(`目录已保存；发现 ${detected} 项，均已在清单中`)
       else toast('目录已保存，但未发现受支持的 Mod 文件', 'error')
       emitFeedback('scan-complete', { count: imported })

@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import heapq
 
 NEXUS_GAME_MAP = {
     "Skyrim Special Edition": ("skyrimspecialedition", 1704),
@@ -58,36 +59,83 @@ def _parse_acf(acf_path: str) -> dict:
 
 # 常见的"游戏本体可执行文件"特征:UE 的 *-Shipping.exe,或体积较大的主 exe。
 _SHIPPING_RE = ("-shipping.exe", "-win64-shipping.exe", "-wingdk-shipping.exe")
+_EXECUTABLE_SCAN_SKIP_DIRS = {
+    "_commonredist", "archive", "archives", "cache", "content", "dlc",
+    "localization", "logs", "mod", "mods", "movies", "node_modules",
+    "pak", "paks", "plugins", "redist", "saved",
+}
+_EXECUTABLE_SCAN_PRIORITY = {
+    "binaries": 0,
+    "bin": 1,
+    "win64": 1,
+    "wingdk": 1,
+    "x64": 1,
+    "win32": 2,
+    "x86": 2,
+    "game": 3,
+    "engine": 4,
+}
 
 
-def _find_shipping_exe(game_root: str, max_depth: int = 4) -> str | None:
+def _find_shipping_exe(game_root: str, max_depth: int = 4,
+                       max_directories: int = 10_000,
+                       max_entries: int = 250_000) -> str | None:
     """在游戏目录内有界搜索游戏本体 exe(优先 UE 的 *-Shipping.exe;否则取最大的 exe)。
     只用于判断"这是不是一个活的游戏安装",不扫全盘。"""
     if not game_root or not os.path.isdir(game_root):
         return None
-    best_shipping = None
     biggest = (0, None)
-    root_depth = game_root.rstrip(os.sep).count(os.sep)
-    for root, dirs, files in os.walk(game_root):
-        if root.count(os.sep) - root_depth > max_depth:
-            dirs[:] = []
+    root = os.path.abspath(game_root)
+    queue = [(0, 0, 0, root)]
+    serial = 0
+    directories_seen = 0
+    entries_seen = 0
+
+    while queue and directories_seen < max_directories and entries_seen < max_entries:
+        _, depth, _, current = heapq.heappop(queue)
+        directories_seen += 1
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen >= max_entries:
+                        break
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            filename = entry.name
+                            lowered = filename.casefold()
+                            if not lowered.endswith(".exe"):
+                                continue
+                            if any(lowered.endswith(s) for s in _SHIPPING_RE):
+                                return entry.path
+                            if any(keyword in lowered for keyword in (
+                                "install", "setup", "unins", "launcher", "mod",
+                                "crash", "redist", "vcredist", "directx", "dxsetup",
+                            )):
+                                continue
+                            try:
+                                size = entry.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                size = 0
+                            if size > biggest[0]:
+                                biggest = (size, entry.path)
+                        elif depth < max_depth and entry.is_dir(follow_symlinks=False):
+                            name = entry.name.casefold()
+                            # Asset and mod trees can contain hundreds of thousands
+                            # of files but never the game executable. Unity *_Data
+                            # is handled by the structure-specific fast path above.
+                            if name in _EXECUTABLE_SCAN_SKIP_DIRS or name.endswith("_data"):
+                                continue
+                            serial += 1
+                            priority = _EXECUTABLE_SCAN_PRIORITY.get(name, 10)
+                            heapq.heappush(
+                                queue, (priority, depth + 1, serial, entry.path)
+                            )
+                    except OSError:
+                        continue
+        except OSError:
             continue
-        for f in files:
-            fl = f.lower()
-            if fl.endswith(".exe"):
-                full = os.path.join(root, f)
-                if any(fl.endswith(s) for s in _SHIPPING_RE):
-                    return full  # shipping exe 是最强信号,立即返回
-                try:
-                    sz = os.path.getsize(full)
-                except OSError:
-                    sz = 0
-                # 排除明显的第三方工具(安装器/mod管理器等),它们通常带这些词
-                if not any(k in fl for k in ("install", "setup", "unins", "launcher", "mod", "crash", "redist", "vcredist", "directx", "dxsetup")):
-                    if sz > biggest[0]:
-                        biggest = (sz, full)
-    if best_shipping:
-        return best_shipping
+
     # 没有 shipping exe:只有当最大 exe 也足够大(>20MB,游戏本体量级)才认
     return biggest[1] if biggest[0] > 20 * 1024 * 1024 else None
 
