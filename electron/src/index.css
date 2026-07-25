@@ -41,7 +41,9 @@
    behavior while changing proportion, rhythm and silhouette. */
 body[data-ma-layout="designed"] .app-shell {
   gap: clamp(8px, .9vw, 14px);
-  padding: clamp(8px, .8vw, 12px) clamp(10px, 1vw, 16px) clamp(10px, 1vw, 16px) 0;
+  height: 100vh;
+  min-height: 0;
+  padding: 0 clamp(8px, .8vw, 12px) 0 0;
   background:
     linear-gradient(118deg, rgba(0, 212, 255, .045) 0 19%, transparent 19% 73%, rgba(162, 89, 255, .05) 73% 100%);
 }
@@ -55,10 +57,10 @@ body[data-ma-layout="designed"] .app-shell::after {
 }
 
 body[data-ma-layout="designed"] .app-shell::before {
-  top: -34px;
+  top: 0;
   right: 4%;
   width: min(46vw, 680px);
-  height: clamp(82px, 11vh, 132px);
+  height: 16px;
   background:
     linear-gradient(105deg, transparent 0 16%, color-mix(in srgb, var(--ma-accent1, #00d4ff) 24%, transparent) 16% 19%, transparent 19% 32%, color-mix(in srgb, var(--ma-accent2, #a259ff) 20%, transparent) 32% 100%);
   clip-path: polygon(15% 0, 100% 0, 90% 42%, 100% 68%, 28% 100%, 0 70%);
@@ -67,9 +69,9 @@ body[data-ma-layout="designed"] .app-shell::before {
 
 body[data-ma-layout="designed"] .app-shell::after {
   left: 18%;
-  bottom: -42px;
+  bottom: 0;
   width: min(61.8vw, 900px);
-  height: clamp(90px, 14vh, 160px);
+  height: 9px;
   background:
     linear-gradient(82deg, color-mix(in srgb, var(--ma-accent2, #a259ff) 18%, transparent), transparent 58%),
     linear-gradient(98deg, transparent 68%, color-mix(in srgb, var(--ma-accent1, #00d4ff) 16%, transparent) 68% 72%, transparent 72%);
@@ -81,8 +83,9 @@ body[data-ma-layout="designed"] .app-sidebar {
   width: clamp(220px, 19.1vw, 268px) !important;
   min-width: clamp(220px, 19.1vw, 268px) !important;
   isolation: isolate;
-  margin-top: clamp(28px, 4.8vh, 48px);
-  margin-bottom: clamp(4px, 1vh, 12px);
+  height: 100%;
+  min-height: 0;
+  margin: 0;
   padding-right: 14px;
   overflow: visible;
   border-right-color: transparent !important;
@@ -98,7 +101,7 @@ body[data-ma-layout="designed"] .app-sidebar::after {
 
 body[data-ma-layout="designed"] .app-sidebar::before {
   z-index: 0;
-  inset: -24px -24px 58% 0;
+  inset: 0 -24px 58% 0;
   background:
     linear-gradient(145deg, color-mix(in srgb, var(--ma-accent2, #a259ff) 28%, rgb(var(--ma-bg1, 18, 27, 38))) 0 34%, rgb(var(--ma-bg1, 18, 27, 38)) 34% 72%, color-mix(in srgb, var(--ma-accent1, #00d4ff) 18%, transparent) 72%);
   clip-path: polygon(0 0, 86% 0, 100% 17%, 91% 68%, 100% 100%, 0 84%);
@@ -152,8 +155,9 @@ body[data-ma-layout="designed"] .app-sidebar .nav-item:nth-child(3n) > * {
 
 body[data-ma-layout="designed"] .app-page-stage {
   z-index: 1;
-  margin-top: clamp(10px, 1.8vh, 20px);
-  margin-bottom: clamp(18px, 3vh, 30px);
+  height: 100%;
+  min-height: 0;
+  margin: 0;
   border: 1px solid color-mix(in srgb, var(--ma-accent1, #00d4ff) 30%, transparent);
   border-radius: 2px 16px 2px 12px;
   box-shadow:
@@ -231,7 +235,7 @@ body[data-ma-layout="designed"] .app-page-layer > div > [class~="border-b"] > * 
 body[data-ma-layout="designed"] .chat-session-rail {
   width: clamp(210px, 23.6%, 250px) !important;
   min-width: clamp(210px, 23.6%, 250px) !important;
-  margin-bottom: 2.5%;
+  margin-bottom: 0;
   position: relative;
   border-right-width: 2px;
   box-shadow: 10px 14px 30px rgba(0, 0, 0, .18);
@@ -256,7 +260,7 @@ body[data-ma-layout="designed"] .chat-primary-pane {
 
 body[data-ma-layout="designed"] .chat-quick-sidebar {
   flex: 1 1 0% !important;
-  margin-top: clamp(18px, 3vh, 32px);
+  margin-top: 0;
   min-width: 250px;
   position: relative;
   isolation: isolate;
