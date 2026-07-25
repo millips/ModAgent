@@ -49,6 +49,12 @@ export function applyVisualPreferences(preferences) {
   document.body.dataset.maLighting = lighting
 }
 
+export function clearVisualPreferences() {
+  document.body.classList.remove('theme-technology-core', 'theme-classic-controls', 'theme-minimal-tech')
+  delete document.body.dataset.maTheme
+  delete document.body.dataset.maLighting
+}
+
 export function saveVisualPreference(key, value) {
   if (!KEYS[key]) return
   try { localStorage.setItem(KEYS[key], value) } catch (_) {}

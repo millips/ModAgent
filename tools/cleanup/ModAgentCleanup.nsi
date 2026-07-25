@@ -22,7 +22,7 @@ ShowInstDetails show
 BrandingText "ModAgent Cleanup ${PRODUCT_VERSION}"
 VIProductVersion "${PRODUCT_VERSION}.0"
 VIAddVersionKey "ProductName" "ModAgent 一键清理器"
-VIAddVersionKey "FileDescription" "Remove ModAgent programs and selected user data"
+VIAddVersionKey "FileDescription" "清除 ModAgent 程序和所选用户数据"
 VIAddVersionKey "FileVersion" "${PRODUCT_VERSION}"
 
 !define MUI_ABORTWARNING
@@ -125,6 +125,8 @@ Function CustomPageLeave
   IfFileExists "$CustomPath\resources\app.asar" marker_ok marker_bad
 marker_ok:
   IfFileExists "$CustomPath\ModAgent.exe" valid
+  IfFileExists "$CustomPath\ModAgentP.exe" valid
+  IfFileExists "$CustomPath\ModAgentPBeta.exe" valid
   IfFileExists "$CustomPath\ModAgentPro.exe" valid
   IfFileExists "$CustomPath\ModAgentProBeta.exe" valid marker_bad
 marker_bad:
@@ -141,21 +143,30 @@ Section "ModAgent 程序、快捷方式和注册信息（必选）" SEC_PROGRAM
     FileWrite $LogHandle "ModAgent Cleanup ${PRODUCT_VERSION}$\r$\n"
   ${Else}
     nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ModAgent.exe'
+    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ModAgentP.exe'
+    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ModAgentPBeta.exe'
     nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ModAgentPro.exe'
     nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ModAgentProBeta.exe'
     nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ModAgentBackend.exe'
   ${EndIf}
 
   !insertmacro RemoveDir "$LOCALAPPDATA\Programs\ModAgent"
+  !insertmacro RemoveDir "$LOCALAPPDATA\Programs\ModAgent P"
+  !insertmacro RemoveDir "$LOCALAPPDATA\Programs\ModAgent P Beta"
   !insertmacro RemoveDir "$LOCALAPPDATA\Programs\ModAgent Pro"
   !insertmacro RemoveDir "$LOCALAPPDATA\Programs\ModAgent Pro Beta"
   !insertmacro RemoveFile "$DESKTOP\ModAgent.lnk"
+  !insertmacro RemoveFile "$DESKTOP\ModAgent P.lnk"
+  !insertmacro RemoveFile "$DESKTOP\ModAgent P Beta.lnk"
   !insertmacro RemoveFile "$DESKTOP\ModAgent Pro.lnk"
   !insertmacro RemoveFile "$DESKTOP\ModAgent Pro Beta.lnk"
   !insertmacro RemoveDir "$SMPROGRAMS\ModAgent"
+  !insertmacro RemoveDir "$SMPROGRAMS\ModAgent P"
+  !insertmacro RemoveDir "$SMPROGRAMS\ModAgent P Beta"
   !insertmacro RemoveDir "$SMPROGRAMS\ModAgent Pro"
   !insertmacro RemoveDir "$SMPROGRAMS\ModAgent Pro Beta"
   !insertmacro RemoveReg "Software\Microsoft\Windows\CurrentVersion\Uninstall\com.modagent.desktop"
+  !insertmacro RemoveReg "Software\Microsoft\Windows\CurrentVersion\Uninstall\com.modagent.desktop.free"
   !insertmacro RemoveReg "Software\Microsoft\Windows\CurrentVersion\Uninstall\com.modagent.desktop.pro"
   !insertmacro RemoveReg "Software\Microsoft\Windows\CurrentVersion\Uninstall\com.modagent.desktop.pro.beta"
 SectionEnd
@@ -164,6 +175,8 @@ Section "清除公测版数据（.modagent-beta）" SEC_BETA_DATA
   !insertmacro RemoveDir "$PROFILE\.modagent-beta"
   !insertmacro RemoveDir "$APPDATA\ModAgent Beta"
   !insertmacro RemoveDir "$LOCALAPPDATA\ModAgent Beta"
+  !insertmacro RemoveDir "$APPDATA\ModAgent P Beta"
+  !insertmacro RemoveDir "$LOCALAPPDATA\ModAgent P Beta"
   !insertmacro RemoveDir "$APPDATA\ModAgent Pro Beta"
   !insertmacro RemoveDir "$LOCALAPPDATA\ModAgent Pro Beta"
 SectionEnd
@@ -171,8 +184,10 @@ SectionEnd
 Section /o "清除稳定版数据（.modagent，可选且不可恢复）" SEC_STABLE_DATA
   !insertmacro RemoveDir "$PROFILE\.modagent"
   !insertmacro RemoveDir "$APPDATA\ModAgent"
-  !insertmacro RemoveDir "$APPDATA\ModAgent Pro"
   !insertmacro RemoveDir "$LOCALAPPDATA\ModAgent"
+  !insertmacro RemoveDir "$APPDATA\ModAgent P"
+  !insertmacro RemoveDir "$LOCALAPPDATA\ModAgent P"
+  !insertmacro RemoveDir "$APPDATA\ModAgent Pro"
   !insertmacro RemoveDir "$LOCALAPPDATA\ModAgent Pro"
 SectionEnd
 

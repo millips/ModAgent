@@ -1,4 +1,7 @@
-const { app, BrowserWindow, Menu, ipcMain, shell, dialog, crashReporter, Notification } = require('electron');
+const {
+  app, BrowserWindow, Menu, ipcMain, shell, dialog, crashReporter,
+  Notification, clipboard, safeStorage,
+} = require('electron');
 const { spawn, exec } = require('child_process');
 const path = require('path');
 const http = require('http');
@@ -7,6 +10,7 @@ const os = require('os');
 const fs = require('fs');
 const { getAppIdentity } = require('./appIdentity');
 const { createSecurityStore } = require('./securityStore');
+const { createLicenseStore } = require('./licenseStore');
 const { createRuntimeDiagnostics, buildDiagnosticReport } = require('./runtimeDiagnostics');
 const { setupAutoUpdater } = require('./updater');
 const { findInstalledBrowser, profileDirectory } = require('./browserLauncher');
@@ -29,6 +33,13 @@ const TRUSTED_EXTERNAL_HOSTS = new Set([
   'www.nexusmods.com',
   'app.tavily.com',
   'platform.deepseek.com',
+  'platform.openai.com',
+  'github.com',
+  'www.github.com',
+  'afdian.com',
+  'www.afdian.com',
+  'ifdian.net',
+  'www.ifdian.net',
 ]);
 
 async function openTrustedExternal(rawUrl) {
@@ -56,6 +67,13 @@ const diagnostics = createRuntimeDiagnostics({
 });
 const { logger } = diagnostics;
 const securityStore = createSecurityStore(DATA_DIR, logger);
+const pLicenseStore = createLicenseStore({
+  dataDir: DATA_DIR,
+  edition: APP_EDITION,
+  safeStorage,
+  publicKeyPath: path.join(__dirname, 'assets', 'license', 'p-public-key.pem'),
+  logger,
+});
 const launchState = diagnostics.beginLaunch();
 
 fs.mkdirSync(path.join(diagnostics.logsDir, 'crashes'), { recursive: true });
@@ -436,6 +454,30 @@ app.on('activate', () => {
 
 ipcMain.handle('get-api-base', () => API_BASE);
 ipcMain.on('get-api-base-sync', event => { event.returnValue = API_BASE; });
+ipcMain.on('get-app-identity-sync', event => {
+  event.returnValue = {
+    edition: APP_EDITION,
+    productName: IDENTITY.productName,
+    version: PACKAGE_INFO.version,
+    channel: IDENTITY.channel,
+  };
+});
+ipcMain.on('get-p-license-status-sync', event => {
+  event.returnValue = pLicenseStore.status();
+});
+ipcMain.handle('get-p-license-status', () => pLicenseStore.status());
+ipcMain.handle('activate-p-license', (_, code) => {
+  try {
+    const status = pLicenseStore.activate(code);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('p-license-status', status);
+    }
+    return { ok: true, status };
+  } catch (error) {
+    logger.warn('ModAgent P activation failed', error.message);
+    return { ok: false, error: error.message || '兑换码验证失败' };
+  }
+});
 ipcMain.handle('open-external', (_, url) => openTrustedExternal(url));
 ipcMain.handle('notify-reply-complete', () => {
   if (!mainWindow || mainWindow.isFocused()) return { ok: true, shown: false };
@@ -506,6 +548,28 @@ ipcMain.handle('save-secrets', (_, updates = {}) => {
   return { ok: true };
 });
 ipcMain.handle('open-diagnostics-folder', () => shell.openPath(diagnostics.logsDir));
+ipcMain.handle('open-maintenance-folder', (_, kind) => {
+  const folders = {
+    logs: diagnostics.logsDir,
+    data: DATA_DIR,
+    cache: app.getPath('sessionData'),
+  };
+  const target = folders[String(kind || '')];
+  if (!target) return 'Unsupported maintenance folder';
+  fs.mkdirSync(target, { recursive: true });
+  return shell.openPath(target);
+});
+ipcMain.handle('copy-maintenance-path', (_, kind) => {
+  const folders = {
+    logs: diagnostics.logsDir,
+    data: DATA_DIR,
+    cache: app.getPath('sessionData'),
+  };
+  const target = folders[String(kind || '')];
+  if (!target) return { ok: false, error: 'Unsupported maintenance folder' };
+  clipboard.writeText(target);
+  return { ok: true, path: target };
+});
 ipcMain.handle('open-legal-document', (_, filename) => {
   const allowed = new Set([
     'PRIVACY.md',

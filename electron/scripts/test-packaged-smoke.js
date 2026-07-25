@@ -14,7 +14,7 @@ function option(name, fallback = '') {
 const edition = option('--edition', 'subscription')
 const defaultExecutable = edition === 'free'
   ? path.resolve(__dirname, '..', 'release', 'free', 'win-unpacked', 'ModAgent.exe')
-  : path.resolve(__dirname, '..', 'release', 'subscription', 'win-unpacked', 'ModAgentPro.exe')
+  : path.resolve(__dirname, '..', 'release', 'subscription', 'win-unpacked', 'ModAgentP.exe')
 const executable = path.resolve(option('--exe', defaultExecutable))
 
 assert(fs.existsSync(executable), `Packaged executable not found: ${executable}`)

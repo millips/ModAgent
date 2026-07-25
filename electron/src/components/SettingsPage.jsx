@@ -1,5 +1,9 @@
 import React, { useState, useEffect } from 'react'
-import { Key, Cpu, Globe, Image, Trash2, FolderOpen, FileDown, RefreshCw, Scale, FileText, PanelLeft } from 'lucide-react'
+import {
+  BookOpen, Copy, Cpu, FileDown, FileText, FolderCog, FolderOpen,
+  Github, Globe, HardDrive, Image, Info, Key, PanelLeft, RefreshCw,
+  Scale, Trash2,
+} from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
 import { SettingsEditionPanel, applyEditionDefaultBackground } from '@edition'
 import {
@@ -8,20 +12,37 @@ import {
 } from '../theme/layoutPreference'
 
 const COMMON_LEGAL_DOCUMENTS = [
+  { file: 'LICENSE.md', label: '软件许可证' },
   { file: 'PRIVACY.md', label: '隐私说明' },
   { file: 'THIRD-PARTY-MODS-DISCLAIMER.md', label: '第三方 Mod 与网站免责声明' },
   { file: 'THIRD_PARTY_NOTICES.md', label: '第三方软件声明' },
 ]
 const SUBSCRIPTION_LEGAL_DOCUMENTS = [
-  { file: 'SUBSCRIPTION-REFUND-SUPPORT.md', label: '订阅、退款与支持说明' },
-  { file: 'SUBSCRIPTION-SOFTWARE-LICENSE.md', label: '订阅版软件许可' },
-  { file: 'PROPRIETARY-ASSETS-LICENSE.md', label: '订阅素材许可' },
+  { file: 'SUBSCRIPTION-REFUND-SUPPORT.md', label: 'P 会员、退款与支持说明' },
+  { file: 'SUBSCRIPTION-SOFTWARE-LICENSE.md', label: 'P 版软件许可' },
+  { file: 'PROPRIETARY-ASSETS-LICENSE.md', label: 'P 专属素材许可' },
 ]
 const LEGAL_DOCUMENTS = __MODAGENT_SUBSCRIPTION__
   ? [...COMMON_LEGAL_DOCUMENTS, ...SUBSCRIPTION_LEGAL_DOCUMENTS]
   : COMMON_LEGAL_DOCUMENTS
+const LLM_PRESETS = [
+  ['deepseek', 'DeepSeek', 'https://api.deepseek.com/v1', 'deepseek-v4-pro'],
+  ['openai', 'OpenAI / GPT', 'https://api.openai.com/v1', 'gpt-4.1'],
+  ['custom', '自定义兼容接口', '', ''],
+]
+const MODEL_OPTIONS = [
+  ['deepseek-v4-pro', 'DeepSeek V4 Pro'],
+  ['deepseek-v4-flash', 'DeepSeek V4 Flash'],
+  ['gpt-4.1', 'OpenAI GPT（示例）'],
+  ['custom', '自定义模型名'],
+]
 
 export default function SettingsPage({ toast, api }) {
+  const identity = window.modagent?.getAppIdentity?.() || {
+    productName: __MODAGENT_SUBSCRIPTION__ ? 'ModAgent P' : 'ModAgent',
+    version: __MODAGENT_VERSION__,
+    channel: 'stable',
+  }
   const [cfg, setCfg] = useState({})
   const [nexusKey, setNexusKey] = useState('')
   const [llmKey, setLlmKey] = useState('')
@@ -30,6 +51,7 @@ export default function SettingsPage({ toast, api }) {
     nexus: false, tavily: false, llm: false,
   })
   const [model, setModel] = useState('deepseek-v4-pro')
+  const [customModel, setCustomModel] = useState('')
   const [endpoint, setEndpoint] = useState('https://api.deepseek.com/v1')
   const [recommendationLimit, setRecommendationLimit] = useState(10)
   const [layoutMode, setLayoutMode] = useState(readLayoutPreference)
@@ -39,7 +61,10 @@ export default function SettingsPage({ toast, api }) {
   useEffect(() => {
     fetch(api + '/status').then(r => r.json()).then(s => {
       setCfg(s)
-      setModel(s.llm_model || 'deepseek-v4-pro')
+      const loadedModel = s.llm_model || 'deepseek-v4-pro'
+      const knownModel = MODEL_OPTIONS.some(([value]) => value === loadedModel)
+      setModel(knownModel ? loadedModel : 'custom')
+      setCustomModel(knownModel ? '' : loadedModel)
       setEndpoint(s.llm_endpoint || 'https://api.deepseek.com/v1')
       setRecommendationLimit(Math.max(2, Math.min(Number(s.recommendation_limit) || 10, 20)))
       setBg(s.bg || null)
@@ -78,7 +103,20 @@ export default function SettingsPage({ toast, api }) {
     try {
       const result = await window.modagent?.checkForAppUpdate?.()
       if (!result) throw new Error('unavailable')
-      toast(result.ok ? `\u5df2\u68c0\u67e5\u66f4\u65b0\uff1a${result.version || '\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248'}` : `\u66f4\u65b0\u68c0\u67e5\u5931\u8d25\uff1a${result.error || '\u672a\u77e5\u9519\u8bef'}`, result.ok ? 'info' : 'error')
+      if (!result.ok) {
+        toast(`更新检查失败：${result.error || '未知错误'}`, 'error')
+        return
+      }
+      if (result.available) {
+        if (result.downloadPage) {
+          toast(`发现新版本 v${result.version}，正在打开下载页面`)
+          await openProjectLink(result.downloadPage)
+        } else {
+          toast(`发现新版本 v${result.version}，请前往原购买/会员页面下载安装`)
+        }
+        return
+      }
+      toast(`当前已是最新版本 v${result.version || identity.version}`)
     } catch (_) {
       toast('\u66f4\u65b0\u68c0\u67e5\u4ec5\u5728\u6b63\u5f0f\u5b89\u88c5\u7248\u4e2d\u53ef\u7528', 'error')
     }
@@ -87,6 +125,34 @@ export default function SettingsPage({ toast, api }) {
   const openDiagnostics = async () => {
     try { await window.modagent?.openDiagnosticsFolder?.() }
     catch (_) { toast('\u65e0\u6cd5\u6253\u5f00\u8fd0\u884c\u65e5\u5fd7', 'error') }
+  }
+
+  const openMaintenanceFolder = async (kind, label) => {
+    try {
+      const error = await window.modagent?.openMaintenanceFolder?.(kind)
+      if (error) throw new Error(error)
+    } catch (_) {
+      toast(`无法打开${label}`, 'error')
+    }
+  }
+
+  const copyMaintenancePath = async (kind, label) => {
+    try {
+      const result = await window.modagent?.copyMaintenancePath?.(kind)
+      if (!result?.ok) throw new Error(result?.error || 'copy failed')
+      toast(`${label}路径已复制`)
+    } catch (_) {
+      toast(`无法复制${label}路径`, 'error')
+    }
+  }
+
+  const openProjectLink = async url => {
+    try {
+      const result = await window.modagent?.openExternal?.(url)
+      if (!result?.ok) throw new Error(result?.error || 'blocked')
+    } catch (_) {
+      toast('无法打开链接', 'error')
+    }
   }
 
   const exportDiagnostics = async () => {
@@ -106,9 +172,18 @@ export default function SettingsPage({ toast, api }) {
   }
 
   const save = async () => {
+    const effectiveModel = model === 'custom' ? customModel.trim() : model
+    if (!effectiveModel) {
+      toast('请填写模型名', 'error')
+      return
+    }
+    if (!endpoint.trim()) {
+      toast('请填写 LLM 接口地址', 'error')
+      return
+    }
     const body = {
-      llm_model: model,
-      llm_endpoint: endpoint,
+      llm_model: effectiveModel,
+      llm_endpoint: endpoint.trim(),
       recommendation_limit: Math.max(2, Math.min(Number(recommendationLimit) || 10, 20)),
     }
     const secrets = {}
@@ -207,16 +282,50 @@ export default function SettingsPage({ toast, api }) {
         <div className="card-cyber space-y-3">
           <div className="flex items-center gap-2 mb-1">
             <Cpu size={14} className="text-cyber-cyan" />
-            <span className="text-sm font-medium">模型设置</span>
+            <span className="text-sm font-medium">LLM 设置</span>
+          </div>
+          <div>
+            <label className="text-xs text-surface-500 block mb-1">服务商快捷预设</label>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {LLM_PRESETS.map(([value, label, presetEndpoint, presetModel]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className="btn-ghost text-xs"
+                  onClick={() => {
+                    if (presetEndpoint) setEndpoint(presetEndpoint)
+                    if (presetModel) {
+                      setModel(presetModel)
+                      setCustomModel('')
+                    } else {
+                      setModel('custom')
+                    }
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
           <div>
             <label className="text-xs text-surface-500 block mb-1">模型</label>
             <select className="input-cyber" value={model} onChange={e => setModel(e.target.value)}>
-              <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
-              <option value="deepseek-chat">DeepSeek V3</option>
-              <option value="deepseek-reasoner">DeepSeek R1</option>
+              {MODEL_OPTIONS.map(([value, label]) => (
+                <option key={value} value={value}>{label}</option>
+              ))}
             </select>
           </div>
+          {model === 'custom' && (
+            <div>
+              <label className="text-xs text-surface-500 block mb-1">自定义模型名</label>
+              <input
+                className="input-cyber"
+                value={customModel}
+                onChange={e => setCustomModel(e.target.value)}
+                placeholder="填写服务商文档中的模型 ID"
+              />
+            </div>
+          )}
           <div>
             <label className="text-xs text-surface-500 block mb-1">接口地址</label>
             <div className="flex items-center gap-2">
@@ -324,8 +433,45 @@ export default function SettingsPage({ toast, api }) {
             <button onClick={openDiagnostics} className="btn-ghost flex items-center justify-center gap-1.5">
               <FolderOpen size={13} /> {`\u8fd0\u884c\u65e5\u5fd7`}
             </button>
+            <button onClick={() => copyMaintenancePath('logs', '日志')} className="btn-ghost flex items-center justify-center gap-1.5">
+              <Copy size={13} /> 复制日志路径
+            </button>
+            <button onClick={() => openMaintenanceFolder('data', '配置目录')} className="btn-ghost flex items-center justify-center gap-1.5">
+              <FolderCog size={13} /> 打开配置目录
+            </button>
+            <button onClick={() => openMaintenanceFolder('cache', '缓存目录')} className="btn-ghost flex items-center justify-center gap-1.5">
+              <HardDrive size={13} /> 打开缓存目录
+            </button>
             <button onClick={exportDiagnostics} className="btn-ghost flex items-center justify-center gap-1.5">
               <FileDown size={13} /> {`\u5bfc\u51fa\u8bca\u65ad`}
+            </button>
+          </div>
+        </div>
+
+        <div className="card-cyber space-y-3">
+          <div className="flex items-center gap-2">
+            <Info size={14} className="text-cyber-cyan" />
+            <span className="text-sm font-medium">关于 {identity.productName}</span>
+          </div>
+          <div className="rounded-lg border border-surface-600/70 bg-surface-900/45 p-4">
+            <p className="text-base font-semibold text-white">{identity.productName}</p>
+            <p className="mt-1 text-xs text-surface-400">AI 驱动的开放式 Mod 管理助手</p>
+            <p className="mt-3 text-[11px] text-surface-500">
+              当前版本：v{identity.version || __MODAGENT_VERSION__} · {identity.channel === 'beta' ? 'Beta' : 'Stable'}
+            </p>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <button type="button" className="btn-ghost flex items-center justify-center gap-1.5"
+              onClick={() => openProjectLink('https://github.com/millips/ModAgent')}>
+              <Github size={13} /> GitHub
+            </button>
+            <button type="button" className="btn-ghost flex items-center justify-center gap-1.5"
+              onClick={() => openProjectLink(`https://github.com/millips/ModAgent/releases/tag/v${identity.version || __MODAGENT_VERSION__}`)}>
+              <BookOpen size={13} /> 更新日志
+            </button>
+            <button type="button" className="btn-ghost flex items-center justify-center gap-1.5"
+              onClick={() => openLegalDocument('LICENSE.md')}>
+              <Scale size={13} /> License
             </button>
           </div>
         </div>
@@ -336,7 +482,7 @@ export default function SettingsPage({ toast, api }) {
             <span className="text-sm font-medium">关于与法律</span>
           </div>
           <p className="text-xs text-surface-500">
-            查看隐私、第三方内容、订阅规则、软件许可和依赖声明。购买或发布前请确认带“发行前填写”的运营信息已经补齐。
+            查看隐私、第三方内容、P 会员规则、软件许可和依赖声明。购买或发布前请确认带“发行前填写”的运营信息已经补齐。
           </p>
           <div className="grid grid-cols-1 gap-2">
             {LEGAL_DOCUMENTS.map(item => (
@@ -352,7 +498,7 @@ export default function SettingsPage({ toast, api }) {
             ))}
           </div>
           <div className="text-[11px] text-surface-500 border-t border-surface-600/60 pt-2">
-            {__MODAGENT_SUBSCRIPTION__ ? 'ModAgent Pro' : 'ModAgent'} v{__MODAGENT_VERSION__} · 发布者：ModAgent Project
+            {__MODAGENT_SUBSCRIPTION__ ? 'ModAgent P' : 'ModAgent'} v{__MODAGENT_VERSION__} · 发布者：ModAgent Project
           </div>
         </div>
 

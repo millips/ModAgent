@@ -72,6 +72,8 @@ assert(fs.existsSync(dryRunLog), 'Cleanup dry-run did not create its plan')
 const plan = fs.readFileSync(dryRunLog, 'utf8')
 assert(plan.includes('.modagent-beta'), 'Beta data was not included in the default plan')
 assert(!plan.includes(`${path.sep}.modagent\r\n`), 'Stable .modagent must be opt-in')
+assert(plan.includes('Programs\\ModAgent P'), 'Standard P install path missing')
+assert(plan.includes('Programs\\ModAgent P Beta'), 'Standard P Beta install path missing')
 assert(plan.includes('Programs\\ModAgent Pro Beta'), 'Standard Beta install path missing')
 
 const stableDryRun = spawnSync(output, ['/S', '/DRYRUN=1', '/PURGE_STABLE=1'], {

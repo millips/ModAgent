@@ -9,6 +9,10 @@ export function SidebarEditionAddon() {
   return null
 }
 
+export function SidebarNavArtwork() {
+  return null
+}
+
 export function SettingsEditionPanel() {
   return null
 }

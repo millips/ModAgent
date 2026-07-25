@@ -2,7 +2,16 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('modagent', {
   getApiBase: () => ipcRenderer.sendSync('get-api-base-sync'),
+  getAppIdentity: () => ipcRenderer.sendSync('get-app-identity-sync'),
   getApiToken: () => process.env.MODAGENT_API_TOKEN || '',
+  getPLicenseStatusSync: () => ipcRenderer.sendSync('get-p-license-status-sync'),
+  getPLicenseStatus: () => ipcRenderer.invoke('get-p-license-status'),
+  activatePLicense: code => ipcRenderer.invoke('activate-p-license', code),
+  onPLicenseStatus: callback => {
+    const listener = (_, detail) => callback(detail);
+    ipcRenderer.on('p-license-status', listener);
+    return () => ipcRenderer.removeListener('p-license-status', listener);
+  },
   getBgDataUrl: filename => ipcRenderer.invoke('get-bg-data-url', filename),
   openExternal: url => ipcRenderer.invoke('open-external', url),
   selectGameDirectory: () => ipcRenderer.invoke('select-game-directory'),
@@ -12,6 +21,8 @@ contextBridge.exposeInMainWorld('modagent', {
   removeBg: () => ipcRenderer.invoke('remove-bg'),
   saveSecrets: secrets => ipcRenderer.invoke('save-secrets', secrets),
   openDiagnosticsFolder: () => ipcRenderer.invoke('open-diagnostics-folder'),
+  openMaintenanceFolder: kind => ipcRenderer.invoke('open-maintenance-folder', kind),
+  copyMaintenancePath: kind => ipcRenderer.invoke('copy-maintenance-path', kind),
   openLegalDocument: filename => ipcRenderer.invoke('open-legal-document', filename),
   exportRuntimeDiagnostics: () => ipcRenderer.invoke('export-runtime-diagnostics'),
   checkForAppUpdate: () => ipcRenderer.invoke('check-for-app-update'),

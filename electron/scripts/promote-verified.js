@@ -10,7 +10,7 @@ const verifiedRoot = path.join(electronRoot, 'release', 'verified', packageInfo.
 const manifestPath = path.join(verifiedRoot, 'release-manifest.json')
 const desktop = path.join(os.homedir(), 'Desktop')
 const freeName = 'ModAgent \u666e\u901a\u7248'
-const proName = 'ModAgent \u8ba2\u9605\u7248'
+const proName = 'ModAgent P \u4f1a\u5458\u7248'
 const freeTarget = process.env.MODAGENT_FREE_TARGET || path.join(desktop, freeName)
 const proTarget = process.env.MODAGENT_PRO_TARGET || path.join(desktop, proName)
 
@@ -92,10 +92,10 @@ copyVerified(
   subscription.installerSha256
 )
 
-const portableSource = path.join(verifiedRoot, 'ModAgentPro')
-const portableTarget = path.join(proDir, 'ModAgentPro')
+const portableSource = path.join(verifiedRoot, 'ModAgentP')
+const portableTarget = path.join(proDir, 'ModAgentP')
 replaceTree(portableSource, portableTarget)
-const promotedExecutable = path.join(portableTarget, 'ModAgentPro.exe')
+const promotedExecutable = path.join(portableTarget, 'ModAgentP.exe')
 if (sha256(promotedExecutable) !== subscription.executableSha256) {
   throw new Error('Portable subscription executable hash mismatch after promotion.')
 }

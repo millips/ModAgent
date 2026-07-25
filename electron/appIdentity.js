@@ -10,16 +10,18 @@ const IDENTITIES = {
     iconName: 'modagent-free.ico',
     artifactPrefix: 'ModAgent',
     updateChannel: 'free',
+    manualUpdateManifestUrl: 'https://github.com/millips/ModAgent/releases/latest/download/free-update.json',
   },
   subscription: {
     edition: 'subscription',
-    productName: 'ModAgent Pro',
-    executableName: 'ModAgentPro',
+    productName: 'ModAgent P',
+    executableName: 'ModAgentP',
     appId: 'com.modagent.desktop.pro',
-    userDataFolder: 'ModAgent Pro',
-    iconName: 'modagent-subscription.ico',
-    artifactPrefix: 'ModAgent-Pro',
+    userDataFolder: 'ModAgent P',
+    iconName: 'modagent-p.ico',
+    artifactPrefix: 'ModAgent-P',
     updateChannel: 'subscription',
+    manualUpdateManifestUrl: 'https://github.com/millips/ModAgent/releases/latest/download/p-update.json',
   },
 };
 

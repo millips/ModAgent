@@ -16,14 +16,17 @@ const freeCssSanitizer = () => ({
     const root = postcss.parse(code)
     root.walkRules(rule => {
       const selector = rule.selector || ''
-      const paidSelector = /theme-technology-core|feedback-core|nav-energy-scan|app-page-atmosphere/.test(selector)
+      const paidSelector = /theme-technology-core|theme-classic-controls|theme-minimal-tech|feedback-core|nav-energy-scan|nav-kawaii|app-page-atmosphere|body\[data-ma-theme|body\[data-ma-lighting/.test(selector)
       const paidAsset = rule.nodes?.some(node =>
-        node.type === 'decl' && /assets\/themes\/technology-core/.test(node.value || '')
+        node.type === 'decl' && /assets\/themes\//.test(node.value || '')
       )
       if (paidSelector || paidAsset) rule.remove()
     })
     root.walkAtRules(atRule => {
-      if (/keyframes$/i.test(atRule.name) && /^tc-/.test(atRule.params || '')) atRule.remove()
+      if (
+        /keyframes$/i.test(atRule.name) &&
+        /^(?:tc-|kawaii-|cat-|gothic-|tactical-|abyssal-)/.test(atRule.params || '')
+      ) atRule.remove()
     })
     return { code: root.toString(), map: null }
   },

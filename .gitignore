@@ -15,3 +15,4 @@ backups/
 _stage_backup/
 electron/release/
 electron/tmp-asar-*/
+electron/.smoke-*/

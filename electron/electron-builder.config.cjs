@@ -66,12 +66,22 @@ module.exports = {
   },
   files: [
     'dist/**/*',
-    'assets/icons/**/*',
+    ...(buildEdition === 'subscription'
+      ? [
+          'assets/icons/modagent-p.ico',
+          'assets/icons/modagent-p.png',
+          'assets/license/p-public-key.pem',
+        ]
+      : [
+          'assets/icons/modagent-free.ico',
+          'assets/icons/modagent-free.png',
+        ]),
     'main.js',
     'browserLauncher.js',
     'preload.js',
     'appIdentity.js',
     'securityStore.js',
+    'licenseStore.js',
     'runtimeDiagnostics.js',
     'updater.js',
     'package.json',

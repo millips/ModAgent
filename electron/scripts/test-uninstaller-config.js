@@ -43,10 +43,12 @@ assert(
 
 const beta = fs.readFileSync(path.join(electronRoot, 'build/installer-beta.nsh'), 'utf8')
 assert(beta.includes('$PROFILE\\.modagent-beta'))
-assert(beta.includes('$LOCALAPPDATA\\ModAgent Pro Beta'))
+assert(beta.includes('$LOCALAPPDATA\\ModAgent P Beta'))
 
 const stable = fs.readFileSync(path.join(electronRoot, 'build/installer.nsh'), 'utf8')
 assert(stable.includes('$PROFILE\\.modagent'))
 assert(stable.includes('IDYES uninstall_keep_all'))
+assert(stable.includes('$LOCALAPPDATA\\ModAgent P'))
+assert(stable.includes('$LOCALAPPDATA\\ModAgent Pro'))
 
 console.log('UNINSTALLER CONFIGURATION TESTS PASSED')

@@ -10,6 +10,8 @@
       RMDir /r "$PROFILE\.modagent-beta"
       RMDir /r "$APPDATA\ModAgent Beta"
       RMDir /r "$LOCALAPPDATA\ModAgent Beta"
+      RMDir /r "$APPDATA\ModAgent P Beta"
+      RMDir /r "$LOCALAPPDATA\ModAgent P Beta"
       RMDir /r "$APPDATA\ModAgent Pro Beta"
       RMDir /r "$LOCALAPPDATA\ModAgent Pro Beta"
       Goto beta_cleanup_done

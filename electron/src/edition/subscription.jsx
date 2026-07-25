@@ -1,6 +1,14 @@
 import React, { useState } from 'react'
-import { Bell, Check, ListChecks, Palette, Pencil, RotateCcw, ShieldAlert, Volume2 } from 'lucide-react'
+import {
+  Bell, Check, Clock3, Copy, KeyRound, ListChecks, LockKeyhole,
+  Palette, Pencil, RotateCcw, ShieldAlert, Sparkles, Volume2,
+} from 'lucide-react'
 import FeedbackCore from '../components/FeedbackCore'
+import defaultWallpaper from '../assets/default-wallpaper.png'
+import kawaiiChatIcon from '../assets/themes/kawaii/icons/nav-chat.png'
+import kawaiiModsIcon from '../assets/themes/kawaii/icons/nav-mods.png'
+import kawaiiSnapsIcon from '../assets/themes/kawaii/icons/nav-snaps.png'
+import kawaiiSettingsIcon from '../assets/themes/kawaii/icons/nav-settings.png'
 import { emitFeedback } from '../feedback/feedbackBus'
 import {
   getFeedbackSoundVolume,
@@ -12,9 +20,17 @@ import {
   VISUAL_THEMES,
   LIGHTING_MODES,
   applyVisualPreferences,
+  clearVisualPreferences,
   readVisualPreferences,
   saveVisualPreference,
 } from '../theme/visualTheme'
+import {
+  P_LICENSE_EVENT,
+  isPAccessEnabled,
+  publishPLicenseStatus,
+  readPLicenseStatus,
+  usePLicenseStatus,
+} from '../license/pLicense'
 
 export { RecommendationDecisionTable as ChatEditionMessage } from '../components/RecommendationDecisionTable'
 
@@ -46,12 +62,51 @@ const FEEDBACK_TESTS = [
 ].map(([type, code, label, count]) => ({ type, code, label, count }))
 
 export function bootstrapEdition() {
-  applyVisualPreferences(readVisualPreferences())
+  const applyAccess = status => {
+    const enabled = isPAccessEnabled(status)
+    document.body.dataset.maPAccess = enabled ? 'active' : 'locked'
+    if (enabled) {
+      applyVisualPreferences(readVisualPreferences())
+      if (document.body.classList.contains('default-bg')) {
+        document.body.classList.remove('has-bg', 'default-bg')
+        document.body.style.backgroundImage = ''
+      }
+    } else {
+      clearVisualPreferences()
+      if (!document.body.classList.contains('has-bg')) {
+        document.body.classList.add('has-bg', 'default-bg')
+        document.body.style.backgroundImage = `url("${defaultWallpaper}")`
+      }
+    }
+  }
+  applyAccess(readPLicenseStatus())
+  window.addEventListener(P_LICENSE_EVENT, event => applyAccess(event.detail))
   installFeedbackInteractions()
 }
 
 export function SidebarEditionAddon({ page }) {
-  return <FeedbackCore page={page} />
+  const status = usePLicenseStatus()
+  if (status.entitled) return <FeedbackCore page={page} />
+  return (
+    <div className="mx-3 mb-3 rounded-lg border border-cyber-yellow/25 bg-surface-900/70 p-3 text-center">
+      <LockKeyhole size={18} className="mx-auto text-cyber-yellow" />
+      <p className="mt-1 text-[10px] font-semibold text-white">ModAgent P 已锁定</p>
+      <p className="mt-1 text-[9px] leading-relaxed text-surface-500">基础 Mod 管理功能仍可正常使用</p>
+    </div>
+  )
+}
+
+const NAV_ART = {
+  chat: kawaiiChatIcon,
+  mods: kawaiiModsIcon,
+  snaps: kawaiiSnapsIcon,
+  settings: kawaiiSettingsIcon,
+}
+
+export function SidebarNavArtwork({ id }) {
+  const status = usePLicenseStatus()
+  if (!status.entitled || !NAV_ART[id]) return null
+  return <img src={NAV_ART[id]} className="nav-kawaii-icon" alt="" draggable="false" />
 }
 
 const conflictTone = {
@@ -104,7 +159,7 @@ function LegacyChatEditionMessage({
                 ? '安装流程已提交'
                 : isConfirmation
                   ? '安装确认 · 最终选择'
-                  : 'Pro 智能推荐 · 决策清单'}
+                  : '智能推荐 · 决策清单'}
           </div>
           <p className="mt-1.5 max-w-3xl text-[11px] leading-relaxed text-surface-500">
             {isConfirmation
@@ -266,11 +321,19 @@ function LegacyChatEditionMessage({
 }
 
 export function applyEditionDefaultBackground() {
-  document.body.classList.remove('has-bg', 'default-bg')
-  document.body.style.backgroundImage = ''
+  if (isPAccessEnabled()) {
+    document.body.classList.remove('has-bg', 'default-bg')
+    document.body.style.backgroundImage = ''
+  } else {
+    document.body.classList.add('has-bg', 'default-bg')
+    document.body.style.backgroundImage = `url("${defaultWallpaper}")`
+  }
 }
 
 export function SettingsEditionPanel({ toast }) {
+  const license = usePLicenseStatus()
+  const [licenseCode, setLicenseCode] = useState('')
+  const [activating, setActivating] = useState(false)
   const initial = readVisualPreferences()
   const [visual, setVisual] = useState(initial.visual)
   const [lighting, setLighting] = useState(initial.lighting)
@@ -291,14 +354,104 @@ export function SettingsEditionPanel({ toast }) {
     toast(label)
   }
 
+  const activate = async () => {
+    if (!licenseCode.trim() || activating) return
+    setActivating(true)
+    try {
+      const result = await window.modagent?.activatePLicense?.(licenseCode.trim())
+      if (!result?.ok) throw new Error(result?.error || '兑换码验证失败')
+      setLicenseCode('')
+      publishPLicenseStatus(result.status)
+      toast('ModAgent P 已激活')
+    } catch (error) {
+      toast(error.message || '兑换码验证失败', 'error')
+    } finally {
+      setActivating(false)
+    }
+  }
+
+  const stateLabel = {
+    trial: `三天试用中 · 剩余 ${license.days_remaining || 0} 天`,
+    active: `P 会员有效 · 剩余 ${license.days_remaining || 0} 天`,
+    expired: 'P 会员已到期',
+    trial_expired: '三天试用已结束',
+    clock_error: '系统时间异常',
+    invalid: '许可证无效',
+    unavailable: '许可证存储不可用',
+  }[license.state] || '正在读取会员状态'
+
   return (
     <>
+      <div className="card-cyber space-y-3 border-cyber-yellow/25">
+        <div className="flex items-center gap-2">
+          <Sparkles size={14} className="text-cyber-yellow" />
+          <span className="text-sm font-medium">ModAgent P · 会员验证</span>
+          <span className={`ml-auto rounded-full border px-2 py-0.5 text-[10px] ${
+            license.entitled
+              ? 'border-cyber-green/30 bg-cyber-green/10 text-cyber-green'
+              : 'border-cyber-yellow/30 bg-cyber-yellow/10 text-cyber-yellow'
+          }`}>{stateLabel}</span>
+        </div>
+        <p className="text-xs leading-relaxed text-surface-500">
+          P 包首次启动提供三天试用；首发兑换码激活后有效 60 天。到期只关闭 P 专属主题、音效与视觉反馈，不影响 Mod 管理和用户数据。
+        </p>
+        {license.expires_at && (
+          <div className="flex items-center gap-2 text-[11px] text-surface-400">
+            <Clock3 size={12} />
+            到期时间：{new Date(license.expires_at).toLocaleString()}
+          </div>
+        )}
+        {license.license_id && (
+          <button
+            type="button"
+            className="btn-ghost flex items-center gap-1.5 text-[11px]"
+            onClick={() => {
+              navigator.clipboard?.writeText(license.license_id)
+              toast('License ID 已复制')
+            }}
+          >
+            <Copy size={11} /> License ID：{license.license_id}
+          </button>
+        )}
+        {license.message && <p className="text-[11px] text-cyber-yellow">{license.message}</p>}
+        <div className="flex gap-2">
+          <input
+            type="password"
+            className="input-cyber flex-1"
+            value={licenseCode}
+            onChange={event => setLicenseCode(event.target.value)}
+            placeholder="请输入爱发电发放的 P 兑换码"
+          />
+          <button
+            type="button"
+            disabled={!licenseCode.trim() || activating}
+            className="btn-cyber flex items-center gap-1.5 disabled:opacity-50"
+            onClick={activate}
+          >
+            <KeyRound size={13} /> {activating ? '验证中' : '验证'}
+          </button>
+        </div>
+      </div>
+
+      {!license.entitled && (
+        <div className="card-cyber space-y-2 border-cyber-yellow/20 bg-cyber-yellow/[0.035]">
+          <div className="flex items-center gap-2 text-sm font-medium text-white">
+            <LockKeyhole size={14} className="text-cyber-yellow" /> P 专属外观已锁定
+          </div>
+          <p className="text-xs leading-relaxed text-surface-500">
+            输入有效兑换码即可恢复 P 主题、专属音效、视觉动效与反馈核心。搜索、核验、安装、更新、卸载和快照等基础功能不会被锁定。
+          </p>
+        </div>
+      )}
+
+      {license.entitled && (
+      <>
       <div className="theme-appearance-card card-cyber space-y-3">
         <div className="flex items-center gap-2 mb-1">
           <Palette size={14} className="text-cyber-cyan" />
           <span className="text-sm font-medium">界面主题</span>
         </div>
-        <p className="text-xs text-surface-500">订阅版主题与氛围打光；按钮外观会随主题自动匹配。</p>
+        <p className="text-xs text-surface-500">P 专属主题与氛围打光；按钮外观会随主题自动匹配。</p>
         <label className="text-xs text-surface-500 block">主体配色</label>
         <select className="input-cyber" value={visual} onChange={event => {
           const value = event.target.value
@@ -436,6 +589,8 @@ export function SettingsEditionPanel({ toast }) {
           ))}
         </div>
       </div>
+      </>
+      )}
     </>
   )
 }

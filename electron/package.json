@@ -1,6 +1,6 @@
 {
   "name": "modagent",
-  "productName": "ModAgent Pro",
+  "productName": "ModAgent P",
   "description": "AI-assisted game mod manager",
   "modagentEdition": "subscription",
   "version": "1.3.0",
@@ -15,6 +15,7 @@
     "test:identity": "node scripts/test-app-identity.js",
     "test:updater": "node scripts/test-updater-config.js",
     "test:uninstaller": "node scripts/test-uninstaller-config.js",
+    "test:license": "node scripts/test-p-license.js",
     "test:packaged-smoke": "node scripts/test-packaged-smoke.js",
     "build": "npm run verify:audio && npm run verify:text && node scripts/clean-dist.js && vite build",
     "start": "electron .",

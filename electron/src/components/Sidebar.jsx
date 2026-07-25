@@ -1,16 +1,12 @@
 import React from 'react'
 import { MessageSquare, Package, Camera, Settings, Wifi, WifiOff, RefreshCw } from 'lucide-react'
-import { SidebarEditionAddon } from '@edition'
-import kawaiiChatIcon from '../assets/themes/kawaii/icons/nav-chat.png'
-import kawaiiModsIcon from '../assets/themes/kawaii/icons/nav-mods.png'
-import kawaiiSnapsIcon from '../assets/themes/kawaii/icons/nav-snaps.png'
-import kawaiiSettingsIcon from '../assets/themes/kawaii/icons/nav-settings.png'
+import { SidebarEditionAddon, SidebarNavArtwork } from '@edition'
 
 const NAV = [
-  { id: 'chat', label: '对话', icon: MessageSquare, kawaiiIcon: kawaiiChatIcon },
-  { id: 'mods', label: 'Mod 管理', icon: Package, kawaiiIcon: kawaiiModsIcon },
-  { id: 'snaps', label: '快照', icon: Camera, kawaiiIcon: kawaiiSnapsIcon },
-  { id: 'settings', label: '设置', icon: Settings, kawaiiIcon: kawaiiSettingsIcon },
+  { id: 'chat', label: '对话', icon: MessageSquare },
+  { id: 'mods', label: 'Mod 管理', icon: Package },
+  { id: 'snaps', label: '快照', icon: Camera },
+  { id: 'settings', label: '设置', icon: Settings },
 ]
 
 export default function Sidebar({ page, onNav, status }) {
@@ -20,7 +16,7 @@ export default function Sidebar({ page, onNav, status }) {
       <div className="app-brand p-4 border-b border-surface-600">
         <h1 className="text-lg font-bold text-cyber-cyan tracking-wide flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-cyber-cyan shadow-[0_0_8px_#00d4ff]"></span>
-          <span className="app-brand-name">ModAgent</span>
+          <span className="app-brand-name">{__MODAGENT_SUBSCRIPTION__ ? 'ModAgent P' : 'ModAgent'}</span>
         </h1>
         <p className="app-brand-version text-[11px] text-surface-500 mt-1">AI Mod Manager v{__MODAGENT_VERSION__}</p>
       </div>
@@ -37,7 +33,7 @@ export default function Sidebar({ page, onNav, status }) {
           >
             <span className="nav-energy-scan" aria-hidden="true" />
             <n.icon size={16} className="nav-default-icon" />
-            <img src={n.kawaiiIcon} className="nav-kawaii-icon" alt="" draggable="false" />
+            <SidebarNavArtwork id={n.id} />
             <span className="nav-item-label">{n.label}</span>
           </button>
         ))}

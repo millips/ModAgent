@@ -10,9 +10,8 @@ _CFG: Config = None
 _AGENT: Agent = None
 
 MODELS = [
-    ("deepseek-chat", "DeepSeek V3 (快速)"),
+    ("deepseek-v4-flash", "DeepSeek V4 Flash (快速)"),
     ("deepseek-v4-pro", "DeepSeek V4 Pro (推荐)"),
-    ("deepseek-reasoner", "DeepSeek R1 (推理)"),
 ]
 
 GAMES = {

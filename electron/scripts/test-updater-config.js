@@ -27,5 +27,8 @@ assert.strictEqual(
 )
 assert.strictEqual(helpers.hasUpdateConfiguration(resources, () => true), true)
 assert.strictEqual(helpers.hasUpdateConfiguration(resources, () => false), false)
+assert(helpers.compareVersions('1.3.1', '1.3.0') > 0)
+assert(helpers.compareVersions('1.3.0', '1.3.0') === 0)
+assert(helpers.compareVersions('1.2.9', '1.3.0') < 0)
 
 console.log('UPDATER CONFIGURATION TESTS PASSED')

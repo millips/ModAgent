@@ -9,6 +9,7 @@ let lastHoverAt = 0
 const CONTROL_SELECTOR = 'button, [role="button"], select, input[type="checkbox"], input[type="radio"]'
 
 function controlFrom(target) {
+  if (document.body?.dataset?.maPAccess !== 'active') return null
   const control = target instanceof Element ? target.closest(CONTROL_SELECTOR) : null
   if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') return null
   return control
@@ -44,6 +45,7 @@ export function installFeedbackInteractions() {
   installed = true
 
   window.addEventListener(FEEDBACK_EVENT, event => {
+    if (document.body?.dataset?.maPAccess !== 'active') return
     const type = event.detail?.type
     if (!type) return
     if (type === 'startup') retryStartup()

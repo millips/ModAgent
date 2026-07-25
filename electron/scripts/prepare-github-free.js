@@ -102,8 +102,8 @@ function inspectFreeBuild() {
     }
   }
   const mp3 = entries.filter(entry => entry.toLowerCase().endsWith('.mp3'))
-  const paidRaster = entries.filter(entry =>
-    /core-shell|frame-base|emission-mask/i.test(entry)
+  const paidAssets = entries.filter(entry =>
+    /(?:^|[\\/])assets[\\/](?:themes|audio|license)(?:[\\/]|$)|modagent-p\.(?:ico|png)$/i.test(entry)
   )
   const marker = JSON.parse(
     asar.extractFile(archive, 'dist\\edition.json').toString('utf8')
@@ -117,9 +117,12 @@ function inspectFreeBuild() {
   if (packedPackage.productName !== 'ModAgent') {
     throw new Error(`Unexpected free product name: ${packedPackage.productName}`)
   }
-  if (mp3.length || paidRaster.length) {
+  if (!entries.some(entry => /assets[\\/]icons[\\/]modagent-free\.ico$/i.test(entry))) {
+    throw new Error('Free build is missing its program icon')
+  }
+  if (mp3.length || paidAssets.length) {
     throw new Error(
-      `Free build contains subscription assets: mp3=${mp3.length}, raster=${paidRaster.length}`
+      `Free build contains P assets: mp3=${mp3.length}, assets=${paidAssets.length}`
     )
   }
 
@@ -156,7 +159,7 @@ function inspectFreeBuild() {
       version: packedPackage.version,
     },
     mp3Count: mp3.length,
-    paidRasterCount: paidRaster.length,
+    paidAssetCount: paidAssets.length,
     legalFiles,
   }
 }
@@ -218,6 +221,10 @@ copyIfExists(
   path.join(repoRoot, 'README.md'),
   path.join(candidateRoot, 'README.md')
 )
+copyIfExists(
+  path.join(repoRoot, 'updates', 'free-update.json'),
+  path.join(candidateRoot, 'free-update.json')
+)
 
 const artifacts = [
   {
@@ -250,7 +257,7 @@ const manifest = {
   isolationChecks: {
     editionMarker: report.marker,
     subscriptionAudioCount: report.mp3Count,
-    subscriptionRasterCount: report.paidRasterCount,
+    pAssetCount: report.paidAssetCount,
     legalFiles: report.legalFiles,
   },
   componentHashes: {
@@ -277,7 +284,7 @@ fs.writeFileSync(
     dirty
       ? '注意：该包来自尚未提交的当前工作树，可用于测试和内容确认；正式发布前应提交源码并重新构建。'
       : '当前源码树干净，候选包可进入最终烟雾测试与 GitHub Release 上传流程。',
-    '普通版隔离检查：通过（无订阅音效、无订阅位图、无订阅许可文件）。',
+    '普通版隔离检查：通过（无 P 音效、主题素材、许可证公钥或 P 图标）。',
   ].join('\r\n') + '\r\n',
   'utf8'
 )

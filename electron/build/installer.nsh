@@ -1,5 +1,5 @@
 !macro customUnInstall
-  ; Stop only the backend located inside this installation. Free and Pro
+  ; Stop only the backend located inside this installation. Free and P
   ; editions may run side by side and must not terminate each other's backend.
   nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\uninstall-stop-backend.ps1" -InstallDir "$INSTDIR"'
 
@@ -15,6 +15,8 @@
       RMDir /r "$LOCALAPPDATA\ModAgent"
       RMDir /r "$APPDATA\ModAgent Pro"
       RMDir /r "$LOCALAPPDATA\ModAgent Pro"
+      RMDir /r "$APPDATA\ModAgent P"
+      RMDir /r "$LOCALAPPDATA\ModAgent P"
       Goto uninstall_cleanup_done
 
     uninstall_remove_appdata:
@@ -22,6 +24,8 @@
       RMDir /r "$LOCALAPPDATA\ModAgent"
       RMDir /r "$APPDATA\ModAgent Pro"
       RMDir /r "$LOCALAPPDATA\ModAgent Pro"
+      RMDir /r "$APPDATA\ModAgent P"
+      RMDir /r "$LOCALAPPDATA\ModAgent P"
       Goto uninstall_cleanup_done
 
     uninstall_keep_all:

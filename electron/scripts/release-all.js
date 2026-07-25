@@ -88,7 +88,7 @@ function copyTree(source, target) {
 function inspectAsar(edition) {
   const identity = edition === 'free'
     ? { folder: 'free', executable: 'ModAgent.exe', installer: `ModAgent-Setup-${packageInfo.version}.exe` }
-    : { folder: 'subscription', executable: 'ModAgentPro.exe', installer: `ModAgent-Pro-Setup-${packageInfo.version}.exe` }
+    : { folder: 'subscription', executable: 'ModAgentP.exe', installer: `ModAgent-P-Setup-${packageInfo.version}.exe` }
   const appDir = path.join(releaseRoot, identity.folder, 'win-unpacked')
   const archive = path.join(appDir, 'resources', 'app.asar')
   const backend = path.join(appDir, 'resources', 'backend', 'ModAgentBackend.exe')
@@ -107,8 +107,8 @@ function inspectAsar(edition) {
     }
   }
   const mp3 = entries.filter(entry => entry.toLowerCase().endsWith('.mp3'))
-  const paidRaster = entries.filter(entry =>
-    /core-shell|frame-base|emission-mask/i.test(entry)
+  const paidAssets = entries.filter(entry =>
+    /(?:^|[\\/])assets[\\/](?:themes|audio|license)(?:[\\/]|$)|modagent-p\.(?:ico|png)$/i.test(entry)
   )
   const marker = JSON.parse(
     asar.extractFile(archive, 'dist\\edition.json').toString('utf8')
@@ -121,13 +121,28 @@ function inspectAsar(edition) {
       || packedPackage.modagentChannel !== 'stable') {
     throw new Error(`${edition} identity mismatch in packaged application`)
   }
-  if (edition === 'free' && (mp3.length || paidRaster.length)) {
-    throw new Error(`Free build contains subscription assets: mp3=${mp3.length}, raster=${paidRaster.length}`)
+  const expectedProductName = edition === 'free' ? 'ModAgent' : 'ModAgent P'
+  if (packedPackage.productName !== expectedProductName) {
+    throw new Error(`${edition} product name mismatch: ${packedPackage.productName}`)
+  }
+  if (edition === 'free' && (mp3.length || paidAssets.length)) {
+    throw new Error(`Free build contains P assets: mp3=${mp3.length}, assets=${paidAssets.length}`)
   }
   if (edition === 'subscription' && mp3.length !== expectedAudioCount) {
     throw new Error(
       `Subscription build must contain exactly ${expectedAudioCount} verified sounds; found ${mp3.length}`
     )
+  }
+  const expectedIcon = edition === 'free' ? 'modagent-free.ico' : 'modagent-p.ico'
+  if (!entries.some(entry => new RegExp(`assets[\\\\/]icons[\\\\/]${expectedIcon.replace('.', '\\.')}$`, 'i').test(entry))) {
+    throw new Error(`${edition} build is missing ${expectedIcon}`)
+  }
+  const hasPublicKey = entries.some(entry => /assets[\\/]license[\\/]p-public-key\.pem$/i.test(entry))
+  if (edition === 'free' && hasPublicKey) {
+    throw new Error('Free build contains the P license public key')
+  }
+  if (edition === 'subscription' && !hasPublicKey) {
+    throw new Error('P build is missing the license public key')
   }
   const legalFiles = fs.readdirSync(legalDir).sort()
   const subscriptionLegal = legalFiles.filter(file =>
@@ -144,7 +159,7 @@ function inspectAsar(edition) {
     edition,
     marker,
     mp3Count: mp3.length,
-    paidRasterCount: paidRaster.length,
+    paidAssetCount: paidAssets.length,
     legalFiles,
     installer,
     executable,
@@ -173,7 +188,9 @@ if (dirty && process.env.MODAGENT_ALLOW_DIRTY !== '1') {
 const reports = []
 if (process.env.MODAGENT_SKIP_BUILD !== '1') {
   cleanDirectory(verifiedRoot)
-  run('npm.cmd', ['run', 'build:backend'])
+  if (process.env.MODAGENT_SKIP_BACKEND_BUILD !== '1') {
+    run('npm.cmd', ['run', 'build:backend'])
+  }
   for (const edition of ['free', 'subscription']) {
     cleanDirectory(path.join(releaseRoot, edition))
     run('npm.cmd', ['run', 'build'], {
@@ -204,8 +221,14 @@ for (const report of reports) {
   fs.copyFileSync(report.installer, target)
   report.verifiedInstaller = target
 }
+for (const manifestName of ['free-update.json', 'p-update.json']) {
+  fs.copyFileSync(
+    path.join(repoRoot, 'updates', manifestName),
+    path.join(verifiedRoot, manifestName),
+  )
+}
 const proReport = reports.find(item => item.edition === 'subscription')
-const proPortable = path.join(verifiedRoot, 'ModAgentPro')
+const proPortable = path.join(verifiedRoot, 'ModAgentP')
 copyTree(path.dirname(proReport.executable), proPortable)
 
 const manifest = {
@@ -219,7 +242,7 @@ const manifest = {
     edition: report.edition,
     marker: report.marker,
     mp3Count: report.mp3Count,
-    paidRasterCount: report.paidRasterCount,
+    paidAssetCount: report.paidAssetCount,
     legalFiles: report.legalFiles,
     installer: path.basename(report.verifiedInstaller),
     installerSha256: report.installerSha256,

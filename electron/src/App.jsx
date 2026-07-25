@@ -51,7 +51,7 @@ export default function App() {
             bg: s.bg || null,
           }))
           if (s.bg) document.body.classList.add('has-bg')
-          setConfigured(s.api_key_set && s.tavily_set && s.llm_set)
+          setConfigured(Boolean(s.llm_set))
           if (!window.__gamesDetected) {
             window.__gamesDetected = true
             refreshGames().catch(() => { window.__gamesDetected = false })
