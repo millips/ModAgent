@@ -8,6 +8,7 @@ from .tools import build_tools_definitions, execute, refresh_local_inventory
 from . import db
 from .recommendation_ui import (
     apply_chinese_descriptions,
+    needs_chinese_name,
     needs_chinese_localization,
     recommendation_analysis_text,
     recommendations_from_tool_evidence,
@@ -120,7 +121,7 @@ REGENERATE_BLOCKED_TOOLS = {
     "mod_uninstall",
     "snapshot_create", "snapshot_restore", "snapshot_delete",
     "mod_patch", "game_config_write", "mod_update", "mod_disable", "mod_enable",
-    "mod_dependency_set", "mod_source_align",
+    "mod_dependency_set", "mod_source_align", "mod_source_bind",
 }
 
 # A question about current state is not authorization to change that state.
@@ -452,7 +453,10 @@ class Agent:
                 "conflict": item.get("conflict"),
             }
             for item in payload.get("items") or []
-            if needs_chinese_localization(item.get("content"))
+            if (
+                needs_chinese_name(item.get("name"))
+                or needs_chinese_localization(item.get("content"))
+            )
         ]
         if not pending:
             return payload
@@ -461,9 +465,12 @@ class Agent:
             "保留专有名词，不翻译 selection_key，不虚构未提供的功能。"
             "每项必须说明它具体改变什么；原文提到适用角色、第一/第三人称、"
             "必需装备、前置、使用条件或已知限制时必须保留，不能只写泛化摘要。"
-            "只使用 content、dependencies 和 conflict 中已有的信息，不可根据名称猜测。"
+            "localized_name 必须是 name 的简短、忠实中文直译；不确定的专有名词保留英文，"
+            "不得添加原标题没有的功能。原英文名会同时展示。"
+            "只使用 content、dependencies 和 conflict 中已有的信息，不可根据名称猜测功能。"
             "每项通常 40-140 个中文字，只返回 JSON："
-            '{"items":[{"selection_key":"原值","content":"中文功能介绍"}]}。\n'
+            '{"items":[{"selection_key":"原值","localized_name":"中文参考名",'
+            '"content":"中文功能介绍"}]}。\n'
             + json.dumps(pending, ensure_ascii=False)
         )
         try:

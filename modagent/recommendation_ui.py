@@ -113,8 +113,15 @@ def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str
         else:
             identity = _text(item.get("source_label"), source)
 
+        original_name = _text(item.get("name"), "未命名 Mod")
+        localized_name = _text(item.get("localized_name"))
+        display_name = (
+            f"{localized_name} / {original_name}"
+            if localized_name and localized_name != original_name
+            else original_name
+        )
         lines.append(
-            f"{index}. **{_text(item.get('name'), '未命名 Mod')}**"
+            f"{index}. **{display_name}**"
             + (f" ({identity})" if identity else "")
         )
         lines.append(_text(item.get("content"), MISSING_CONTENT_TEXT))
@@ -167,6 +174,12 @@ def needs_chinese_localization(value: Any) -> bool:
     return not _CHINESE_RE.search(text)
 
 
+def needs_chinese_name(value: Any) -> bool:
+    """Whether an original source title would benefit from a Chinese display alias."""
+    text = _text(value)
+    return bool(text) and not _CHINESE_RE.search(text)
+
+
 def apply_chinese_descriptions(payload: dict, translations: Any) -> dict:
     """Apply model translations by stable selection key, never exposing English fallback."""
     if not isinstance(payload, dict):
@@ -182,23 +195,34 @@ def apply_chinese_descriptions(payload: dict, translations: Any) -> dict:
         translations = translations.get("items") or translations.get("translations") or []
 
     localized = {}
+    localized_names = {}
     if isinstance(translations, list):
         for row in translations:
             if not isinstance(row, dict):
                 continue
             key = _text(row.get("selection_key") or row.get("key"))
             content = _text(row.get("content") or row.get("description"))
+            localized_name = _text(
+                row.get("localized_name") or row.get("name_zh") or row.get("chinese_name")
+            )
             if key and content and _CHINESE_RE.search(content):
                 localized[key] = content[:280]
+            if key and localized_name and _CHINESE_RE.search(localized_name):
+                localized_names[key] = localized_name[:80]
 
     for item in payload.get("items") or []:
-        if not isinstance(item, dict) or not needs_chinese_localization(item.get("content")):
+        if not isinstance(item, dict):
             continue
         key = _text(item.get("selection_key"))
-        item["content"] = localized.get(
-            key,
-            "原始简介暂未完成中文转换；请打开来源页面核对功能、版本与兼容性。",
-        )
+        if needs_chinese_name(item.get("name")):
+            item["localized_name"] = localized_names.get(
+                key, _text(item.get("localized_name"))
+            )
+        if needs_chinese_localization(item.get("content")):
+            item["content"] = localized.get(
+                key,
+                "原始简介暂未完成中文转换；请打开来源页面核对功能、版本与兼容性。",
+            )
     return payload
 
 
@@ -342,6 +366,7 @@ def _normalize_item(source: str, item: dict) -> dict:
         "source_id": str(source_id),
         "mod_id": item.get("mod_id"),
         "name": _text(item.get("name") or item.get("full_name"), "未命名 Mod")[:120],
+        "localized_name": _text(item.get("localized_name"))[:80],
         "content": _text(content, MISSING_CONTENT_TEXT)[:280],
         "has_function_summary": has_function_summary,
         "recommendation_reason": _recommendation_reason(

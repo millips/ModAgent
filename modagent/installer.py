@@ -245,6 +245,11 @@ def _redengine_layout() -> dict:
 # 注意(Palworld):创意工坊 mod 由 Steam 自己下到 steamapps/workshop,不走本 installer;
 # 这里只处理 Nexus 包。未匹配文件进 skipped,不硬装(汉化/系统类落别处的优雅降级)。
 GAME_LAYOUTS = {
+    "stardewvalley": {
+        "patterns": {},
+        "load_order_file": None,
+        "handler": "stardew_smapi",
+    },
     "stellarblade": _ue_layout("SB", extra_patterns={
         # CNS 注册文件 → ~mods 扁平化(CNS 从 ~mods 根递归扫描,见 DekCNS main.lua DekCNS_ScanConfigs)
         r"\.dekcns\.json$": "SB/Content/Paks/~mods/",
@@ -426,6 +431,133 @@ def _install_ff7r(archive_path: str, game_root: str, game_slug: str) -> dict:
     return result
 
 
+def _safe_mod_folder_name(value: str, fallback: str = "SMAPI-Mod") -> str:
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(value or "")).strip(" .")
+    return (value or fallback)[:100]
+
+
+def _install_stardew_smapi(
+    archive_path: str, game_root: str, game_slug: str,
+) -> dict:
+    """Install complete SMAPI packages below Mods/, preserving manifest roots."""
+    result = {
+        "installed": [], "skipped": [], "errors": [],
+        "handler": "stardew_smapi", "verified_mods": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        extract_archive(archive_path, tmp)
+        manifest_roots = []
+        for current, dirs, files in os.walk(tmp):
+            dirs[:] = [name for name in dirs if name.casefold() != "__macosx"]
+            manifest_name = next(
+                (name for name in files if name.casefold() == "manifest.json"),
+                "",
+            )
+            if not manifest_name:
+                continue
+            manifest_path = os.path.join(current, manifest_name)
+            try:
+                with open(manifest_path, "r", encoding="utf-8-sig") as handle:
+                    manifest = json.load(handle)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"SMAPI manifest.json 无法解析: {manifest_path}: {exc}"
+                ) from exc
+            unique_id = str(manifest.get("UniqueID") or "").strip()
+            name = str(manifest.get("Name") or "").strip()
+            if not unique_id or not name:
+                raise RuntimeError(
+                    f"SMAPI manifest.json 缺少 Name/UniqueID: {manifest_path}"
+                )
+            manifest_roots.append((os.path.realpath(current), manifest))
+
+        if not manifest_roots:
+            raise RuntimeError(
+                "Stardew Valley Mod 压缩包中未找到有效的 SMAPI manifest.json；"
+                "已停止安装，未使用 BepInEx 兜底。"
+            )
+
+        manifest_roots.sort(key=lambda item: len(item[0]), reverse=True)
+        used_folders = set()
+        root_targets = {}
+        for manifest_root, manifest in manifest_roots:
+            relative = os.path.relpath(manifest_root, tmp)
+            leaf = "" if relative == "." else os.path.basename(manifest_root)
+            folder = _safe_mod_folder_name(
+                leaf or manifest.get("Name"),
+                str(manifest.get("UniqueID") or "SMAPI-Mod"),
+            )
+            base_folder = folder
+            suffix = 2
+            while folder.casefold() in used_folders:
+                folder = f"{base_folder}-{suffix}"
+                suffix += 1
+            used_folders.add(folder.casefold())
+            root_targets[manifest_root] = folder
+
+        operations = []
+        for current, dirs, files in os.walk(tmp):
+            dirs[:] = [name for name in dirs if name.casefold() != "__macosx"]
+            real_current = os.path.realpath(current)
+            owner_root = next(
+                (
+                    root for root, _ in manifest_roots
+                    if real_current == root
+                    or real_current.startswith(root + os.sep)
+                ),
+                "",
+            )
+            if not owner_root:
+                for filename in files:
+                    result["skipped"].append(
+                        os.path.relpath(os.path.join(current, filename), tmp)
+                    )
+                continue
+            folder = root_targets[owner_root]
+            for filename in files:
+                source = os.path.join(current, filename)
+                relative = os.path.relpath(source, owner_root)
+                destination = os.path.join(game_root, "Mods", folder, relative)
+                operations.append({
+                    "src": source,
+                    "dest": destination,
+                    "record": {
+                        "file": os.path.relpath(source, tmp),
+                        "smapi_unique_id": next(
+                            str(manifest.get("UniqueID") or "")
+                            for root, manifest in manifest_roots
+                            if root == owner_root
+                        ),
+                    },
+                })
+
+        result["installed"] = _commit_files_transactionally(
+            operations, game_root, game_slug
+        )
+
+        for manifest_root, manifest in manifest_roots:
+            folder = root_targets[manifest_root]
+            installed_root = os.path.join(game_root, "Mods", folder)
+            installed_manifest = os.path.join(installed_root, "manifest.json")
+            entry_dll = str(manifest.get("EntryDll") or "").strip()
+            if not os.path.isfile(installed_manifest):
+                raise RuntimeError(
+                    f"SMAPI 安装复核失败，manifest 未落入 Mods/: {installed_manifest}"
+                )
+            if entry_dll and not os.path.isfile(os.path.join(installed_root, entry_dll)):
+                raise RuntimeError(
+                    f"SMAPI 安装复核失败，EntryDll 缺失: {entry_dll}"
+                )
+            result["verified_mods"].append({
+                "name": str(manifest.get("Name") or ""),
+                "unique_id": str(manifest.get("UniqueID") or ""),
+                "version": str(manifest.get("Version") or ""),
+                "folder": folder,
+                "entry_dll": entry_dll,
+            })
+    return result
+
+
 def detect_mod_structure(archive_path: str) -> list[str]:
     with tempfile.TemporaryDirectory() as tmp:
         return extract_archive(archive_path, tmp)
@@ -486,6 +618,8 @@ def install_mod(
 
     if layout.get("handler") == "ff7r":
         return _install_ff7r(archive_path, game_root, game_slug)
+    if layout.get("handler") == "stardew_smapi":
+        return _install_stardew_smapi(archive_path, game_root, game_slug)
 
     # 没有 per-game 规则时：走 Thunderstore/BepInEx 通用安装(REPO 等 Unity 游戏)。
     # 由 _install_bepinex 在解压后按真实内容判定:含 BepInEx/ 结构或 plugins/dll 才装,

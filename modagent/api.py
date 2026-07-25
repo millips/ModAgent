@@ -40,7 +40,7 @@ _inventory_scan_jobs_lock = threading.RLock()
 PROMPT_REFERENCED_TOOLS = {
     # 与 I 盘真身 tools.py 的 build_tools_definitions 保持一致(32 个)
     "nexus_search", "nexus_get_detail", "mod_recommend", "mod_download", "batch_download",
-    "mod_install", "mod_install_batch", "mod_install_custom", "mod_uninstall", "mod_source_align", "mod_update_check", "mod_update",
+    "mod_install", "mod_install_batch", "mod_install_custom", "mod_uninstall", "mod_source_align", "mod_source_bind", "mod_update_check", "mod_update",
     "mod_disable", "mod_enable", "mod_dependency_set",
     "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete", "conflict_check",
     "list_local_mods", "tool_extract",

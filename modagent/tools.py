@@ -291,6 +291,27 @@ def build_tools_definitions(tier: str) -> list[dict]:
            "返回已绑定、候选歧义、未匹配和来源失败四类；只会自动保存精确或高置信匹配，绝不把低置信候选强行绑定。",
            {"force_refresh": {"type": "boolean", "description": "忽略 Thunderstore 十分钟缓存，重新拉取完整包清单"}},
            []),
+        _t(
+            "mod_source_bind",
+            "把一个本地已安装 Mod 绑定到用户明确确认的 Nexus Mod ID。"
+            "只有用户已经明确说明实际来源 ID 时才可 confirmed=true；"
+            "工具会先核验 Nexus 完整详情并保存稳定绑定，后续更新不得再靠名称猜测。",
+            {
+                "local_mod_id": {
+                    "type": "string",
+                    "description": "get_installed/mod_update_check 返回的本地 Mod ID",
+                },
+                "nexus_mod_id": {
+                    "type": "integer",
+                    "description": "用户明确确认的 Nexus Mod ID",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "用户已明确确认该本地 Mod 的实际 Nexus ID",
+                },
+            },
+            ["local_mod_id", "nexus_mod_id"],
+        ),
         _t("mod_update_check", "自动对齐来源后检查当前游戏全部已安装 Mod 的版本。"
            "返回逐项状态：可更新、已是最新、本地版本未知、外部平台托管、未绑定或检查失败；"
            "updates_available 中的项目可直接交给 mod_update 一键同步。",
@@ -1808,6 +1829,72 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         )
         return json.dumps(result, indent=2, ensure_ascii=False)
 
+    elif name == "mod_source_bind":
+        local_mod_id = str(args.get("local_mod_id") or "").strip()
+        nexus_mod_id = int(args.get("nexus_mod_id") or 0)
+        mod = db.get_mod(local_mod_id, slug)
+        if not mod:
+            return json.dumps({
+                "error": f"未找到本地已安装 Mod: {local_mod_id}"
+            }, ensure_ascii=False)
+        if nexus_mod_id <= 0:
+            return json.dumps({"error": "Nexus Mod ID 无效"}, ensure_ascii=False)
+        try:
+            detail = nexus.get_detail(
+                nexus_mod_id, slug, api_key, cfg.chrome_cdp_port
+            )
+        except Exception as exc:
+            return json.dumps({
+                "error": f"无法核验 Nexus #{nexus_mod_id} 完整详情: {exc}"
+            }, ensure_ascii=False)
+        preview = {
+            "local": {
+                "mod_id": str(mod.id),
+                "name": mod.name,
+                "version": mod.version,
+            },
+            "nexus": {
+                "mod_id": nexus_mod_id,
+                "name": detail.get("name") or "",
+                "author": detail.get("author") or "",
+                "version": detail.get("version") or "",
+                "summary": detail.get("summary") or "",
+                "description": detail.get("description") or "",
+                "dependencies": detail.get("dependencies") or [],
+                "updated_at": detail.get("updated_at") or "",
+            },
+        }
+        if not args.get("confirmed"):
+            return json.dumps({
+                "requires_confirmation": True,
+                "message": (
+                    "已取得本地项与 Nexus 完整详情；只有用户明确确认二者是同一 Mod，"
+                    "才能写入稳定更新绑定"
+                ),
+                "preview": preview,
+            }, ensure_ascii=False, indent=2)
+        url = f"https://www.nexusmods.com/{slug}/mods/{nexus_mod_id}"
+        db.upsert_mod_source_binding(
+            slug, str(mod.id), "nexus", str(nexus_mod_id), url,
+            1.0, "user_confirmed", str(detail.get("version") or ""),
+            {
+                "nexus_slug": slug,
+                "matched_name": detail.get("name") or "",
+                "author": detail.get("author") or "",
+                "summary": detail.get("summary") or "",
+                "description": detail.get("description") or "",
+                "dependencies": detail.get("dependencies") or [],
+                "updated_at": detail.get("updated_at") or "",
+            },
+        )
+        return json.dumps({
+            "bound": True,
+            "match_method": "user_confirmed",
+            "source": "nexus",
+            "source_key": str(nexus_mod_id),
+            "preview": preview,
+        }, ensure_ascii=False, indent=2)
+
     elif name == "mod_update_check":
         # 先建立稳定来源绑定。Thunderstore 使用完整社区包账本，不再逐个加载网页。
         from .source_alignment import align_installed_mods
@@ -1868,10 +1955,19 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     latest_by_id[str(m.id)] = latest
                     binding = db.get_mod_source_binding(str(m.id), slug)
                     if binding:
+                        try:
+                            binding_metadata = json.loads(
+                                binding.get("metadata") or "{}"
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            binding_metadata = {}
+                        binding_metadata["dependencies"] = dependencies
                         db.upsert_mod_source_binding(
                             slug, str(m.id), "nexus", upstream_id,
-                            binding.get("source_url") or "", 1, "stable_id",
-                            latest, {"dependencies": dependencies},
+                            binding.get("source_url") or "",
+                            binding.get("confidence") or 1,
+                            binding.get("match_method") or "stable_id",
+                            latest, binding_metadata,
                         )
 
         failed_by_id = {
@@ -2044,6 +2140,26 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             new_files = [f["dest"] for f in result.get("installed", [])]
             if not new_files or result.get("errors"):
                 raise RuntimeError("新版本未能完整落位")
+            if stardew.is_stardew(
+                getattr(cfg, "game_name", ""), slug, root
+            ):
+                real_mods = os.path.realpath(os.path.join(root, "Mods"))
+                misplaced = []
+                for installed_path in new_files:
+                    try:
+                        inside_mods = (
+                            os.path.commonpath([
+                                real_mods, os.path.realpath(installed_path)
+                            ]) == real_mods
+                        )
+                    except ValueError:
+                        inside_mods = False
+                    if not inside_mods:
+                        misplaced.append(installed_path)
+                if misplaced or not result.get("verified_mods"):
+                    raise RuntimeError(
+                        "SMAPI 更新验收失败：新版本未完整安装到 Stardew Valley/Mods"
+                    )
         except Exception as exc:
             try:
                 rollback = snapshot.snapshot_restore(snap_id)
@@ -2080,6 +2196,8 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             )
         return json.dumps({"updated": mod.name, "version": mod.version,
                            "source": source,
+                           "install_handler": result.get("handler", ""),
+                           "verified_mods": result.get("verified_mods", []),
                            "snapshot_id": snap_id, "cache_cleanup": cache_cleanup},
                           indent=2, ensure_ascii=False)
 

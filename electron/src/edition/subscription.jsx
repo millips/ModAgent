@@ -164,7 +164,14 @@ export function ChatEditionMessage({
                     </button>
                   </td>
                   <td className="px-3 py-3 align-top">
-                    <p className="font-medium leading-snug text-white">{index + 1}. {item.name}</p>
+                    <p className="font-medium leading-snug text-white">
+                      {index + 1}. {item.localized_name || item.name}
+                    </p>
+                    {item.localized_name && item.localized_name !== item.name && (
+                      <p className="mt-1 text-[10px] leading-snug text-surface-500">
+                        原名：{item.name}
+                      </p>
+                    )}
                     <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px]">
                       <span className="text-cyber-purple">{item.source_label || item.source}</span>
                       <span className={`rounded border px-1.5 py-0.5 ${

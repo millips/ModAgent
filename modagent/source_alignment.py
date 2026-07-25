@@ -143,7 +143,9 @@ def align_installed_mods(cfg, *, force_refresh: bool = False) -> dict:
             })
         else:
             existing = db.get_mod_source_binding(mid, slug)
-            if existing and existing.get("match_method") == "manual":
+            if existing and existing.get("match_method") in {
+                "manual", "user_confirmed",
+            }:
                 report["bound"].append({
                     "mod_id": mid, "name": mod.name, "source": existing["source"],
                     "source_key": existing["source_key"],
@@ -215,9 +217,18 @@ def align_installed_mods(cfg, *, force_refresh: bool = False) -> dict:
             ranked.sort(key=lambda pair: pair[0], reverse=True)
             best_score, best = ranked[0] if ranked else (0.0, {})
             runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
+            credible = [
+                (score, row) for score, row in ranked if score >= .90
+            ]
             source_key = str(best.get("mod_id") or "")
-            exact = best_score == 1.0
-            strong = best_score >= .92 and best_score - runner_up >= .06
+            # An exact title is not identity proof when another highly similar
+            # project exists. Auto Forager #7736/#47161 is the regression case.
+            exact = best_score == 1.0 and len(credible) == 1
+            strong = (
+                best_score >= .92
+                and best_score - runner_up >= .06
+                and len(credible) == 1
+            )
             if source_key and source_key not in claimed and (exact or strong):
                 url = f"https://www.nexusmods.com/{nexus_slug}/mods/{source_key}"
                 latest = str(best.get("version") or "")
@@ -233,6 +244,47 @@ def align_installed_mods(cfg, *, force_refresh: bool = False) -> dict:
                     "source_key": source_key, "confidence": best_score,
                     "match_method": method, "current_version": mod.version,
                     "latest_version": latest, "url": url,
+                })
+            elif best_score >= .58 and ranked:
+                candidates = []
+                for score, row in ranked[:3]:
+                    if score < .45:
+                        continue
+                    candidate = {
+                        "source": "nexus",
+                        "source_key": str(row.get("mod_id") or ""),
+                        "name": str(row.get("name") or ""),
+                        "version": str(row.get("version") or ""),
+                        "summary": str(row.get("summary") or "")[:500],
+                        "score": score,
+                        "detail_verified": False,
+                    }
+                    try:
+                        detail = nexus.get_detail(
+                            int(row["mod_id"]), nexus_slug, api_key, cdp_port
+                        )
+                        candidate.update({
+                            "name": str(detail.get("name") or candidate["name"]),
+                            "version": str(detail.get("version") or candidate["version"]),
+                            "author": str(detail.get("author") or ""),
+                            "summary": str(detail.get("summary") or "")[:800],
+                            "description": str(detail.get("description") or "")[:2000],
+                            "dependencies": detail.get("dependencies") or [],
+                            "updated_at": str(detail.get("updated_at") or ""),
+                            "detail_verified": True,
+                        })
+                    except Exception as exc:
+                        candidate["detail_error"] = (str(exc) or type(exc).__name__)[:180]
+                    candidates.append(candidate)
+                report["ambiguous"].append({
+                    "mod_id": str(mod.id),
+                    "name": mod.name,
+                    "current_version": mod.version,
+                    "reason": (
+                        "发现多个高度相似的 Nexus 项目；名称相似不能证明本机来源，"
+                        "必须核对完整详情并由用户确认稳定 ID"
+                    ),
+                    "candidates": candidates,
                 })
             else:
                 if error:

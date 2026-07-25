@@ -183,12 +183,17 @@ localized = apply_chinese_descriptions(evidence_result, {
     "items": [
         {
             "selection_key": evidence_result["items"][0]["selection_key"],
+            "localized_name": "蒂法美人鱼比基尼",
             "content": "替换蒂法服装外观，并提供经过核验的服装细节。",
         },
     ],
 })
 assert localized["items"][0]["content"].startswith("替换蒂法服装")
+assert localized["items"][0]["localized_name"] == "蒂法美人鱼比基尼"
+assert localized["items"][0]["name"] == "Tifa Mermaid Bikini"
 assert "Verified outfit detail" not in localized["items"][0]["content"]
+localized_analysis = recommendation_analysis_text("", localized)
+assert "**蒂法美人鱼比基尼 / Tifa Mermaid Bikini**" in localized_analysis
 assert all(
     any("\u3400" <= char <= "\u9fff" for char in item["content"])
     for item in localized["items"]

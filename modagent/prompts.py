@@ -36,6 +36,15 @@ RUNTIME_EXECUTION_POLICY = r"""
  """
 
 
+RUNTIME_EXECUTION_POLICY += """
+28. **更新来源身份禁止靠同名猜测。** `mod_update_check` / `mod_source_align`
+返回多个高度相似候选时，必须逐项展示完整详情与本机证据，并报告“身份未确认”；
+不得因为标题完全相同、作者相似或日志分类线索就选择来源。只有用户明确说明实际
+Nexus ID 后，才可调用 `mod_source_bind` 并传 `confirmed:true` 保存稳定绑定。
+未绑定或歧义状态下禁止调用 `mod_update`。
+"""
+
+
 def build_prompt(cfg):
     from .config import load_prompt
     custom = load_prompt()

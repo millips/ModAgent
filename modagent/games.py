@@ -895,38 +895,67 @@ def list_known_games() -> list[dict]:
 
 
 def _find_steam_libraries() -> list[str]:
-    paths = []
+    """Find Steam itself and every configured library without crawling disks."""
+    candidates = [
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            "Steam",
+        )
+    ]
 
-    steam_default = os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Steam")
-    if os.path.isdir(steam_default):
-        paths.append(steam_default)
-
-    library_file = os.path.join(steam_default, "steamapps", "libraryfolders.vdf")
-    if os.path.isfile(library_file):
+    if os.name == "nt":
         try:
-            with open(library_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    stripped = line.strip()
-                    if stripped.startswith('"path"'):
-                        p = stripped.split('"')[3].replace("\\\\", "\\")
-                        if os.path.isdir(p) and p not in paths:
-                            paths.append(p)
-        except Exception:
+            import winreg
+            registry_locations = (
+                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+            )
+            for hive, key_path in registry_locations:
+                try:
+                    with winreg.OpenKey(hive, key_path) as key:
+                        root = _registry_value(key, ("SteamPath", "InstallPath"))
+                        if root:
+                            candidates.append(root.replace("/", os.sep))
+                except OSError:
+                    continue
+        except ImportError:
             pass
 
-    if not paths:
-        for drive in _get_drives():
-            for root, dirs, _ in os.walk(drive, topdown=True):
-                dirs[:] = [d for d in dirs if not d.startswith("$")]
-                if "SteamLibrary" in dirs:
-                    p = os.path.join(root, "SteamLibrary")
-                    if os.path.isdir(os.path.join(p, "steamapps", "common")):
-                        paths.append(p)
-                if "Steam" in dirs and "steamapps" in os.listdir(os.path.join(root, "Steam")):
-                    p = os.path.join(root, "Steam")
-                    if os.path.isdir(os.path.join(p, "steamapps", "common")) and p not in paths:
-                        paths.append(p)
-                break
+    # Portable/custom installs such as D:\steam are common in China. Inspect
+    # only each drive root and compare case-insensitively; never crawl a drive.
+    for drive in _get_drives():
+        try:
+            entries = os.listdir(drive)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.casefold() in {"steam", "steamlibrary"}:
+                candidates.append(os.path.join(drive, entry))
+
+    paths = []
+    seen = set()
+
+    def add_library(value: str):
+        path = os.path.abspath(os.path.expandvars(str(value or "")))
+        if not os.path.isdir(os.path.join(path, "steamapps")):
+            return
+        key = os.path.normcase(os.path.realpath(path))
+        if key not in seen:
+            seen.add(key)
+            paths.append(path)
+
+    for candidate in list(candidates):
+        add_library(candidate)
+        library_file = os.path.join(candidate, "steamapps", "libraryfolders.vdf")
+        try:
+            with open(library_file, "r", encoding="utf-8-sig", errors="replace") as handle:
+                for line in handle:
+                    match = re.match(r'\s*"path"\s*"([^"]+)"', line, re.I)
+                    if match:
+                        add_library(match.group(1).replace("\\\\", "\\"))
+        except OSError:
+            continue
 
     return paths
 

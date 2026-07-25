@@ -9,6 +9,7 @@ import { ChatEditionMessage } from '@edition'
 // 后端强制只读生成，副作用不重放、也不撤销。
 const SIDE_EFFECT_TOOLS = new Set([
   'mod_install', 'mod_install_batch', 'mod_install_custom', 'mod_uninstall', 'mod_update',
+  'mod_source_bind',
   'mod_disable', 'mod_enable', 'mod_patch', 'mod_dependency_set', 'import_existing_mods',
   'game_config_write',
   'snapshot_create', 'snapshot_restore', 'snapshot_delete',
@@ -28,6 +29,7 @@ const QUIET_TOOLS = new Set([
 const TOOL_LABELS = {
   nexus_search: '搜索 Nexus', nexus_get_detail: '核验 Mod 详情',
   mod_recommend: '分析推荐结果',
+  mod_source_bind: '确认 Mod 维护来源',
   browser_open: '打开下载页面', browser_observe: '识别页面状态',
   browser_click: '操作下载页面', browser_input: '填写页面信息', browser_wait: '等待页面响应',
   conflict_check: '检查冲突与落位', game_file_check: '检查游戏文件', game_config_write: '写入游戏配置',
@@ -1448,7 +1450,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           >
             {/* currentGame 为空 = 后端配置的游戏不在检测列表里(已卸载/移动),兜底一个 value='' 的
                 option,免得 select 匹配不到时静默跳到第一个游戏、误导用户以为切换了。 */}
-            {!currentGame && <option value="">{!status.online ? '正在连接后端…' : games.length === 0 ? '正在检测游戏…' : status.game ? `${status.game}(未在检测列表)` : '选择游戏...'}</option>}
+            {!currentGame && <option value="">{!status.online ? '正在连接后端…' : gameScanBusy ? '正在检测游戏…' : games.length === 0 ? '未检测到游戏，可手动导入' : status.game ? `${status.game}(未在检测列表)` : '选择游戏...'}</option>}
             <optgroup label="稳定适配">
               {games.filter(g => g.adapted).map(g => (
                 <option key={g.path} value={g.path}>{g.name}{gameSourceLabel(g.source) ? ` · ${gameSourceLabel(g.source)}` : ''}</option>

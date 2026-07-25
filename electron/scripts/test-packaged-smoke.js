@@ -56,6 +56,7 @@ try {
   const log = fs.readFileSync(logPath, 'utf8')
   assert(log.includes('ModAgent API ready'), 'Backend health check was not observed')
   assert(log.includes('Packaged smoke test passed'), 'Smoke-test success marker missing')
+  assert(!log.includes('\uFFFD'), 'Backend log contains invalid UTF-8 replacement characters')
   console.log(`PACKAGED ${edition.toUpperCase()} SMOKE TEST PASSED (${packageInfo.version})`)
 } finally {
   fs.rmSync(smokeRoot, { recursive: true, force: true })

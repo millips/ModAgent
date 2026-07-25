@@ -180,12 +180,16 @@ function startBackend() {
     env: {
       ...process.env,
       PYTHONUNBUFFERED: '1',
+      PYTHONIOENCODING: 'utf-8',
+      PYTHONUTF8: '1',
       MODAGENT_API_TOKEN: API_TOKEN,
       MODAGENT_API_PORT: String(API_PORT),
     },
   });
-  pythonProcess.stdout.on('data', data => logger.info('[API]', data.toString().trim()));
-  pythonProcess.stderr.on('data', data => logger.error('[API]', data.toString().trim()));
+  pythonProcess.stdout.setEncoding('utf8');
+  pythonProcess.stderr.setEncoding('utf8');
+  pythonProcess.stdout.on('data', data => logger.info('[API]', data.trim()));
+  pythonProcess.stderr.on('data', data => logger.error('[API]', data.trim()));
   pythonProcess.on('error', error => logger.error('Backend spawn error', error));
   pythonProcess.on('close', code => {
     logger.warn('Backend exited', { code, isQuitting });

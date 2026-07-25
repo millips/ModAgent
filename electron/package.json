@@ -3,7 +3,7 @@
   "productName": "ModAgent Pro",
   "description": "AI-assisted game mod manager",
   "modagentEdition": "subscription",
-  "version": "1.10.0",
+  "version": "1.10.1",
   "main": "main.js",
   "scripts": {
     "dev": "vite --port 3000",
@@ -13,6 +13,7 @@
     "test:browser": "node scripts/test-browser-launcher.js",
     "test:diagnostics": "node scripts/test-runtime-diagnostics.js",
     "test:identity": "node scripts/test-app-identity.js",
+    "test:updater": "node scripts/test-updater-config.js",
     "test:packaged-smoke": "node scripts/test-packaged-smoke.js",
     "build": "npm run verify:audio && npm run verify:text && node scripts/clean-dist.js && vite build",
     "start": "electron .",
@@ -24,6 +25,7 @@
     "dist:win": "npm run build && npm run build:backend && electron-builder --win nsis --config electron-builder.config.cjs",
     "release:all": "node scripts/release-all.js",
     "release:public-beta": "node scripts/release-public-beta.js",
+    "build:cleanup": "node scripts/build-cleanup-tool.js",
     "release:github-free": "node scripts/prepare-github-free.js",
     "release:promote": "node scripts/promote-verified.js"
   },

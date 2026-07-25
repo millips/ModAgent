@@ -85,4 +85,60 @@ assert detected[0]["name"] == "Example Game"
 assert detected[0]["source"] == "epic_manifest"
 assert detected[0]["real"] is True
 
+# Lowercase portable roots such as D:\steam must be found without crawling
+# the whole drive.
+portable_drive = os.path.join(root, "PortableDrive")
+portable_steam = os.path.join(portable_drive, "steam")
+portable_steamapps = os.path.join(portable_steam, "steamapps")
+portable_stardew = os.path.join(
+    portable_steamapps, "common", "Stardew Valley"
+)
+touch(os.path.join(portable_stardew, "Stardew Valley.exe"), b"x" * 158 * 1024)
+touch(os.path.join(portable_stardew, "Stardew Valley.dll"))
+touch(os.path.join(portable_stardew, "MonoGame.Framework.dll"))
+touch(os.path.join(portable_stardew, "Content", "Content.xnb"))
+with open(
+    os.path.join(portable_steamapps, "appmanifest_413150.acf"),
+    "w",
+    encoding="utf-8",
+) as handle:
+    handle.write(
+        '"AppState"\n{\n'
+        '  "appid" "413150"\n'
+        '  "name" "Stardew Valley"\n'
+        '  "installdir" "Stardew Valley"\n'
+        '}\n'
+    )
+
+old_get_drives = games._get_drives
+old_find_libraries = games._find_steam_libraries
+old_program_files = os.environ.get("ProgramFiles(x86)")
+games._get_drives = lambda: [portable_drive]
+os.environ["ProgramFiles(x86)"] = os.path.join(root, "MissingProgramFiles")
+try:
+    discovered_libraries = games._find_steam_libraries()
+    assert any(
+        os.path.normcase(os.path.realpath(path))
+        == os.path.normcase(os.path.realpath(portable_steam))
+        for path in discovered_libraries
+    )
+    games._find_steam_libraries = lambda: [portable_steam]
+    portable_detected = games.detect_steam_games()
+finally:
+    games._find_steam_libraries = old_find_libraries
+    games._get_drives = old_get_drives
+    if old_program_files is None:
+        os.environ.pop("ProgramFiles(x86)", None)
+    else:
+        os.environ["ProgramFiles(x86)"] = old_program_files
+
+portable_matches = [
+    game for game in portable_detected
+    if os.path.normcase(os.path.realpath(game["path"]))
+    == os.path.normcase(os.path.realpath(portable_stardew))
+]
+assert len(portable_matches) == 1
+assert portable_matches[0]["name"] == "Stardew Valley"
+assert portable_matches[0]["real"] is True
+
 print("GAME DISCOVERY TESTS PASSED")

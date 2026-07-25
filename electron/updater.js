@@ -1,9 +1,30 @@
+const fs = require('fs');
 const path = require('path');
 const { app, dialog, ipcMain } = require('electron');
 const electronLog = require('electron-log');
 
+function updateConfigurationPath(resourcesPath) {
+  return path.join(resourcesPath, 'app-update.yml');
+}
+
+function hasUpdateConfiguration(resourcesPath, existsSync = fs.existsSync) {
+  return existsSync(updateConfigurationPath(resourcesPath));
+}
+
 function setupAutoUpdater({ identity, diagnostics, getMainWindow }) {
   if (!app.isPackaged) return null;
+  if (!hasUpdateConfiguration(process.resourcesPath)) {
+    diagnostics.logger.info('Updater disabled', {
+      reason: 'update feed is not configured for this build',
+      channel: identity.updateChannel,
+    });
+    ipcMain.handle('check-for-app-update', async () => ({
+      ok: false,
+      skipped: true,
+      error: '当前测试版尚未配置自动更新源',
+    }));
+    return null;
+  }
   let autoUpdater;
   try {
     ({ autoUpdater } = require('electron-updater'));
@@ -66,4 +87,8 @@ function setupAutoUpdater({ identity, diagnostics, getMainWindow }) {
   return autoUpdater;
 }
 
-module.exports = { setupAutoUpdater };
+module.exports = {
+  setupAutoUpdater,
+  hasUpdateConfiguration,
+  updateConfigurationPath,
+};
