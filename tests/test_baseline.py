@@ -84,7 +84,9 @@ r = tools.execute("snapshot_restore", {"snapshot_id": s1}, cfg)
 check("8 cross-game restore refused", "跨游戏回滚已拒绝" in r)
 
 # 9. 同游戏回滚仍可用(用 s0)
-r = tools.execute("snapshot_restore", {"snapshot_id": s0}, cfg)
+r0 = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s0}, cfg))
+r = tools.execute("snapshot_restore", {"snapshot_id": s0, "confirmed": True,
+                                       "confirmation_token": r0["confirmation_token"]}, cfg)
 check("9 same-game restore works", "files_restored" in r)
 
 print("\nALL PASS" if allok else "\nSOME FAILED")

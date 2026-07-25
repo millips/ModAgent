@@ -1,0 +1,111 @@
+name: Bug 反馈
+description: 报告 ModAgent 安装、启动、扫描、下载、安装、快照或回滚问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢参与测试。请勿提交 API Key、Cookie、账号密码、支付信息或未经检查的完整日志。
+        建议先在“设置 → 应用维护 → 导出诊断”生成脱敏诊断信息，并在上传前自行检查。
+
+  - type: input
+    id: version
+    attributes:
+      label: ModAgent 版本与公测包编号
+      description: 例如 Pro 1.10.0 / PublicTest-20260724-1
+      placeholder: Pro 1.10.0 / PublicTest-YYYYMMDD-N
+    validations:
+      required: true
+
+  - type: dropdown
+    id: edition
+    attributes:
+      label: 版本类型
+      options:
+        - ModAgent Pro
+        - ModAgent 普通版
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 环境
+      description: 请填写 Windows 10/11、系统版本，以及是否为普通用户权限。
+      placeholder: Windows 11 23H2，普通用户
+    validations:
+      required: true
+
+  - type: input
+    id: game
+    attributes:
+      label: 游戏与来源平台
+      description: 同一游戏存在多份安装时，请分别注明路径和平台。
+      placeholder: Stardew Valley / Steam / D:\SteamLibrary\steamapps\common\Stardew Valley
+    validations:
+      required: true
+
+  - type: input
+    id: game_count
+    attributes:
+      label: 已安装游戏的大致数量
+      description: 请注明 Steam、Epic、Xbox 等平台合计数量，便于排查扫描性能。
+      placeholder: Steam 80 个，Xbox 5 个
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从启动应用开始，按顺序列出每一步。
+      placeholder: |
+        1. 启动 ModAgent
+        2. 点击“重新扫描游戏”
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 请包含完整错误文案；可在此拖入已脱敏截图。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproducibility
+    attributes:
+      label: 复现频率
+      options:
+        - 每次都能复现
+        - 经常出现
+        - 偶尔出现
+        - 只出现过一次
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 已脱敏诊断信息
+      description: 可拖入诊断文件；上传前请确认不含私人路径、账号信息或密钥。
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已确认内容中不包含 API Key、Cookie、密码或支付信息。
+          required: true
+        - label: 若问题涉及写盘、卸载或回滚，我已保留必要的游戏存档和重要文件备份。
+          required: true

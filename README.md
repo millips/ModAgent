@@ -1,109 +1,137 @@
 # ModAgent
 
-ModAgent 是一个面向 PC 游戏的开源 AI Mod 管理器，帮助用户搜索、识别、安装、管理和回滚游戏 Mod。
+面向 Windows 的本地 AI Mod 管理器：对话搜索、方案分析、安装确认、Mod 管理与快照回滚。
 
-本仓库仅包含 **ModAgent 普通版**。订阅版的专属主题、音效、动效、壁纸与商业素材不包含在本仓库中，也不属于 GPL 开源范围。
+当前版本：**v1.3.0 稳定版候选**。
 
-## 主要功能
+[下载普通版](https://github.com/millips/ModAgent/releases) · [提交问题](https://github.com/millips/ModAgent/issues) · [隐私说明](PRIVACY.md)
 
-- 通过对话描述 Mod 需求
-- 聚合 Nexus Mods、GitHub、Steam Workshop、Thunderstore、GameBanana 等来源
-- 下载并安装受支持的 Mod
-- 扫描现有 Mod
-- 创建、预览与恢复快照
-- 启用、禁用及卸载 Mod
-- 检查前置依赖与陈旧风险
-- 本地保存配置、对话和 Mod 管理记录
+![ModAgent 普通版对话与状态总览](docs/assets/promo/v1.0.0/01-chat-overview.png)
 
-实际支持能力取决于游戏、Mod 类型、来源网站与当前版本。安装前请阅读应用内的风险提示，并为重要存档保留备份。
+## 它解决什么问题
 
-## 系统要求
+找 Mod、看说明、确认版本和依赖、下载压缩包、安装到游戏目录、出问题后恢复——这些步骤通常分散在网页和文件夹里。
 
-- Windows 10/11 x64
-- 当前 v1.0 仅提供中文界面与中文交互
-- Python 3.10 或更高版本（仅源码运行需要）
-- Node.js 18 或更高版本（仅前端开发与打包需要）
-- 使用在线搜索、Mod 来源和 AI 模型时需要网络连接
+ModAgent 把核心流程整理进一个桌面界面：
 
-## 必需的 API Key
+- 用自然语言描述想找的 Mod
+- 汇总候选并分析功能、更新时间、依赖和风险
+- 真正修改本地文件前由用户确认
+- 集中查看、启用、禁用和卸载已安装 Mod
+- 用快照记录关键状态，并在回滚前预览影响
 
-ModAgent 普通版不内置共享密钥。用户需要在“设置”中填写自己的 API Key：
+## 实机界面
 
-| API Key | 用途 | 缺少时的影响 |
-|---|---|---|
-| Nexus Mods API Key | 查询 Nexus Mods、读取文件和版本信息、执行 Nexus 下载流程 | 无法完整使用 Nexus Mods 来源 |
-| Tavily Search API Key | 搜索 GitHub、Steam Workshop、GameBanana 及其他网页来源，补充跨站推荐信息 | 跨网站搜索与综合推荐能力明显受限 |
-| DeepSeek API Key | 驱动中文对话、需求理解、计划生成和工具调用 | 无法使用 AI 对话与自动规划 |
+| Mod 管理 | 快照历史 |
+|---|---|
+| ![Mod 管理](docs/assets/promo/v1.0.0/02-mod-management.png) | ![快照历史](docs/assets/promo/v1.0.0/03-snapshot-history.png) |
 
-API Key 分别由对应服务提供，相关额度、费用、地区可用性和服务条款由服务提供方决定。
+![卸载前影响确认](docs/assets/promo/v1.0.0/04-safety-confirmation.png)
 
-### 当前模型与语言支持
+## 下载与安装
 
-- 当前官方验证并支持的模型服务：**DeepSeek**
-- 当前产品语言：**简体中文**
-- 设置页中可能出现兼容 OpenAI 接口格式的实验性模型选项，但 v1.0 不承诺其完整可用性
-- 英文界面、其他模型服务和免配置托管能力属于后续规划
+前往 [GitHub Releases](https://github.com/millips/ModAgent/releases)：
 
-因此，当前版本更准确的定位是：**由用户提供 API Key 的中文 AI Mod 管理器**，并非无需配置即可使用的在线服务。
+- 大多数用户下载 `ModAgent-Setup-<版本>.exe`
+- 免安装使用下载 `ModAgent-Portable-<版本>.zip`
+- 使用同一 Release 中的 `SHA256SUMS.txt` 校验文件完整性
+
+当前发布目标为 Windows x64。
+
+## 首次使用
+
+1. 启动 ModAgent。
+2. 按界面提示配置一个大模型 API Key；Nexus Mods 和 Tavily 均可跳过，之后再补。
+3. 选择自动识别到的游戏，或手动导入游戏目录。
+4. 先创建原版基线快照。
+5. 在对话页描述需求，核对分析和操作计划后再执行。
+
+## 重要限制
+
+- ModAgent 不绕过 Nexus Mods 的登录、人机验证或下载限制。
+- 遇到验证页面或 “Slow download” 时，需要用户完成平台要求的操作。
+- 未特化适配的游戏会使用通用规则，安装位置与文件清单必须由用户核对。
+- 快照不能替代存档和重要个人文件的独立备份。
+- Mod 内容、版权、兼容性和可用性由相应作者及第三方平台负责。
+
+## 普通版与 ModAgent P
+
+普通版和 P 共用完整的 Agent 推荐、核验、计划、安装与回滚闭环；P 只增加主题、音效、视觉动效/反馈核心和专属身份。
+
+| 功能 | 普通版 | P |
+|---|:---:|:---:|
+| AI 对话、需求分析与文本推荐 | ✓ | ✓ |
+| 游戏自动识别、手动导入和多安装实例 | ✓ | ✓ |
+| Nexus、Steam Workshop、Thunderstore、GitHub、GameBanana 等多源搜索 | ✓ | ✓ |
+| 候选详情、版本、依赖和更新活跃度核验 | ✓ | ✓ |
+| 本地 Mod 扫描、导入、启用、禁用和卸载 | ✓ | ✓ |
+| 下载、安装确认、安装规则和失败回滚 | ✓ | ✓ |
+| 快照、影响预览和恢复 | ✓ | ✓ |
+| 稳定来源绑定、更新检查和歧义阻断 | ✓ | ✓ |
+| 朴素 / 设计双布局 | ✓ | ✓ |
+| 结构化推荐决策表、智能预选和最终勾选联动 | ✓ | ✓ |
+| 前置依赖置顶、必要依赖标记和安装顺序约束 | ✓ | ✓ |
+| 暂不可安装候选的保留、核验、来源页和手动导入路径 | ✓ | ✓ |
+| 推荐选择状态跨会话恢复、候选数量调节 | ✓ | ✓ |
+| JSON、INI、CFG、TXT、XML 配置智能补丁 | ✓ | ✓ |
+| P 专属主题与氛围打光 | — | ✓ |
+| P 专属音效 | — | ✓ |
+| P 视觉动效与反馈核心 | — | ✓ |
+| P 专属图标和身份标识 | — | ✓ |
+
+两版目前都需要用户配置自己的大模型 API Key；Nexus 和 Tavily 为可选增强。ModAgent P 首发提供 3 天试用，爱发电兑换码离线验证后开放 60 天。到期只关闭四类 P 表现层权益，不影响核心功能和用户数据。
+
+完整边界和不承诺事项见 [普通版与 P 功能矩阵](docs/EDITION-COMPARISON.md)。GitHub 普通版不包含 P 专有资源和许可证公钥。
 
 ## 从源码运行
 
-安装 Python 依赖：
+环境要求：
+
+- Python 3.10+
+- Node.js
+- Windows
+
+后端：
 
 ```powershell
 python -m pip install -r requirements.txt
+python -m modagent.api
 ```
 
-安装前端依赖：
+前端：
 
 ```powershell
 cd electron
 npm install
-```
-## 普通用户下载
-
-普通用户请从 GitHub 仓库右侧的 **Releases** 下载 `ModAgent-Setup-*.exe` 安装程序。
-
-GitHub 自动提供的 **Source code (zip)** 只包含约数 MB 的源代码，不能解压后直接运行 ModAgent。完整 Windows 安装程序包含 Electron、Python 后端和运行依赖，体积会明显更大。
-
-暂未发布 Release 时，表示当前版本仍在封闭测试阶段。
-
-
-开发模式运行：
-
-```powershell
-npm run dev:full
+$env:MODAGENT_EDITION='free'
+npm run dev
 ```
 
-## 构建 Windows 安装包
+构建普通版候选发布目录：
 
 ```powershell
 cd electron
-npm run dist:win
+npm run release:github-free
 ```
 
-构建过程会生成 Python 后端与 Electron 安装程序。生成结果不会提交到源码仓库。
+输出位于 `electron/release/github-free/v<版本>-candidate/`。工作树未提交时，清单会明确标记为候选测试包，不允许伪装成正式可追溯 Release。
 
-## 隐私与安全
+## 反馈
 
-- API 密钥通过 Windows DPAPI 加密保存在本机。
-- ModAgent 不包含项目方自建的遥测上传。
-- 使用 AI 模型、搜索服务或 Mod 来源时，必要请求会发送到用户选择的第三方服务。
-- 诊断文件仅在用户主动导出后由用户自行提供。
+提交 Issue 时请提供：
 
-详见 [隐私说明](PRIVACY.md) 与 [第三方 Mod 和网站免责声明](THIRD-PARTY-MODS-DISCLAIMER.md)。
+- ModAgent 版本
+- 游戏名称
+- 可复现的操作步骤
+- 期望结果与实际结果
+- 已脱敏的日志或截图
 
-## 许可证
+请勿提交 API Key、Cookie、账号信息或包含私人目录信息的完整日志。
 
-ModAgent 普通版以 **GNU GPL v3.0 only** 发布，详见 [LICENSE.md](LICENSE.md) 与 [LICENSE-GPL-3.0.txt](LICENSE-GPL-3.0.txt)。
+## 许可
 
-第三方组件仍受各自许可证约束，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+普通版源代码按 [GNU GPL v3](LICENSE-GPL-3.0.txt) 发布。第三方组件、第三方 Mod 与订阅资源的许可边界见：
 
-## 联系
-
-问题反馈、权利投诉与公开联系：`3387454098@qq.com`
-我的支持频道:https://afdian.com/a/catgirl_creator
-
-## 鸣谢
-
-特别感谢一直陪伴我测试的朋友:czzj,屿白ww,欧阳青岚,小满大王
+- [项目许可说明](LICENSE.md)
+- [第三方声明](THIRD_PARTY_NOTICES.md)
+- [第三方 Mod 免责声明](THIRD-PARTY-MODS-DISCLAIMER.md)

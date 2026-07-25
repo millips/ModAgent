@@ -54,6 +54,10 @@ export function emitToolFeedback(name, ok, detail = {}) {
     emitFeedback('warning', { ...detail, tool: name, blocked: true })
     return
   }
+  if (name === 'snapshot_restore' && !/"complete"\s*:\s*true/.test(previewText)) {
+    emitFeedback('warning', { ...detail, tool: name, incomplete: true })
+    return
+  }
 
   let count = Number(detail.count) || 0
   if (name === 'mod_install_batch' && !count) {

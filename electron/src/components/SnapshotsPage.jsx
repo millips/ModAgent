@@ -1,40 +1,62 @@
 import React, { useState, useEffect } from 'react'
 import { Camera, RotateCcw, Clock, Shield, Trash2, Eye, X } from 'lucide-react'
+import { emitFeedback } from '../feedback/feedbackBus'
 
 export default function SnapshotsPage({ toast, api, status, onRefresh }) {
   const [snaps, setSnaps] = useState([])
+  const [storage, setStorage] = useState(null)
   const [actionLock, setActionLock] = useState(null)
   const [preview, setPreview] = useState(null)
   const [delConfirm, setDelConfirm] = useState(null)
   const [restoreConfirm, setRestoreConfirm] = useState(null)   // 回滚预览确认弹窗数据
 
-  useEffect(() => { loadSnaps() }, [status.game_slug])
+  useEffect(() => { loadSnaps() }, [status.game_slug, status.game_instance_id])
 
   const loadSnaps = async () => {
     try {
-      const slug = status.game_slug || ''
-      const url = slug ? `${api}/snapshots?game_slug=${slug}` : `${api}/snapshots`
-      const r = await fetch(url)
+      const scope = status.game_instance_id || status.game_slug || ''
+      const url = scope ? `${api}/snapshots?game_slug=${encodeURIComponent(scope)}` : `${api}/snapshots`
+      const storageUrl = scope
+        ? `${api}/snapshots/storage?game_slug=${encodeURIComponent(scope)}`
+        : `${api}/snapshots/storage`
+      const [r, storageResponse] = await Promise.all([fetch(url), fetch(storageUrl)])
       if (!r.ok) throw new Error(`snapshots request failed: ${r.status}`)
       const data = await r.json()
       if (!Array.isArray(data)) throw new Error('snapshots response is not an array')
+      const storageData = storageResponse.ok ? await storageResponse.json() : null
+      setStorage(storageData)
       setSnaps(data.map(s => ({
         id: s.id, time: new Date(s.timestamp * 1000).toLocaleString(),
         trigger: s.trigger_mod_name || '', files: s.files_count || 0,
         baseline: !!s.baseline, valid: s.valid !== false,
+        logicalBytes: storageData?.snapshots?.[s.id]?.logical_bytes || 0,
+        exclusiveBytes: storageData?.snapshots?.[s.id]?.exclusive_bytes || 0,
       })))
     } catch (_) { toast('加载快照失败', 'error') }
   }
 
+  const formatBytes = value => {
+    const bytes = Number(value || 0)
+    if (bytes < 1024) return `${bytes} B`
+    const units = ['KiB', 'MiB', 'GiB', 'TiB']
+    let size = bytes
+    let unit = -1
+    do {
+      size /= 1024
+      unit += 1
+    } while (size >= 1024 && unit < units.length - 1)
+    return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unit]}`
+  }
+
   const reconcile = async () => {
     try {
-      const slug = status.game_slug || ''
-      const r = await fetch(`${api}/snapshots/reconcile?game_slug=${encodeURIComponent(slug)}`, { method: 'POST' })
+      const scope = status.game_instance_id || status.game_slug || ''
+      const r = await fetch(`${api}/snapshots/reconcile?game_slug=${encodeURIComponent(scope)}`, { method: 'POST' })
       const d = await r.json()
-      if (d.invalid?.length) toast(`对账完成: ${d.invalid.length}/${d.checked} 个快照已失效(磁盘文件丢失),已标灰`, 'error')
-      else toast(`对账完成: ${d.checked} 个快照全部完好`)
+      if (d.invalid?.length) { emitFeedback('warning', { source: 'snapshot-reconcile', count: d.invalid.length }); toast(`对账完成: ${d.invalid.length}/${d.checked} 个快照已失效(磁盘文件丢失),已标灰`, 'error') }
+      else { emitFeedback('notice', { source: 'snapshot-reconcile' }); toast(`对账完成: ${d.checked} 个快照全部完好`) }
       loadSnaps()
-    } catch (_) { toast('对账失败', 'error') }
+    } catch (_) { emitFeedback('error', { source: 'snapshot-reconcile' }); toast('对账失败', 'error') }
   }
 
   const friendlyErr = (raw) => {
@@ -55,9 +77,9 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
       })
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
-      if (data.error) toast(friendlyErr(data.error), 'error')
-      else { toast('快照已创建: ' + data.snapshot_id); loadSnaps(); onRefresh?.() }
-    } catch (e) { toast('创建失败', 'error') }
+      if (data.error) { emitFeedback('error', { source: 'snapshot' }); toast(friendlyErr(data.error), 'error') }
+      else { emitFeedback('snapshot-complete', { snapshotId: data.snapshot_id }); toast('快照已创建: ' + data.snapshot_id); loadSnaps(); onRefresh?.() }
+    } catch (e) { emitFeedback('error', { source: 'snapshot' }); toast('创建失败', 'error') }
     setActionLock(null)
   }
 
@@ -67,9 +89,9 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
     setActionLock(sid)
     try {
       const r = await fetch(`${api}/snapshots/${sid}/preview`)
-      if (!r.ok) { toast('生成回滚预览失败', 'error'); setActionLock(null); return }
+      if (!r.ok) { emitFeedback('error', { source: 'rollback-preview' }); toast('生成回滚预览失败', 'error'); setActionLock(null); return }
       setRestoreConfirm(await r.json())
-    } catch (_) { toast('生成回滚预览失败', 'error') }
+    } catch (_) { emitFeedback('error', { source: 'rollback-preview' }); toast('生成回滚预览失败', 'error') }
     setActionLock(null)
   }
 
@@ -82,14 +104,18 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
     try {
       const r = await fetch(api + '/tool/snapshot_restore', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ snapshot_id: sid, confirmed: true })
+        body: JSON.stringify({ snapshot_id: sid, confirmed: true, confirmation_token: restoreConfirm?.confirmation_token })
       })
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
-      if (data.error) toast(friendlyErr(data.error), 'error')
-      else {
-        toast(`已回滚: 删除 ${data.deleted ?? 0} 个 · 还原 ${data.restored ?? 0} 个文件`)
-        if (data.warning) toast(data.warning, 'error')
+      if (data.error) { emitFeedback('error', { source: 'rollback' }); toast(friendlyErr(data.error), 'error') }
+      else if (!data.complete) {
+        emitFeedback('warning', { source: 'rollback', snapshotId: sid })
+        toast(data.warning || '回滚后复核仍有差异，未标记为完成', 'error')
+      } else {
+        emitFeedback('rollback-complete', { snapshotId: sid })
+        toast(`已回滚并复核: 删除 ${data.deleted ?? 0} 个 · 复制还原 ${data.restored ?? 0} 个 · 原本一致 ${data.unchanged_verified ?? 0} 个`)
+        if (data.warning) { emitFeedback('warning', { source: 'rollback' }); toast(data.warning, 'error') }
         if (data.mods_cleaned?.length) {
           toast(`已同步清理 ${data.mods_cleaned.length} 条被回滚 mod 的记录`)
         }
@@ -103,7 +129,7 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
           if (bits.length) toast(`工坊订阅同步: ${bits.join(' · ')}`)
         }
       }
-    } catch (e) { toast('回滚失败', 'error') }
+    } catch (e) { emitFeedback('error', { source: 'rollback' }); toast('回滚失败', 'error') }
     setActionLock(null)
   }
 
@@ -112,17 +138,21 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
       const r = await fetch(`${api}/snapshots/${sid}`)
       const data = await r.json()
       setPreview(data)
-    } catch (_) { toast('加载详情失败', 'error') }
+    } catch (_) { emitFeedback('error', { source: 'snapshot-preview' }); toast('加载详情失败', 'error') }
   }
 
   const deleteSnap = async (sid) => {
     setDelConfirm(null)
     setActionLock(sid)
     try {
-      const r = await fetch(`${api}/snapshots/${sid}`, { method: 'DELETE' })
-      if (r.ok) { toast('快照已删除'); loadSnaps(); onRefresh?.() }
-      else toast('删除失败', 'error')
-    } catch (e) { toast('删除失败', 'error') }
+      const previewResponse = await fetch(`${api}/snapshots/${sid}/delete-preview`)
+      if (!previewResponse.ok) throw new Error('delete preview failed')
+      const deletePreview = await previewResponse.json()
+      const token = encodeURIComponent(deletePreview.confirmation_token || '')
+      const r = await fetch(`${api}/snapshots/${sid}?confirmation_token=${token}`, { method: 'DELETE' })
+      if (r.ok) { emitFeedback('remove-complete', { snapshotId: sid }); toast('快照已删除'); loadSnaps(); onRefresh?.() }
+      else { emitFeedback('error', { source: 'snapshot-delete' }); toast('删除失败', 'error') }
+    } catch (e) { emitFeedback('error', { source: 'snapshot-delete' }); toast('删除失败', 'error') }
     setActionLock(null)
   }
 
@@ -131,6 +161,22 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
       <div className="flex items-center justify-between px-4 py-3 border-b border-surface-600">
         <h2 className="text-base font-semibold flex items-center gap-2">
           <Camera size={16} className="text-cyber-purple" /> 快照历史
+          {storage && (
+            <span
+              className="px-2 py-0.5 rounded text-[10px] font-normal bg-cyber-purple/10 text-cyber-purple border border-cyber-purple/25"
+              title={`普通目录统计会显示 ${formatBytes(storage.logical_bytes)}；硬链接去重后的实际数据约 ${formatBytes(storage.deduplicated_bytes)}`}
+            >
+              实际占用约 {formatBytes(storage.deduplicated_bytes)}
+            </span>
+          )}
+          {storage?.orphan_snapshot_count > 0 && (
+            <span
+              className="px-2 py-0.5 rounded text-[10px] font-normal bg-cyber-yellow/10 text-cyber-yellow border border-cyber-yellow/25"
+              title="旧版本遗留在磁盘、但已不在快照账本中的目录；当前不会自动删除，以免误删尚需恢复的数据。"
+            >
+              磁盘残留 {storage.orphan_snapshot_count} 份
+            </span>
+          )}
         </h2>
         <div className="flex gap-2">
           <button className="btn-ghost" onClick={reconcile} title="校验每个快照的磁盘文件是否还在,失效的标灰并禁用回滚">
@@ -164,7 +210,15 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
               </div>
             </div>
             <div className="flex items-center gap-4">
-              <span className="text-xs text-surface-500">{snap.baseline ? '原版' : `${snap.files} 文件`}</span>
+              <span
+                className="text-xs text-surface-500 text-right"
+                title={`本快照逻辑大小 ${formatBytes(snap.logicalBytes)}；单独删除预计释放 ${formatBytes(snap.exclusiveBytes)}。共享数据会在最后一个引用快照删除后释放。`}
+              >
+                {snap.baseline ? '原版' : `${snap.files} 文件`}
+                <span className="block text-[10px] text-surface-600">
+                  新增占用约 {formatBytes(snap.exclusiveBytes)}
+                </span>
+              </span>
               <button onClick={() => showPreview(snap.id)} className="btn-ghost p-1.5" title="预览" disabled={!snap.valid}>
                 <Eye size={14} />
               </button>
@@ -216,6 +270,11 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
             {restoreConfirm.domain_sniffed && (
               <div className="mb-3 px-3 py-2 rounded-md bg-cyber-yellow/10 border border-cyber-yellow/30 text-xs text-cyber-yellow">
                 该游戏为开放模式:快照范围由目录名自动推测(未经人工核对)。请逐条检查"将删除"清单,确认里面没有你的存档或个人文件。
+              </div>
+            )}
+            {restoreConfirm.external_configs?.action_count > 0 && (
+              <div className="rounded border border-cyber-yellow/30 bg-cyber-yellow/5 p-2 text-xs text-surface-300">
+                用户配置：将处理 {restoreConfirm.external_configs.action_count} 个 Documents/AppData 配置文件
               </div>
             )}
             <div className="space-y-3">

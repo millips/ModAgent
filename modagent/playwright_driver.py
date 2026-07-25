@@ -185,7 +185,10 @@ def click(
                 "label": label,
             }
         locator.click(timeout=10000)
-        page.wait_for_timeout(900)
+        # Nexus free downloads begin after a visible three-second countdown.
+        # Keep the listener alive until the delayed browser event arrives.
+        wait_ms = 6500 if re.search(r"slow\s*download", label or "", re.I) else 1200
+        page.wait_for_timeout(wait_ms)
         return {
             "status": "clicked",
             "driver": "playwright",
@@ -194,6 +197,87 @@ def click(
         }
     except Exception as exc:
         return {"status": "failed", "error": str(exc)}
+    finally:
+        if runtime:
+            runtime.stop()
+
+
+def click_download_control(
+    cdp_port: int, url: str, stage: str, capture_dir: str,
+) -> dict:
+    """Fallback for Nexus controls that reject or lose raw CDP mouse events.
+
+    Unlike the general browser tool this helper stays inside the downloader,
+    keeps a download listener alive through Nexus' free-account countdown and
+    writes the captured file into the downloader's own staging directory.
+    """
+    if not available():
+        return {"status": "unavailable", "clicked": False}
+    runtime = browser = None
+    downloads: list[str] = []
+    try:
+        runtime, browser = _connect(cdp_port)
+        page = _find_page(browser, url)
+        if not page:
+            # A Manual click can rewrite the query string. Match the stable mod
+            # page portion before giving up.
+            marker = str(url).split("?", 1)[0]
+            page = next((
+                candidate
+                for context in browser.contexts for candidate in context.pages
+                if candidate.url.split("?", 1)[0] == marker
+            ), None)
+        if not page:
+            return {"status": "page_not_found", "clicked": False}
+        page.set_default_timeout(8000)
+        Path(capture_dir).mkdir(parents=True, exist_ok=True)
+
+        def on_download(download):
+            suggested = re.sub(
+                r'[<>:"/\\|?*\x00-\x1f]', "_",
+                download.suggested_filename or "nexus-download.bin",
+            )
+            target = Path(capture_dir) / suggested
+            stem, suffix = target.stem, target.suffix
+            counter = 2
+            while target.exists():
+                target = Path(capture_dir) / f"{stem}_{counter}{suffix}"
+                counter += 1
+            download.save_as(target)
+            downloads.append(str(target.resolve()))
+
+        page.on("download", on_download)
+        labels = {
+            "slow": re.compile(r"^\s*slow\s*download\s*$", re.I),
+            "manual": re.compile(r"^\s*manual(?:\s+download)?\s*$", re.I),
+            "intermediate": re.compile(r"^\s*(?:continue|download|download anyway|next)\s*$", re.I),
+            "files": re.compile(r"^\s*files(?:\s+\d+)?\s*$", re.I),
+        }
+        pattern = labels.get(stage)
+        if not pattern:
+            return {"status": "unsupported_stage", "clicked": False}
+        locator = page.get_by_text(pattern, exact=True)
+        visible = []
+        for index in range(min(locator.count(), 12)):
+            item = locator.nth(index)
+            try:
+                if item.is_visible() and item.is_enabled():
+                    visible.append(item)
+            except Exception:
+                continue
+        if not visible:
+            return {"status": "target_missing", "clicked": False}
+        target = visible[0]
+        target.scroll_into_view_if_needed()
+        target.click(timeout=8000)
+        # Slow download has a visible countdown before the browser event.
+        page.wait_for_timeout(8500 if stage == "slow" else 1800)
+        return {
+            "status": "clicked", "clicked": True,
+            "downloads": downloads, "url": page.url,
+        }
+    except Exception as exc:
+        return {"status": "failed", "clicked": False, "error": str(exc)[:300]}
     finally:
         if runtime:
             runtime.stop()

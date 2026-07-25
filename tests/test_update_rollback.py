@@ -38,14 +38,18 @@ originals = {
 
 
 async def fake_download_mod(**kwargs):
-    return {"local_path": os.path.join(TMP, "new.zip")}
+    archive = os.path.join(TMP, "new.zip")
+    with open(archive, "wb") as handle:
+        handle.write(b"test archive")
+    return {"local_path": archive}
 
 
 tools.nexus.get_main_file = lambda *args, **kwargs: {"file_id": 20, "version": "2.0"}
 tools.downloader.download_mod = fake_download_mod
 tools.snapshot.snapshot_create = lambda *args, **kwargs: "update-snapshot"
 tools.snapshot.snapshot_restore = lambda sid: {
-    "deleted": 1, "restored": 1, "failed": {"delete": [], "restore": []}
+    "complete": True, "deleted": 1, "restored": 1,
+    "failed": {"delete": [], "restore": []}
 }
 tools.installer.uninstall_mod = lambda *args, **kwargs: {"removed": ["old.pak"], "errors": []}
 tools.installer.install_mod = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("broken archive"))

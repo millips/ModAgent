@@ -23,6 +23,16 @@ _SNAP_RE = re.compile(r"snap_\d{8}_\d{6}(?:_\d+)?")
 _WINPATH_RE = re.compile(r"[A-Za-z]:\\[^\s\"'；;，,。、）)\u4e00-\u9fff]+")
 # "12/12" 这类完成计数
 _COUNT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+_UNFINISHED_ACTION_RE = re.compile(
+    r"(?:我(?:现在|接下来|这就|马上|再|来|会)|先)"
+    r"[^。！？\n]{0,24}"
+    r"(?:查|搜索|搜一下|核对|检查|验证|下载|安装|处理|尝试|读取|打开)",
+    re.IGNORECASE,
+)
+_CONDITIONAL_ACTION_RE = re.compile(
+    r"(?:你|用户)(?:确认|选择|提供|告诉)|确认后|如果你|是否要|要不要|请选择",
+    re.IGNORECASE,
+)
 
 
 def _collect_strings(obj, out: list) -> None:
@@ -135,6 +145,27 @@ def validate_report(
                         "count_mismatch", f"{done}/{total}", "完成数大于总数"))
 
     return ValidationResult(ok=not violations, violations=violations)
+
+
+def check_unfulfilled_action_promise(report_text: str) -> bool:
+    """Reject a final answer that merely promises another tool-capable step."""
+    text = str(report_text or "")
+    if not _UNFINISHED_ACTION_RE.search(text):
+        return False
+    # A clearly conditional next action after a user confirmation/input is a
+    # legitimate stopping point, not an empty promise.
+    return not bool(_CONDITIONAL_ACTION_RE.search(text))
+
+
+def build_action_promise_correction_message() -> dict:
+    return {
+        "role": "user",
+        "content": (
+            "[系统纠偏] 你正准备把“接下来再查/再搜/再处理”作为最终回复，"
+            "但这些步骤可以由当前工具立即执行。不要输出进度承诺；现在直接调用所需工具，"
+            "完成后一次性汇报真实结果。只有确实缺少用户输入或需要危险操作确认时才能停下提问。"
+        ),
+    }
 
 
 def build_correction_message(result: ValidationResult) -> dict:
@@ -379,7 +410,7 @@ STATE_QUERY_WORDS = [
 STATE_QUERY_TOOLS = {
     "get_installed", "snapshot_list",
     "nexus_get_detail", "read_readme", "conflict_check",
-    "scan_existing_mods", "nexus_search",
+    "scan_existing_mods", "mod_source_align", "mod_update_check", "nexus_search",
 }
 
 # —— 断言闸:回答里出现"数量/存在性/版本"断言的特征 ——

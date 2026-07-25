@@ -63,16 +63,14 @@ def _match_game_catalog(game_name: str, games) -> dict | None:
         if overlap >= required:
             exact = int(_normalise_game_name(title).casefold()
                         == _normalise_game_name(game_name).casefold())
-            candidates.append((
-                exact, overlap, slug, title, int(item.get("id") or 0)
-            ))
+            candidates.append((exact, overlap, slug, title))
     if not candidates:
         return None
-    _, _, slug, title, game_id = max(candidates)
+    _, _, slug, title = max(candidates)
     return {
         "status": "available",
         "slug": slug,
-        "game_id": game_id,
+        "game_id": int(item.get("id") or 0),
         "evidence": f"Nexus API games catalogue: {title}",
         "reason": "verified in Nexus official game catalogue",
     }
@@ -209,7 +207,12 @@ def resolve_game_id(game_slug: str, api_key: str) -> int:
 
 
 def search(query: str, game_slug: str, api_key: str, cdp_port: int = 18888, game_id: int = 0, tavily_key: str = "") -> list[dict]:
-    """搜索 Nexus Mods。Tavily → CDP → API Cache 三层回退。"""
+    """Search Nexus through independent routes without making CDP a choke point.
+
+    Web search is best for discovery, the API cache is deterministic, and CDP
+    is the last fallback because login challenges/page redesigns are the least
+    reliable part of the chain.
+    """
     if not (game_slug or "").strip():
         raise ValueError("game_mapping_missing: Nexus game slug is empty")
 
@@ -219,13 +222,21 @@ def search(query: str, game_slug: str, api_key: str, cdp_port: int = 18888, game
         if result:
             return result
 
-    # 2. CDP simulated search
+    api_error = None
+    try:
+        result = _search_api(query, game_slug, api_key, game_id)
+        if result:
+            return result
+    except NexusSearchUnavailable as exc:
+        api_error = exc
+
+    # CDP is an adaptive final route, not a prerequisite for ordinary search.
     result = _search_cdp(query, game_slug, api_key, cdp_port, game_id)
     if result and not (len(result) == 1 and result[0].get("error")):
         return result
-
-    # 3. API cache index
-    return _search_api(query, game_slug, api_key, game_id)
+    if api_error:
+        raise api_error
+    return []
 
 
 def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
@@ -497,7 +508,7 @@ def _search_cdp(query: str, game_slug: str, api_key: str, cdp_port: int, game_id
         results = asyncio.run(downloader.search_via_cdp(query, game_slug, game_id, cdp_port))
         return results
     except RuntimeError as e:
-        return [{"name": f"Chrome 未启动: {e}", "mod_id": 0, "error": str(e)}]
+        return [{"name": f"浏览器自动化不可用: {e}", "mod_id": 0, "error": str(e)}]
     except Exception as e:
         return [{"name": f"搜索失败: {e}", "mod_id": 0, "error": str(e)}]
 
@@ -511,7 +522,7 @@ def get_mod(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888) ->
             info = _get_mod_via_cdp(mod_id, game_slug, cdp_port)
             if info:
                 return info
-            raise RuntimeError(f"获取 Mod {mod_id} 详情失败：HTTP {e.code}（成人内容受 API 限制；如已在 Chrome 登录 Nexus 仍失败，可直接用 mod_id 下载）")
+            raise RuntimeError(f"获取 Mod {mod_id} 详情失败：HTTP {e.code}（成人内容受 API 限制；如已在 ModAgent 浏览器登录 Nexus 仍失败，可直接用 mod_id 下载）")
         raise
 
 

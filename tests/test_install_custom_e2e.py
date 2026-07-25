@@ -72,7 +72,9 @@ check("B1 custom mod recorded in DB", len(custom_mods) == 1
 check("B2 domain persisted", LOC_REL in db.get_custom_domain_files("palworld"))
 
 # 端到端回滚:回到安装前 → 游戏原文件还原成 ORIGINAL(铁律6 在真实工具路径成立)
-rb = json.loads(tools.execute("snapshot_restore", {"snapshot_id": snap_id}, cfg))
+preview = json.loads(tools.execute("snapshot_restore", {"snapshot_id": snap_id}, cfg))
+rb = json.loads(tools.execute("snapshot_restore", {"snapshot_id": snap_id, "confirmed": True,
+                                                     "confirmation_token": preview["confirmation_token"]}, cfg))
 check("A5 rollback restored ORIGINAL game file", open(LOC).read() == "ORIGINAL",
       f"content={open(LOC).read()!r}, rb={rb}")
 

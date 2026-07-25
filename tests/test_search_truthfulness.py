@@ -32,7 +32,14 @@ originals = {
 }
 
 try:
-    nexus.discover_game = lambda name, key="", nexus_key="": {
+    sf6 = nexus._match_game_catalog("Street Fighter™ 6", [
+        {"name": "Street Fighter 6", "domain_name": "streetfighter6"},
+        {"name": "Street Fighter V", "domain_name": "streetfighterv"},
+    ])
+    check("A0 official Nexus catalogue resolves the correct sequel",
+          sf6 and sf6["slug"] == "streetfighter6")
+
+    nexus.discover_game = lambda name, tavily_key="", nexus_api_key="": {
         "status": "available",
         "slug": "generic-unknown-game",
         "evidence": "https://www.nexusmods.com/games/generic-unknown-game",
@@ -42,12 +49,12 @@ try:
     thunderstore.find_community = lambda name: None
     gamebanana.find_game = lambda name: None
     github.search = lambda q, game, limit=5: []
-    nexus.search = lambda q, slug, key, **kwargs: []
+    nexus.search = lambda q, slug, key: []
     nexus.resolve_deps = lambda mid, slug, key: []
 
     sources._SRC_CACHE.clear()
     found = sources.available_sources(
-        "Unknown Game", "", "X:/Games/Unknown", "tvly-key")
+        "Unknown Game", "", "X:/Games/Unknown", "tvly-key", "nexus-key")
     check("A1 unknown game dynamically resolves Nexus",
           found["nexus"] == "generic-unknown-game")
     check("A2 discovery evidence retained",

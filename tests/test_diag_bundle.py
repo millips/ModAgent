@@ -21,13 +21,11 @@ def w(path, data):
 # 造游戏 + 框架日志(日志里故意混入一个疑似 key,测 _scrub 兜底)
 G = os.path.join(TMP, "REPO")
 NEXUS_KEY = "abcdef0123456789abcdef0123456789abcdef01"   # 40 位十六进制,像 Nexus key
-# Assemble synthetic secret-shaped fixtures at runtime to avoid repository scanner false positives.
-LLM_KEY = "sk-" + "proj-" + "SYNTHETICLLMVALUE1234567890"
-TAVILY_KEY = "tvly-" + "syntheticvalue123def456"
+LLM_KEY = "sk-proj-SUPERSECRETLLMKEY1234567890"
 w(os.path.join(G, "BepInEx", "LogOutput.log"),
   f"[Info] starting\n[Error] leaked token in log: {LLM_KEY}\n[Info] done")
 
-cfg = Config(nexus_api_key=NEXUS_KEY, llm_api_key=LLM_KEY, tavily_api_key=TAVILY_KEY,
+cfg = Config(nexus_api_key=NEXUS_KEY, llm_api_key=LLM_KEY, tavily_api_key="tvly-xyz789abc123def456",
              game_slug="repo", game_root=G)
 mods = [InstalledMod(id="m1", name="MoreHead", version="1.5", snapshot_id="",
                      installed_by="modagent", game_slug="repo")]
@@ -64,7 +62,7 @@ def leaked(secret):
     return [n for n, b in blobs.items() if secret in b]
 check("D1 nexus key nowhere in bundle", not leaked(NEXUS_KEY), f"leaked in {leaked(NEXUS_KEY)}")
 check("D2 llm key nowhere in bundle", not leaked(LLM_KEY), f"leaked in {leaked(LLM_KEY)}")
-check("D3 tavily key nowhere in bundle", not leaked(TAVILY_KEY))
+check("D3 tavily key nowhere in bundle", not leaked("tvly-xyz789abc123def456"))
 # _scrub 兜底:日志里混入的 key 也被抹(证明不止靠字段名脱敏)
 check("D4 scrub caught key in log body",
       "***REDACTED***" in blobs[[n for n in names if n.startswith("logs/")][0]])

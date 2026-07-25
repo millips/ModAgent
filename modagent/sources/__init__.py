@@ -105,9 +105,12 @@ def available_sources(game_name: str, game_slug: str, game_root: str,
         return gamebanana.find_game(game_name)
     ex = cf.ThreadPoolExecutor(max_workers=2)
     futs = {"thunderstore": ex.submit(_ts), "gamebanana": ex.submit(_gb)}
+    done, not_done = cf.wait(list(futs.values()), timeout=5)
     for k, f in futs.items():
         try:
-            out[k] = f.result(timeout=4) or None
+            if f in not_done:
+                raise TimeoutError("source probe exceeded 5 seconds")
+            out[k] = f.result() or None
             if out[k]:
                 out["source_status"][k] = {
                     "status": "available",

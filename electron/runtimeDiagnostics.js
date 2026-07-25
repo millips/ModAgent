@@ -1,6 +1,38 @@
 const fs = require('fs');
 const path = require('path');
 
+const SECRET_KEY_PATTERN = '(?:api[_-]?key|token|authorization|secret|password|cookie)';
+
+function redactDiagnosticText(input) {
+  let text = String(input || '');
+  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [REDACTED]');
+  text = text.replace(
+    new RegExp(`("?${SECRET_KEY_PATTERN}"?\\s*[:=]\\s*)("[^"\\r\\n]*"|[^\\s,;]+)`, 'gi'),
+    '$1"[REDACTED]"',
+  );
+  text = text.replace(/\b(?:sk|tvly|nxs)_[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]');
+  text = text.replace(/([?&](?:key|token|api_key|access_token)=)[^&\s]+/gi, '$1[REDACTED]');
+  return text;
+}
+
+function buildDiagnosticReport({ diagnostics, productName, version, edition }) {
+  const sections = [
+    `${productName} ${version}`,
+    `Generated: ${new Date().toISOString()}`,
+    `Edition: ${edition}`,
+  ];
+  for (const filename of ['desktop.log', 'updater.log']) {
+    const filePath = path.join(diagnostics.logsDir, filename);
+    if (fs.existsSync(filePath)) {
+      sections.push(`\n===== ${filename} =====\n${fs.readFileSync(filePath, 'utf8').slice(-500000)}`);
+    }
+  }
+  if (fs.existsSync(diagnostics.stateFile)) {
+    sections.push(`\n===== runtime-state.json =====\n${fs.readFileSync(diagnostics.stateFile, 'utf8')}`);
+  }
+  return redactDiagnosticText(sections.join('\n'));
+}
+
 function atomicWriteJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.tmp`;
@@ -126,4 +158,4 @@ function createRuntimeDiagnostics({ dataDir, edition, productName, version }) {
   };
 }
 
-module.exports = { createRuntimeDiagnostics };
+module.exports = { createRuntimeDiagnostics, redactDiagnosticText, buildDiagnosticReport };

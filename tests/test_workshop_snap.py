@@ -88,7 +88,9 @@ db.add_mod(db.InstalledMod(id="ws_555", name="Workshop 555", version="", snapsho
 from modagent import tools
 cfg = types.SimpleNamespace(nexus_api_key="", game_slug="palworld", game_id=6063,
                             game_root=G, tier="free", chrome_cdp_port=18888)
-r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s0}, cfg))
+preview = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s0}, cfg))
+r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s0, "confirmed": True,
+                                                    "confirmation_token": preview["confirmation_token"]}, cfg))
 check("6 tool returns workshop", r["workshop"]["unsubscribed"] == ["555"])
 check("6 db row cleaned", db.get_mod("ws_555") is None)
 

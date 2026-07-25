@@ -9,6 +9,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Optional, Callable
 
 from .config import CONFIG_DIR
@@ -20,6 +21,63 @@ USER_AGENT = "ModAgent/1.0"
 # 一个统一入口——用户手动下载的 mod 扔进来,ModAgent 扫描→透视→mod_install_custom 安装。
 DROPBOX_DIR = os.path.join(CONFIG_DIR, "dropbox")
 TOOLS_DIR = os.path.join(CONFIG_DIR, "tools")
+STALE_ARCHIVE_DAYS = 7
+STALE_PART_DAYS = 1
+MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024
+
+
+class NexusManualDownloadRequired(RuntimeError):
+    """Nexus requires login, consent, or verification that cannot be automated."""
+
+    def __init__(
+        self, page_url: str, reason: str = "", existing_gate: bool = False,
+        diagnostics: Optional[dict] = None,
+    ):
+        self.page_url = page_url
+        self.reason = reason
+        self.existing_gate = existing_gate
+        self.diagnostics = diagnostics or {}
+        super().__init__(
+            "该 Nexus 文件需要页面确认，页面已保留；其他文件仍可继续处理。"
+            f"{reason}"
+        )
+
+
+class NexusDirectDownloadUnavailable(RuntimeError):
+    """The official API could identify the file but did not issue a CDN URL."""
+
+    def __init__(self, message: str, diagnostics: Optional[dict] = None):
+        self.diagnostics = diagnostics or {}
+        super().__init__(message)
+
+
+_NEXUS_MANUAL_GATES: dict[str, dict] = {}
+_NEXUS_MANUAL_GATE_SECONDS = 30
+
+
+def _nexus_files_page_url(game_slug: str, mod_id: int) -> str:
+    """Use the real Files tab; a bare file_id deep-link no longer hydrates it."""
+    return f"https://www.nexusmods.com/{game_slug}/mods/{int(mod_id)}?tab=files"
+
+
+def _nexus_gate_reason(state: dict, automated_stage: str = "") -> str:
+    """Describe the observed gate without calling a signed-in user logged out."""
+    if state.get("siteDownloadError"):
+        return (
+            "（Nexus 页面自身未生成下载位置："
+            f"{state['siteDownloadError']}；这不是登录状态错误）"
+        )
+    if state.get("login") and not state.get("loggedIn"):
+        return "（检测到 Nexus 尚未登录）"
+    if state.get("adult"):
+        return "（需要确认成人内容显示权限）"
+    if state.get("captcha"):
+        return "（检测到站方人机验证）"
+    return (
+        "（已自动尝试 Files → Manual Download → Slow Download，"
+        "但站方页面尚未产生下载链接；"
+        f"页面状态：{state or automated_stage}）"
+    )
 
 
 def ensure_downloads_dir(game_slug: str) -> str:
@@ -28,10 +86,165 @@ def ensure_downloads_dir(game_slug: str) -> str:
     return path
 
 
+def _download_meta_path(path: str) -> str:
+    return path + ".modagent.json"
+
+
+def _remember_download(path: str, game_slug: str, mod_id: int, file_id) -> None:
+    """持久记录 Nexus 文件身份，让指定 file_id 的重试也能准确命中缓存。"""
+    try:
+        with open(_download_meta_path(path), "w", encoding="utf-8") as f:
+            json.dump({"source": "nexus", "game_slug": game_slug,
+                       "mod_id": str(mod_id), "file_id": str(file_id or "")}, f)
+    except OSError:
+        pass
+
+
+def find_cached_nexus_download(game_slugs, mod_id, file_id=None) -> str:
+    """跨本地/Nexus slug 查缓存；指定 file_id 时只复用同一变体。"""
+    if isinstance(game_slugs, str):
+        game_slugs = [game_slugs]
+    for bucket in dict.fromkeys(str(s) for s in (game_slugs or []) if s):
+        pattern = os.path.join(DOWNLOADS_DIR, bucket, f"{mod_id}_*.zip")
+        for path in sorted(glob.glob(pattern)):
+            if not os.path.isfile(path):
+                continue
+            if file_id is None:
+                return path
+            try:
+                with open(_download_meta_path(path), encoding="utf-8") as f:
+                    meta = json.load(f)
+                if (str(meta.get("mod_id")) == str(mod_id)
+                        and str(meta.get("file_id")) == str(file_id)):
+                    return path
+            except (OSError, ValueError, TypeError):
+                continue
+    return ""
+
+
 def ensure_dropbox_dir(game_slug: str) -> str:
     path = os.path.join(DROPBOX_DIR, game_slug or "_unknown")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def managed_cache_roots() -> list[str]:
+    """Caches owned by ModAgent; deliberately excludes the user dropbox."""
+    data_root = os.path.dirname(os.path.abspath(DOWNLOADS_DIR))
+    return [
+        os.path.abspath(DOWNLOADS_DIR),
+        os.path.join(data_root, "browser-downloads"),
+    ]
+
+
+def _inside(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath(
+            [os.path.normcase(os.path.realpath(path)),
+             os.path.normcase(os.path.realpath(root))]
+        ) == os.path.normcase(os.path.realpath(root))
+    except ValueError:
+        return False
+
+
+def cleanup_installed_archive(archive_path: str) -> dict:
+    """Delete an archive only after installation and only from owned caches."""
+    path = os.path.abspath(str(archive_path or ""))
+    if not path or not os.path.isfile(path):
+        return {"removed": False, "reason": "not_found"}
+    if not any(_inside(path, root) for root in managed_cache_roots()):
+        return {"removed": False, "reason": "user_managed_file"}
+    try:
+        size = os.path.getsize(path)
+        os.remove(path)
+        try:
+            os.remove(_download_meta_path(path))
+        except OSError:
+            pass
+        return {"removed": True, "bytes_freed": size, "path": path}
+    except OSError as exc:
+        return {"removed": False, "reason": str(exc), "path": path}
+
+
+def cleanup_stale_downloads(
+    now: float | None = None,
+    archive_days: int = STALE_ARCHIVE_DAYS,
+    part_days: int = STALE_PART_DAYS,
+    max_bytes: int = MAX_CACHE_BYTES,
+) -> dict:
+    """Bound cache age and size without touching files outside owned roots."""
+    now = time.time() if now is None else now
+    entries = []
+    orphan_metadata = []
+    for root in managed_cache_roots():
+        if not os.path.isdir(root):
+            continue
+        for current, _, files in os.walk(root):
+            for filename in files:
+                path = os.path.join(current, filename)
+                if filename.lower().endswith(".modagent.json"):
+                    archive_path = path[:-len(".modagent.json")]
+                    if not os.path.isfile(archive_path):
+                        try:
+                            os.remove(path)
+                            orphan_metadata.append(path)
+                        except OSError:
+                            pass
+                        continue
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                entries.append({
+                    "path": path,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "part": filename.lower().endswith(".part"),
+                })
+
+    removed = []
+    kept = []
+    for item in entries:
+        limit_days = part_days if item["part"] else archive_days
+        if now - item["mtime"] > limit_days * 86400:
+            try:
+                os.remove(item["path"])
+                removed.append(item)
+            except OSError:
+                kept.append(item)
+        else:
+            kept.append(item)
+
+    total = sum(item["size"] for item in kept)
+    if total > max_bytes:
+        for item in sorted(kept, key=lambda value: value["mtime"]):
+            if total <= max_bytes:
+                break
+            try:
+                os.remove(item["path"])
+                total -= item["size"]
+                removed.append(item)
+            except OSError:
+                continue
+    removed_dirs = 0
+    for root in managed_cache_roots():
+        if not os.path.isdir(root):
+            continue
+        for current, dirs, _ in os.walk(root, topdown=False):
+            for dirname in dirs:
+                path = os.path.join(current, dirname)
+                try:
+                    os.rmdir(path)
+                    removed_dirs += 1
+                except OSError:
+                    pass
+    return {
+        "removed_files": len(removed) + len(orphan_metadata),
+        "bytes_freed": sum(item["size"] for item in removed),
+        "remaining_bytes": total,
+        "orphan_metadata_removed": len(orphan_metadata),
+        "empty_directories_removed": removed_dirs,
+    }
 
 
 def ensure_tools_dir() -> str:
@@ -115,7 +328,7 @@ def extract_external_tool(archive_path: str, display_name: str = "") -> dict:
 # ── Preflight ──
 
 def preflight_check(cdp_port: int, api_key: str) -> str:
-    """验证 Chrome CDP + Nexus 标签页 + API Key。返回 webSocketDebuggerUrl。"""
+    """验证 Chromium CDP + Nexus 标签页 + API Key。返回 WebSocket URL。"""
     if not api_key:
         raise RuntimeError("未配置 Nexus API Key，请在设置中填写")
 
@@ -125,16 +338,16 @@ def preflight_check(cdp_port: int, api_key: str) -> str:
         ).read())
     except Exception:
         raise RuntimeError(
-            "Chrome CDP 未开启。请先启动 Chrome:\n"
-            f'chrome.exe --remote-debugging-port={cdp_port} --user-data-dir="%TEMP%\\chr_cdp"'
+            "浏览器自动化服务未启动。ModAgent 支持 Microsoft Edge、"
+            "Google Chrome 和 Brave；请重启 ModAgent 后重试。"
         )
 
     if not isinstance(tabs, list):
-        raise RuntimeError("Chrome CDP 返回异常数据")
+        raise RuntimeError("浏览器 CDP 返回异常数据")
 
     nexus_tab = next((t for t in tabs if "nexusmods.com" in t.get("url", "")), None)
     if not nexus_tab:
-        raise RuntimeError("请在 Chrome 中打开任意 Nexus Mods 页面并登录")
+        raise RuntimeError("请在 ModAgent 打开的浏览器中打开 Nexus Mods 页面并登录")
 
     ws = nexus_tab.get("webSocketDebuggerUrl")
     if not ws:
@@ -234,6 +447,91 @@ def get_mod_info(mod_id: int, game_slug: str, api_key: str) -> dict:
 
 
 # ── Step 2: 获取 CDN 直链 ──
+
+def get_download_url_api(
+    game_slug: str, mod_id: int, file_id: int, api_key: str,
+) -> str:
+    """Ask the official Nexus API for a signed CDN URL.
+
+    This is the clean direct path for accounts entitled to API downloads.
+    Free accounts commonly receive 403 and must continue through the website;
+    that expected refusal is preserved as structured diagnostics.
+    """
+    url = (
+        f"https://api.nexusmods.com/v1/games/{game_slug}/mods/{int(mod_id)}"
+        f"/files/{int(file_id)}/download_link.json"
+    )
+    req = urllib.request.Request(url, headers={
+        "apikey": api_key,
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+        "Application-Name": "ModAgent",
+        "Application-Version": "1.3.0",
+    })
+    try:
+        with urllib.request.urlopen(
+            req, context=ssl._create_unverified_context(), timeout=20,
+        ) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            content_type = response.headers.get("Content-Type", "")
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        diagnostics = {
+            "path": "official_api",
+            "http_status": int(exc.code),
+            "content_type": exc.headers.get("Content-Type", ""),
+            "response_kind": "json" if raw.lstrip().startswith(("{", "[")) else "text",
+            "premium_or_site_flow_required": int(exc.code) in {401, 403},
+        }
+        try:
+            data = json.loads(raw)
+            message = (
+                data.get("message") if isinstance(data, dict) else ""
+            ) or ""
+            if message:
+                diagnostics["message"] = str(message)[:300]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        raise NexusDirectDownloadUnavailable(
+            f"Nexus 官方下载接口返回 HTTP {exc.code}",
+            diagnostics,
+        ) from exc
+    except Exception as exc:
+        raise NexusDirectDownloadUnavailable(
+            f"Nexus 官方下载接口请求失败：{type(exc).__name__}",
+            {"path": "official_api", "transport_error": type(exc).__name__},
+        ) from exc
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise NexusDirectDownloadUnavailable(
+            "Nexus 官方下载接口没有返回 JSON",
+            {
+                "path": "official_api",
+                "http_status": status,
+                "content_type": content_type,
+                "response_kind": "non_json",
+            },
+        ) from exc
+    rows = data if isinstance(data, list) else [data]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cdn = row.get("URI") or row.get("uri") or row.get("url") or row.get("URL")
+        if isinstance(cdn, str) and cdn.startswith(("http://", "https://")):
+            return cdn
+    raise NexusDirectDownloadUnavailable(
+        "Nexus 官方下载接口未返回 CDN 地址",
+        {
+            "path": "official_api",
+            "http_status": status,
+            "content_type": content_type,
+            "response_kind": type(data).__name__,
+        },
+    )
+
 
 async def get_download_url(ws_url: str, file_id: int, game_id: int) -> str:
     """在已登录的 Chrome 页面内执行 fetch，获取 CDN 直链。不导航页面，复用已有 Nexus 标签。
@@ -335,10 +633,427 @@ async def _cdp_eval(ws, expr: str, msg_id: int, await_promise: bool = False, tim
             return result.get("value") if isinstance(result, dict) else None
 
 
+async def _cdp_trusted_click(
+    ws, x: float, y: float, msg_id: int, timeout: float = 10
+) -> bool:
+    """Click rendered coordinates with trusted CDP mouse events.
+
+    Nexus ignores synthetic ``element.click()`` in some download flows.  A
+    browser-level mouse event follows the same path as a real user click while
+    still leaving login, CAPTCHA and adult-content consent to the user.
+    """
+    commands = (
+        ("mouseMoved", {}),
+        ("mousePressed", {"button": "left", "clickCount": 1}),
+        ("mouseReleased", {"button": "left", "clickCount": 1}),
+    )
+    for offset, (event_type, extra) in enumerate(commands):
+        command_id = msg_id + offset
+        await ws.send(json.dumps({
+            "id": command_id,
+            "method": "Input.dispatchMouseEvent",
+            "params": {
+                "type": event_type,
+                "x": float(x),
+                "y": float(y),
+                **extra,
+            },
+        }))
+        while True:
+            message = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+            if message.get("id") != command_id:
+                continue
+            if message.get("error"):
+                return False
+            break
+    return True
+
+
+async def _cdp_navigate(
+    ws, url: str, msg_id: int, timeout: float = 10,
+) -> bool:
+    """Navigate the existing target so Nexus cannot strand us in a popup tab."""
+    await ws.send(json.dumps({
+        "id": msg_id,
+        "method": "Page.navigate",
+        "params": {"url": str(url)},
+    }))
+    while True:
+        message = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+        if message.get("id") != msg_id:
+            continue
+        return not bool(message.get("error"))
+
+
+async def _cdp_command(
+    ws, method: str, params: dict, msg_id: int, timeout: float = 10,
+) -> dict:
+    """Send a non-evaluate CDP command while ignoring unrelated page events."""
+    await ws.send(json.dumps({
+        "id": msg_id,
+        "method": method,
+        "params": params,
+    }))
+    while True:
+        message = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+        if message.get("id") != msg_id:
+            continue
+        return message
+
+
+async def _nexus_automate_slow_download(
+    ws, file_id: int, cdp_port: int = 0,
+) -> dict:
+    """Drive Nexus' free-account UI and capture the generated CDN URL.
+
+    Nexus changes CSS classes regularly, so selectors intentionally combine
+    stable file-id attributes, href parameters, visible button text, and modal
+    state instead of relying on one class name.
+    """
+    install_capture = r"""
+    (() => {
+      if (window.__modAgentDownloadCaptureInstalled) return true;
+      window.__modAgentDownloadCaptureInstalled = true;
+      window.__modAgentDownloadUrl = '';
+      // Keep Nexus' free/premium choice in this disposable automation tab.
+      // The current site may otherwise open a second target which this CDP
+      // loop cannot observe.
+      const originalWindowOpen = window.open.bind(window);
+      window.open = function(url, target, features) {
+        const href = String(url || '');
+        if (/nexusmods\.com/i.test(href) && /(?:file_id=|download)/i.test(href)) {
+          location.assign(href);
+          return window;
+        }
+        return originalWindowOpen(url, target, features);
+      };
+      const capture = value => {
+        try {
+          const data = typeof value === 'string' ? JSON.parse(value) : value;
+          const item = Array.isArray(data) ? data[0] : data;
+          const url = item && (item.url || item.URL);
+          if (url) window.__modAgentDownloadUrl = url;
+        } catch (_) {}
+      };
+      const originalFetch = window.fetch;
+      window.fetch = async function(...args) {
+        const response = await originalFetch.apply(this, args);
+        try {
+          const requestUrl = typeof args[0] === 'string'
+            ? args[0] : String(args[0]?.url || args[0] || '');
+          if (requestUrl.includes('GenerateDownloadUrl')) {
+            capture(await response.clone().text());
+          }
+        } catch (_) {}
+        return response;
+      };
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__modAgentUrl = String(url || '');
+        return originalOpen.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(...args) {
+        if (this.__modAgentUrl && this.__modAgentUrl.includes('GenerateDownloadUrl')) {
+          this.addEventListener('load', () => capture(this.responseText), { once: true });
+        }
+        return originalSend.apply(this, args);
+      };
+      return true;
+    })()
+    """
+    click_script = f"""
+    (() => {{
+      const fid = {int(file_id)};
+      const visible = el => {{
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+      }};
+      const text = el => (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+      const selector = 'a, button, [role="button"], input[type="button"], input[type="submit"]';
+      const deepQuery = root => {{
+        const found = [];
+        const visit = node => {{
+          if (!node?.querySelectorAll) return;
+          for (const el of node.querySelectorAll('*')) {{
+            if (el.matches?.(selector)) found.push(el);
+            if (el.shadowRoot) visit(el.shadowRoot);
+          }}
+        }};
+        visit(root);
+        return found;
+      }};
+      const all = deepQuery(document).filter(visible);
+      const component = [...document.querySelectorAll('mod-file-download')]
+        .find(el => String(el.getAttribute('file-id') || '') === String(fid));
+      const componentUrl = component?.getAttribute('download-url') || '';
+      const componentLoggedIn = component?.getAttribute('user-is-logged-in') === 'true';
+      if (/^https?:\\/\\//i.test(componentUrl)) {{
+        return {{
+          clicked: false, stage: 'component-url', direct_url: componentUrl,
+          loggedIn: componentLoggedIn, url: location.href
+        }};
+      }}
+      const prepare = (el, stage) => {{
+        const style = getComputedStyle(el);
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+            style.pointerEvents === 'none') {{
+          return {{clicked: false, stage: stage + '-disabled', text: text(el)}};
+        }}
+        // Keep navigation in this CDP target so the capture hook can be
+        // reinstalled on the next document instead of losing a target=_blank tab.
+        if (el.tagName === 'A') el.removeAttribute('target');
+        el.scrollIntoView({{block: 'center', inline: 'center'}});
+        const r = el.getBoundingClientRect();
+        return {{
+          clicked: false, ready_to_click: true, stage, text: text(el),
+          x: r.left + r.width / 2, y: r.top + r.height / 2,
+          href: el.href || ''
+        }};
+      }};
+      const dialogs = all.filter(el =>
+        !!el.closest?.('[role="dialog"], dialog, .modal, .reveal-modal, [class*="modal"]')
+      );
+      // Nexus may expose one Manual button on the page and a second Manual
+      // download link in a dependency dialog. Finish the active dialog first.
+      const actionable = dialogs.length ? dialogs : all;
+      const slow = actionable.find(el => /slow\\s*download/i.test(text(el)));
+      if (slow) return prepare(slow, 'slow');
+      const exact = actionable.find(el => {{
+        const hay = [
+          el.href, el.dataset?.id, el.dataset?.fileId, el.getAttribute('data-file-id'),
+          el.getAttribute('data-id'), el.getAttribute('onclick')
+        ].filter(Boolean).join(' ');
+        return /^(manual|manual\\s+download)$/i.test(text(el)) &&
+               (hay.includes(String(fid)) || location.search.includes('file_id=' + fid));
+      }});
+      const manual = exact || actionable.find(el =>
+        /^(manual|manual\\s+download)$/i.test(text(el))
+      );
+      if (manual) return prepare(manual, 'manual');
+      const files = all.find(el => {{
+        const href = String(el.href || '');
+        return /^files(?:\\s+\\d+)?$/i.test(text(el)) &&
+               /[?&]tab=files(?:&|$)/i.test(href);
+      }});
+      if (files) return prepare(files, 'files');
+      const dialog = document.querySelector('[role="dialog"], .modal, .reveal-modal, [class*="modal"]');
+      if (dialog) {{
+        const intermediate = [...dialog.querySelectorAll('a, button, [role="button"]')]
+          .filter(visible)
+          .find(el => /^(continue|download|download anyway|next)$/i.test(text(el)));
+        if (intermediate) return prepare(intermediate, 'intermediate');
+      }}
+      const body = (document.body?.innerText || '').toLowerCase();
+      const visibleSiteError = /something went wrong|download link for the file could not be retrieved/.test(body)
+        ? 'download-link-not-retrieved' : '';
+      const loginForm = !!document.querySelector(
+        'form[action*="login" i] input[type="password"], input[name="password"], input[autocomplete="current-password"]'
+      );
+      const loggedIn = all.some(el =>
+        /(?:sign\\s*out|log\\s*out|my\\s+profile|download\\s+history)/i.test(text(el))
+      ) || componentLoggedIn;
+      const slowAvailable = all.some(el => /slow\\s*download/i.test(text(el)));
+      const manualAvailable = all.some(el => /^(manual|manual\\s+download)$/i.test(text(el)));
+      return {{
+        clicked: false,
+        stage: slowAvailable || manualAvailable ? 'download-control-visible' : 'blocked',
+        loggedIn,
+        login: !loggedIn && (loginForm || /\\/login(?:[/?#]|$)/i.test(location.pathname)),
+        siteDownloadError: componentUrl.startsWith('#ERROR-')
+          ? componentUrl.slice(1, 160) : visibleSiteError,
+        adult: /adult content|confirm.*age|content blocking/.test(body),
+        captcha: /captcha|verify you are human|cloudflare/.test(body),
+        slowAvailable,
+        manualAvailable,
+        title: document.title,
+        url: location.href
+      }};
+    }})()
+    """
+
+    last_state = None
+    clicked_actions: set[str] = set()
+    unchanged_state_count = 0
+    previous_fingerprint = ""
+    capture_dir = os.path.join(
+        DOWNLOADS_DIR, "_browser_capture", str(int(file_id))
+    )
+    os.makedirs(capture_dir, exist_ok=True)
+    capture_started = time.time()
+    for old_path in glob.glob(os.path.join(capture_dir, "*")):
+        try:
+            if os.path.isfile(old_path):
+                os.remove(old_path)
+        except OSError:
+            pass
+    try:
+        await _cdp_command(
+            ws,
+            "Browser.setDownloadBehavior",
+            {
+                "behavior": "allow",
+                "downloadPath": capture_dir,
+                "eventsEnabled": True,
+            },
+            2099,
+        )
+    except Exception:
+        pass
+    for attempt in range(90):
+        completed_downloads = [
+            path for path in glob.glob(os.path.join(capture_dir, "*"))
+            if os.path.isfile(path)
+            and not path.lower().endswith((".crdownload", ".tmp"))
+            and os.path.getsize(path) > 0
+            and os.path.getmtime(path) >= capture_started - 1
+        ]
+        if completed_downloads:
+            newest = max(completed_downloads, key=os.path.getmtime)
+            return {
+                "url": Path(newest).resolve().as_uri(),
+                "local_path": os.path.abspath(newest),
+                "stage": "browser-download",
+            }
+        # Manual Download commonly performs a full navigation to Nexus'
+        # free/premium choice page. A navigation destroys all page-level
+        # monkey-patches, so reinstall the capture hook before every attempt
+        # and, crucially, before clicking Slow download on the new document.
+        await _cdp_eval(ws, install_capture, 2100 + attempt * 4)
+
+        captured = await _cdp_eval(
+            ws,
+            "window.__modAgentDownloadUrl || ''",
+            2101 + attempt * 4,
+        )
+        if isinstance(captured, str) and captured.startswith(("http://", "https://")):
+            return {"url": captured, "stage": "captured"}
+
+        state = await _cdp_eval(ws, click_script, 2102 + attempt * 4)
+        if isinstance(state, dict):
+            last_state = state
+            direct_url = state.get("direct_url", "")
+            if isinstance(direct_url, str) and direct_url.startswith(("http://", "https://")):
+                return {"url": direct_url, "stage": "component-url"}
+            stage = state.get("stage")
+            action_key = "|".join([
+                str(state.get("url") or ""),
+                str(stage or ""),
+                str(state.get("href") or ""),
+                str(state.get("text") or ""),
+            ])
+            fingerprint = json.dumps({
+                "url": state.get("url"),
+                "stage": stage,
+                "href": state.get("href"),
+                "text": state.get("text"),
+                "captcha": bool(state.get("captcha")),
+                "login": bool(state.get("login")),
+                "siteDownloadError": state.get("siteDownloadError"),
+            }, ensure_ascii=False, sort_keys=True)
+            if fingerprint == previous_fingerprint:
+                unchanged_state_count += 1
+            else:
+                previous_fingerprint = fingerprint
+                unchanged_state_count = 0
+            if state.get("siteDownloadError") and any(
+                "|slow|" in key for key in clicked_actions
+            ):
+                return {
+                    "url": "",
+                    "stage": "site-download-error",
+                    "state": state,
+                }
+            should_click = (
+                state.get("ready_to_click")
+                and stage in {"manual", "slow", "intermediate", "files"}
+                and action_key not in clicked_actions
+            )
+            if should_click:
+                if stage == "files" and state.get("href"):
+                    clicked = await _cdp_navigate(
+                        ws, state["href"], 9000 + attempt * 3,
+                    )
+                else:
+                    clicked = await _cdp_trusted_click(
+                        ws, state.get("x", 0), state.get("y", 0),
+                        9000 + attempt * 3,
+                    )
+                # Some Nexus controls are visible and valid but reject raw CDP
+                # coordinates.  Use Playwright's auto-waiting click as a
+                # downloader-internal fallback instead of asking the user to
+                # click the exact same button by hand.
+                if not clicked and cdp_port:
+                    try:
+                        from . import playwright_driver
+                        fallback = await asyncio.to_thread(
+                            playwright_driver.click_download_control,
+                            cdp_port,
+                            str(state.get("url") or ""),
+                            str(stage or ""),
+                            capture_dir,
+                        )
+                    except Exception as exc:
+                        fallback = {
+                            "status": "failed", "clicked": False,
+                            "error": type(exc).__name__,
+                        }
+                    clicked = bool(fallback.get("clicked"))
+                    state["playwright_fallback"] = fallback.get("status", "")
+                    fallback_downloads = fallback.get("downloads") or []
+                    if fallback_downloads:
+                        newest = max(fallback_downloads, key=os.path.getmtime)
+                        return {
+                            "url": Path(newest).resolve().as_uri(),
+                            "local_path": os.path.abspath(newest),
+                            "stage": "browser-download",
+                        }
+                state["clicked"] = clicked
+                if clicked:
+                    clicked_actions.add(action_key)
+                    unchanged_state_count = 0
+            if not should_click and (
+                (state.get("captcha") and unchanged_state_count >= 12)
+                or (state.get("login") and unchanged_state_count >= 4)
+                or unchanged_state_count >= 16
+            ):
+                return {
+                    "url": "",
+                    "stage": "human-verification" if state.get("captcha") else "no-progress",
+                    "state": state,
+                }
+
+        # Some Nexus layouts expose the final link directly in the modal.
+        direct = await _cdp_eval(
+            ws,
+            r"""(() => {
+              const links = [...document.querySelectorAll('a[href]')];
+              const found = links.map(a => a.href).find(h =>
+                /^https?:/i.test(h) &&
+                (/nexus-cdn/i.test(h) || /premium\.nexusmods/i.test(h) ||
+                 /cf-files\.nexusmods/i.test(h)));
+              return found || '';
+            })()""",
+            2103 + attempt * 4,
+        )
+        if isinstance(direct, str) and direct.startswith(("http://", "https://")):
+            return {"url": direct, "stage": "direct-link"}
+
+        if any("|slow|" in key for key in clicked_actions):
+            await asyncio.sleep(0.25)
+        elif any("|manual|" in key for key in clicked_actions):
+            await asyncio.sleep(0.5)
+        else:
+            await asyncio.sleep(0.75)
+
+    return {"url": "", "stage": "timeout", "state": last_state}
+
+
 async def _find_captured_nexus_download(
     cdp_port: int, game_slug: str, mod_id: int
 ) -> str:
-    """Recover a CDN URL captured after semantic browser interaction."""
+    """Recover a CDN URL captured after the LLM interacted with the kept page."""
     import websockets
 
     try:
@@ -382,12 +1097,39 @@ async def get_download_url_filepage(
     """
     import websockets
 
-    page_url = f"https://www.nexusmods.com/{game_slug}/mods/{mod_id}?tab=files&file_id={file_id}"
+    page_url = _nexus_files_page_url(game_slug, mod_id)
     captured = await _find_captured_nexus_download(cdp_port, game_slug, mod_id)
     if captured:
+        _NEXUS_MANUAL_GATES.pop(game_slug, None)
         return captured
 
-    tab = _open_tab(cdp_port, page_url)
+    gate = _NEXUS_MANUAL_GATES.get(game_slug)
+    reuse_tab = None
+    if gate and time.monotonic() < gate["until"]:
+        same_file = (
+            int(gate.get("mod_id") or 0) == int(mod_id)
+            and int(gate.get("file_id") or 0) == int(file_id)
+        )
+        if same_file:
+            try:
+                tabs = json.loads(urllib.request.urlopen(
+                    f"http://127.0.0.1:{int(cdp_port)}/json/list", timeout=5
+                ).read())
+                reuse_tab = next(
+                    (item for item in tabs if item.get("id") == gate.get("tab_id")),
+                    None,
+                )
+            except Exception:
+                reuse_tab = None
+            _NEXUS_MANUAL_GATES.pop(game_slug, None)
+        # A page waiting for verification belongs to this file only. Keep it
+        # open, but let independent files continue in their own target.
+    if gate and time.monotonic() >= gate["until"]:
+        _NEXUS_MANUAL_GATES.pop(game_slug, None)
+
+    tab = reuse_tab or _open_tab(cdp_port, page_url)
+    created_tab = reuse_tab is None
+    keep_tab = False
     ws_url = tab.get("webSocketDebuggerUrl")
     if not ws_url:
         _close_tab(cdp_port, tab.get("id", ""))
@@ -417,10 +1159,19 @@ async def get_download_url_filepage(
                 f"      body: 'fid={file_id}&game_id={game_id}'"
                 "    }"
                 "  );"
-                "  if (!resp.ok) return JSON.stringify({error: resp.status});"
                 "  const txt = await resp.text();"
+                "  if (!resp.ok) return JSON.stringify({"
+                "    error: resp.status,"
+                "    content_type: resp.headers.get('content-type') || '',"
+                "    cloudflare_challenge: /just a moment|cf-chl|cloudflare/i.test(txt),"
+                "    body_kind: txt.trim().startsWith('<') ? 'html' : 'text'"
+                "  });"
                 "  try { JSON.parse(txt); } catch(_) {"
-                "    return JSON.stringify({bad_body: txt.slice(0, 200), at: location.href});"
+                "    return JSON.stringify({"
+                "      bad_body: true, at: location.href,"
+                "      content_type: resp.headers.get('content-type') || '',"
+                "      body_kind: txt.trim().startsWith('<') ? 'html' : 'text'"
+                "    });"
                 "  }"
                 "  return txt;"
                 "} catch(e) {"
@@ -454,29 +1205,66 @@ async def get_download_url_filepage(
                         continue
                     if "bad_body" in parsed:
                         last_err = (f"GenerateDownloadUrl 返回非 JSON @ {parsed.get('at', '')}: "
-                                    f"{parsed['bad_body']!r}(疑似登录态失效或站方改版)")
+                                    f"类型={parsed.get('body_kind', 'unknown')},"
+                                    f"content-type={parsed.get('content_type', '')}")
                         await asyncio.sleep(3)
                         continue
                     if "error" in parsed:
-                        raise RuntimeError(
-                            f"GenerateDownloadUrl 失败: HTTP {parsed['error']}"
-                            f"(已在文件页上下文内请求;若持续 403,请在浏览器中打开该 mod 的"
-                            f" Files 页手动点一次 Slow download 通过站方校验后重试)")
+                        suffix = (
+                            "（Cloudflare 验证页）"
+                            if parsed.get("cloudflare_challenge") else ""
+                        )
+                        last_err = (
+                            f"GenerateDownloadUrl 返回 HTTP {parsed['error']}{suffix};"
+                            f"content-type={parsed.get('content_type', '')}"
+                        )
+                        break
                     cdn = parsed.get("url") or parsed.get("URL")
                     if cdn:
+                        _NEXUS_MANUAL_GATES.pop(game_slug, None)
                         return cdn
 
                 last_err = (
                     f"未获取到下载链接(原始返回: {value!r})。"
-                    "参数正确时返回 [] 多为站方临时风控(C-4 实测:数分钟后自愈),"
-                    "请等 1-2 分钟重试;或在浏览器打开该 mod 的 Files 页手动点一次"
-                    " Slow download 后再试。"
+                    "当前页面接口没有生成直链，已转入可见页面按钮流程。"
                 )
                 await asyncio.sleep(3)
 
-            raise RuntimeError(last_err or "未获取到下载链接: 未知原因")
+            automated = await _nexus_automate_slow_download(
+                ws, file_id, cdp_port=cdp_port,
+            )
+            automated_url = automated.get("url", "")
+            if automated_url:
+                _NEXUS_MANUAL_GATES.pop(game_slug, None)
+                return automated_url
+
+            state = automated.get("state") or {}
+            browser_diagnostics = {
+                "path": "website",
+                "generate_download_url": last_err or "",
+                "automation_stage": automated.get("stage", ""),
+                "site_download_error": state.get("siteDownloadError", ""),
+                "logged_in": bool(state.get("loggedIn")),
+                "login_required": bool(state.get("login")),
+                "captcha": bool(state.get("captcha")),
+            }
+            keep_tab = True
+            _NEXUS_MANUAL_GATES[game_slug] = {
+                "until": time.monotonic() + _NEXUS_MANUAL_GATE_SECONDS,
+                "page_url": state.get("url") or page_url,
+                "tab_id": tab.get("id", ""),
+                "mod_id": int(mod_id),
+                "file_id": int(file_id),
+            }
+            reason = _nexus_gate_reason(state, automated.get("stage", ""))
+            raise NexusManualDownloadRequired(
+                state.get("url") or page_url,
+                reason,
+                diagnostics=browser_diagnostics,
+            )
     finally:
-        _close_tab(cdp_port, tab.get("id", ""))
+        if not keep_tab and created_tab:
+            _close_tab(cdp_port, tab.get("id", ""))
 
 
 # ── Step 3: 下载文件 ──
@@ -758,10 +1546,10 @@ async def download_mod(
 ) -> dict:
     """完整下载一个 mod 的标准流程（按 SOP）。传入 file_id 可直接下载指定变体。"""
     # 0. 检查本地缓存 — 命中直接返回，不要求开 Chrome
-    cache_pattern = os.path.join(DOWNLOADS_DIR, game_slug, f"{mod_id}_*.zip")
-    cached = glob.glob(cache_pattern)
-    if cached and not file_id:
-        return {"mod_id": mod_id, "local_path": cached[0], "cached": True}
+    cached = find_cached_nexus_download(game_slug, mod_id, file_id)
+    if cached:
+        return {"mod_id": mod_id, "file_id": file_id,
+                "local_path": cached, "cached": True}
 
     # 1. 前置检查 — 真要下载才需要 Chrome
     ws_url = preflight_check(cdp_port, api_key)
@@ -793,10 +1581,26 @@ async def download_mod(
 
     last_err = None
     for attempt in range(6):
-        # 每次都重新生成直链（旧链可能已过期）。
-        # 走"文件页上下文"通路:免费账号必须如此(从首页等其他页请求必 403),Premium 同样兼容。
+        # 每次都重新生成直链（旧链可能已过期）。先走官方 API；
+        # 免费账号被拒时再回落到同一文件页里的 Slow download 流程。
+        cdn_url = ""
+        direct_failure = None
         try:
-            cdn_url = await get_download_url_filepage(cdp_port, game_slug, mod_id, file_id, game_id)
+            cdn_url = get_download_url_api(
+                game_slug, mod_id, file_id, api_key,
+            )
+        except NexusDirectDownloadUnavailable as exc:
+            direct_failure = exc
+
+        try:
+            if not cdn_url:
+                cdn_url = await get_download_url_filepage(
+                    cdp_port, game_slug, mod_id, file_id, game_id,
+                )
+        except NexusManualDownloadRequired as exc:
+            if direct_failure:
+                exc.diagnostics["direct_api"] = direct_failure.diagnostics
+            raise
         except RuntimeError as e:
             last_err = e
             # get_download_url_filepage 已在同一个标签内重试三次。继续外层循环
@@ -818,6 +1622,7 @@ async def download_mod(
 
         # 字节完整 → 再验解压完整性（抓"满大小但内部损坏"）
         if _verify_archive(local_path):
+            _remember_download(local_path, game_slug, mod_id, file_id)
             return {
                 "mod_id": mod_id, "file_id": file_id, "local_path": local_path,
                 "cached": False, "mod_name": mod_name, "version": version,
