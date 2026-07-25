@@ -1,9 +1,16 @@
 import argparse
 import multiprocessing
 import os
+import sys
+
+# A PyInstaller windowed executable can inherit the Windows ANSI code page even
+# when the parent sets PYTHONIOENCODING. Force pipe output to UTF-8 before
+# importing the API, because startup checks may log during module import.
+for stream in (sys.stdout, sys.stderr):
+    if stream is not None and hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 import uvicorn
-
 from modagent.api import app
 
 

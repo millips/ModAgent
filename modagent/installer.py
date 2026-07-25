@@ -5,6 +5,8 @@ import zipfile
 import re
 import tempfile
 import subprocess
+import hashlib
+import uuid
 from typing import Optional
 
 from .config import CONFIG_DIR
@@ -13,6 +15,152 @@ from .config import CONFIG_DIR
 # CNS 等 mod 框架用非锚定子串扫描配置(string.find(name,'dekcns.json')),
 # 原地备份会被当成正经配置产生"重影",且每次覆盖安装都复发。
 BACKUPS_DIR = os.path.join(CONFIG_DIR, "backups")
+
+
+def resolve_managed_game_path(path: str, game_root: str) -> tuple[str, str]:
+    """Resolve a ledger path and fail closed unless it is inside the game root.
+
+    Mod records are persistent input, not an authority boundary.  Old versions,
+    manual database edits, junctions and symlinks can all turn a once-valid
+    absolute path into a path outside the selected game.  Every destructive
+    ledger operation must call this helper immediately before touching disk.
+    """
+    try:
+        raw = os.fspath(path)
+    except TypeError:
+        return "", "记录不是有效文件路径"
+    if not isinstance(raw, str) or not raw.strip():
+        return "", "记录路径为空"
+    if not game_root:
+        return "", "未配置游戏根目录"
+
+    root_abs = os.path.abspath(game_root)
+    root_real = os.path.realpath(root_abs)
+    drive, _ = os.path.splitdrive(root_real)
+    anchor = drive + os.sep if drive else os.path.abspath(os.sep)
+    if os.path.normcase(root_real) == os.path.normcase(anchor):
+        return "", "游戏根目录不能是磁盘根目录"
+
+    candidate = raw if os.path.isabs(raw) else os.path.join(root_abs, raw)
+    candidate_abs = os.path.abspath(candidate)
+    candidate_real = os.path.realpath(candidate_abs)
+    try:
+        within = (
+            os.path.normcase(os.path.commonpath([root_real, candidate_real]))
+            == os.path.normcase(root_real)
+        )
+    except ValueError:
+        within = False
+    if not within or os.path.normcase(candidate_real) == os.path.normcase(root_real):
+        return "", "记录路径越出当前游戏目录"
+    return candidate_abs, ""
+
+
+def _file_fingerprint(path: str) -> tuple[int, str]:
+    """Return size and SHA-256 for an on-disk commit verification."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+def _commit_files_transactionally(operations: list[dict], game_root: str,
+                                  game_slug: str) -> list[dict]:
+    """Stage and atomically commit a complete install plan.
+
+    Every source is copied and hashed before the game directory is changed. Existing
+    destinations are moved into a same-volume rollback area, staged files are then
+    moved into place with ``os.replace``, and every committed file is re-hashed. Any
+    failure restores all previous files and removes newly-created files.
+    """
+    if not operations:
+        return []
+    real_root = os.path.realpath(game_root)
+    seen = set()
+    for operation in operations:
+        src = os.path.realpath(operation["src"])
+        dest = os.path.realpath(operation["dest"])
+        if not os.path.isfile(src):
+            raise RuntimeError(f"安装预检失败，源文件不存在: {operation['src']}")
+        try:
+            if os.path.commonpath([real_root, dest]) != real_root:
+                raise RuntimeError(f"安装预检失败，目标越出游戏目录: {operation['dest']}")
+        except ValueError as exc:
+            raise RuntimeError(f"安装预检失败，目标路径无效: {operation['dest']}") from exc
+        key = os.path.normcase(dest)
+        if key in seen:
+            raise RuntimeError(f"安装预检失败，多个文件映射到同一目标: {operation['dest']}")
+        seen.add(key)
+
+    transaction_root = os.path.join(game_root, f".modagent-transaction-{uuid.uuid4().hex}")
+    stage_root = os.path.join(transaction_root, "stage")
+    rollback_root = os.path.join(transaction_root, "rollback")
+    committed = []
+    moved_originals = []
+    cleanup_transaction = True
+    try:
+        os.makedirs(stage_root, exist_ok=False)
+        os.makedirs(rollback_root, exist_ok=False)
+        for index, operation in enumerate(operations):
+            staged = os.path.join(stage_root, str(index))
+            shutil.copy2(operation["src"], staged)
+            operation["staged"] = staged
+            operation["fingerprint"] = _file_fingerprint(staged)
+
+        for index, operation in enumerate(operations):
+            dest = operation["dest"]
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            existed = os.path.exists(dest)
+            operation["existed"] = existed
+            if existed:
+                _backup_file(dest, game_root, game_slug)
+                rollback = os.path.join(rollback_root, str(index))
+                os.replace(dest, rollback)
+                moved_originals.append((dest, rollback))
+            os.replace(operation["staged"], dest)
+            committed.append(dest)
+            if _file_fingerprint(dest) != operation["fingerprint"]:
+                raise RuntimeError(f"安装落盘复核失败: {dest}")
+
+        installed = []
+        for operation in operations:
+            record = dict(operation.get("record", {}))
+            record["dest"] = operation["dest"]
+            record.setdefault("overwrote", operation["existed"])
+            record["size"] = operation["fingerprint"][0]
+            record["sha256"] = operation["fingerprint"][1]
+            installed.append(record)
+        return installed
+    except Exception as original_error:
+        restore_errors = []
+        for dest in reversed(committed):
+            try:
+                if os.path.exists(dest):
+                    os.remove(dest)
+            except OSError as exc:
+                restore_errors.append(f"无法移除失败提交 {dest}: {exc}")
+        for dest, rollback in reversed(moved_originals):
+            try:
+                if os.path.exists(rollback):
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    os.replace(rollback, dest)
+            except OSError as exc:
+                restore_errors.append(f"无法恢复原文件 {dest}: {exc}")
+        if restore_errors:
+            # Never delete the only remaining copy of an original file. Keeping the
+            # transaction directory makes the failure recoverable and diagnosable.
+            cleanup_transaction = False
+            raise RuntimeError(
+                "安装提交失败且自动恢复不完整；回滚文件已保留在 "
+                f"{transaction_root}: {'; '.join(restore_errors)}"
+            ) from original_error
+        raise
+    finally:
+        if cleanup_transaction:
+            shutil.rmtree(transaction_root, ignore_errors=True)
 
 
 def _backup_file(dest: str, game_root: str, game_slug: str) -> None:
@@ -136,6 +284,11 @@ def _redengine_layout() -> dict:
 # 注意(Palworld):创意工坊 mod 由 Steam 自己下到 steamapps/workshop,不走本 installer;
 # 这里只处理 Nexus 包。未匹配文件进 skipped,不硬装(汉化/系统类落别处的优雅降级)。
 GAME_LAYOUTS = {
+    "stardewvalley": {
+        "patterns": {},
+        "load_order_file": None,
+        "handler": "stardew_smapi",
+    },
     "stellarblade": _ue_layout("SB", extra_patterns={
         # CNS 注册文件 → ~mods 扁平化(CNS 从 ~mods 根递归扫描,见 DekCNS main.lua DekCNS_ScanConfigs)
         r"\.dekcns\.json$": "SB/Content/Paks/~mods/",
@@ -151,6 +304,16 @@ GAME_LAYOUTS = {
         "load_order_subpath": "Skyrim Special Edition",
     },
     "fallout4": _bethesda_layout(("ba2",), ("meshes", "textures")),
+    "finalfantasy7rebirth": {
+        "handler": "ff7r",
+        "patterns": _ue_layout("End")["patterns"],
+        "load_order_file": None,
+    },
+}
+
+_GAME_SLUG_ALIASES = {
+    "local_final_fantasy_vii_rebirth": "finalfantasy7rebirth",
+    "final_fantasy_vii_rebirth": "finalfantasy7rebirth",
 }
 
 
@@ -236,10 +399,236 @@ def _extract_with_7zip(seven_zip: str, archive_path: str, extract_to: str) -> li
 
 
 def get_game_layout(game_slug: str) -> dict:
-    return GAME_LAYOUTS.get(game_slug, {
+    canonical = _GAME_SLUG_ALIASES.get(str(game_slug or "").lower(), game_slug)
+    return GAME_LAYOUTS.get(canonical, {
         "patterns": {},
         "load_order_file": None,
     })
+
+
+def _ff7r_dest(member: str, plugin_roots: set[str], game_root: str) -> Optional[str]:
+    norm = member.replace("\\", "/").lstrip("/")
+    low = norm.lower()
+    if low.startswith("end/"):
+        rel = norm
+    else:
+        first = norm.split("/", 1)[0]
+        if first.lower() in plugin_roots:
+            rel = f"End/Mods/{norm}"
+        elif re.search(r"(?:^|/)(?:dwmapi|xinput1_3|dsound|version|d3d11|winmm)\.dll$", low):
+            rel = f"End/Binaries/Win64/{os.path.basename(norm)}"
+        elif low.endswith((".pak", ".ucas", ".utoc")):
+            rel = f"End/Content/Paks/~mods/{os.path.basename(norm)}"
+        else:
+            return None
+    dest = os.path.normpath(os.path.join(game_root, rel.replace("/", os.sep)))
+    try:
+        if os.path.commonpath([os.path.realpath(game_root), os.path.realpath(dest)]) != os.path.realpath(game_root):
+            return None
+    except ValueError:
+        return None
+    return dest
+
+
+def _install_ff7r(archive_path: str, game_root: str, game_slug: str) -> dict:
+    """FF7 Rebirth：识别 End/ 结构、Dresscode 插件目录、注入器和松散 pak。"""
+    result = {"installed": [], "skipped": [], "errors": []}
+    with tempfile.TemporaryDirectory() as tmp:
+        extract_archive(archive_path, tmp)
+        walk_root = tmp
+        while True:
+            entries = [e for e in os.listdir(walk_root) if e.lower() != "__macosx"]
+            if len(entries) != 1 or not os.path.isdir(os.path.join(walk_root, entries[0])):
+                break
+            candidate = os.path.join(walk_root, entries[0])
+            # End 是游戏结构；直接含 .uplugin 的单目录是插件本体，两者都不能剥。
+            if entries[0].lower() == "end" or any(
+                    f.lower().endswith(".uplugin") for f in os.listdir(candidate)
+                    if os.path.isfile(os.path.join(candidate, f))):
+                break
+            walk_root = candidate
+        members = []
+        for current, _, files in os.walk(walk_root):
+            members.extend(os.path.relpath(os.path.join(current, f), walk_root) for f in files)
+        plugin_roots = {
+            m.replace("\\", "/").split("/", 1)[0].lower()
+            for m in members if m.lower().endswith(".uplugin") and "/" in m.replace("\\", "/")
+        }
+        operations = []
+        for member in members:
+            dest = _ff7r_dest(member, plugin_roots, game_root)
+            if not dest:
+                result["skipped"].append(member)
+                continue
+            operations.append({
+                "src": os.path.join(walk_root, member), "dest": dest,
+                "record": {"file": member},
+            })
+        result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
+    if not result["installed"]:
+        raise RuntimeError("未识别到 FF7 Rebirth 的 End/Mods、注入器或 pak 文件，已停止安装。")
+    return result
+
+
+def _safe_mod_folder_name(value: str, fallback: str = "SMAPI-Mod") -> str:
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(value or "")).strip(" .")
+    return (value or fallback)[:100]
+
+
+def _relative_child_path(path: str, root: str) -> str:
+    """Return a lexical child path while validating its canonical containment.
+
+    Windows can expose the same temporary directory through both a long path and
+    an 8.3 short path (for example ``RunnerAdmin`` and ``RUNNER~1``). Mixing a
+    canonical root with a lexical child makes ``relpath`` manufacture ``..``
+    segments. Keep both operands in their original absolute representation for
+    the relative path, and use real paths only for the containment check.
+    """
+    absolute_path = os.path.abspath(path)
+    absolute_root = os.path.abspath(root)
+    real_path = os.path.normcase(os.path.realpath(absolute_path))
+    real_root = os.path.normcase(os.path.realpath(absolute_root))
+    try:
+        if os.path.commonpath([real_root, real_path]) != real_root:
+            raise ValueError(f"路径越出根目录: {path}")
+    except ValueError as exc:
+        raise ValueError(f"路径不属于指定根目录: {path}") from exc
+
+    relative = os.path.relpath(absolute_path, absolute_root)
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        raise ValueError(f"相对路径越出根目录: {path}")
+    return relative
+
+
+def _is_same_or_child_path(path: str, root: str) -> bool:
+    try:
+        _relative_child_path(path, root)
+        return True
+    except ValueError:
+        return False
+
+
+def _install_stardew_smapi(
+    archive_path: str, game_root: str, game_slug: str,
+) -> dict:
+    """Install complete SMAPI packages below Mods/, preserving manifest roots."""
+    result = {
+        "installed": [], "skipped": [], "errors": [],
+        "handler": "stardew_smapi", "verified_mods": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        extract_archive(archive_path, tmp)
+        manifest_roots = []
+        for current, dirs, files in os.walk(tmp):
+            dirs[:] = [name for name in dirs if name.casefold() != "__macosx"]
+            manifest_name = next(
+                (name for name in files if name.casefold() == "manifest.json"),
+                "",
+            )
+            if not manifest_name:
+                continue
+            manifest_path = os.path.join(current, manifest_name)
+            try:
+                with open(manifest_path, "r", encoding="utf-8-sig") as handle:
+                    manifest = json.load(handle)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"SMAPI manifest.json 无法解析: {manifest_path}: {exc}"
+                ) from exc
+            unique_id = str(manifest.get("UniqueID") or "").strip()
+            name = str(manifest.get("Name") or "").strip()
+            if not unique_id or not name:
+                raise RuntimeError(
+                    f"SMAPI manifest.json 缺少 Name/UniqueID: {manifest_path}"
+                )
+            # Preserve the lexical extraction path. Converting only this side to
+            # realpath can turn it into an 8.3 short path on Windows CI and make
+            # later relpath calculations escape through artificial ``..`` parts.
+            manifest_roots.append((os.path.abspath(current), manifest))
+
+        if not manifest_roots:
+            raise RuntimeError(
+                "Stardew Valley Mod 压缩包中未找到有效的 SMAPI manifest.json；"
+                "已停止安装，未使用 BepInEx 兜底。"
+            )
+
+        manifest_roots.sort(key=lambda item: len(item[0]), reverse=True)
+        used_folders = set()
+        root_targets = {}
+        for manifest_root, manifest in manifest_roots:
+            relative = _relative_child_path(manifest_root, tmp)
+            leaf = "" if relative == "." else os.path.basename(manifest_root)
+            folder = _safe_mod_folder_name(
+                leaf or manifest.get("Name"),
+                str(manifest.get("UniqueID") or "SMAPI-Mod"),
+            )
+            base_folder = folder
+            suffix = 2
+            while folder.casefold() in used_folders:
+                folder = f"{base_folder}-{suffix}"
+                suffix += 1
+            used_folders.add(folder.casefold())
+            root_targets[manifest_root] = folder
+
+        operations = []
+        for current, dirs, files in os.walk(tmp):
+            dirs[:] = [name for name in dirs if name.casefold() != "__macosx"]
+            owner_root = next(
+                (
+                    root for root, _ in manifest_roots
+                    if _is_same_or_child_path(current, root)
+                ),
+                "",
+            )
+            if not owner_root:
+                for filename in files:
+                    result["skipped"].append(
+                        _relative_child_path(os.path.join(current, filename), tmp)
+                    )
+                continue
+            folder = root_targets[owner_root]
+            for filename in files:
+                source = os.path.join(current, filename)
+                relative = _relative_child_path(source, owner_root)
+                destination = os.path.join(game_root, "Mods", folder, relative)
+                operations.append({
+                    "src": source,
+                    "dest": destination,
+                    "record": {
+                        "file": _relative_child_path(source, tmp),
+                        "smapi_unique_id": next(
+                            str(manifest.get("UniqueID") or "")
+                            for root, manifest in manifest_roots
+                            if root == owner_root
+                        ),
+                    },
+                })
+
+        result["installed"] = _commit_files_transactionally(
+            operations, game_root, game_slug
+        )
+
+        for manifest_root, manifest in manifest_roots:
+            folder = root_targets[manifest_root]
+            installed_root = os.path.join(game_root, "Mods", folder)
+            installed_manifest = os.path.join(installed_root, "manifest.json")
+            entry_dll = str(manifest.get("EntryDll") or "").strip()
+            if not os.path.isfile(installed_manifest):
+                raise RuntimeError(
+                    f"SMAPI 安装复核失败，manifest 未落入 Mods/: {installed_manifest}"
+                )
+            if entry_dll and not os.path.isfile(os.path.join(installed_root, entry_dll)):
+                raise RuntimeError(
+                    f"SMAPI 安装复核失败，EntryDll 缺失: {entry_dll}"
+                )
+            result["verified_mods"].append({
+                "name": str(manifest.get("Name") or ""),
+                "unique_id": str(manifest.get("UniqueID") or ""),
+                "version": str(manifest.get("Version") or ""),
+                "folder": folder,
+                "entry_dll": entry_dll,
+            })
+    return result
 
 
 def detect_mod_structure(archive_path: str) -> list[str]:
@@ -300,6 +689,11 @@ def install_mod(
     patterns = layout.get("patterns", {})
     result = {"installed": [], "skipped": [], "errors": []}
 
+    if layout.get("handler") == "ff7r":
+        return _install_ff7r(archive_path, game_root, game_slug)
+    if layout.get("handler") == "stardew_smapi":
+        return _install_stardew_smapi(archive_path, game_root, game_slug)
+
     # 没有 per-game 规则时：走 Thunderstore/BepInEx 通用安装(REPO 等 Unity 游戏)。
     # 由 _install_bepinex 在解压后按真实内容判定:含 BepInEx/ 结构或 plugins/dll 才装,
     # 否则抛"暂不支持",绝不误报安装成功。
@@ -325,6 +719,7 @@ def install_mod(
             result.setdefault("notes", []).append(
                 f"已自动剥离压缩包顶层目录: {os.path.relpath(walk_root, tmp)}")
 
+        operations = []
         for root, _, files in os.walk(walk_root):
             for f in files:
                 full_src = os.path.join(root, f)
@@ -335,18 +730,9 @@ def install_mod(
                     result["skipped"].append(member)
                     continue
 
-                dest_dir = os.path.dirname(dest)
-                os.makedirs(dest_dir, exist_ok=True)
+                operations.append({"src": full_src, "dest": dest, "record": {"file": member}})
 
-                if os.path.exists(dest):
-                    # 覆盖前备份到集中区(C-0:绝不在游戏目录留 .modagent_bak)
-                    _backup_file(dest, game_root, game_slug)
-
-                try:
-                    shutil.copy2(full_src, dest)
-                    result["installed"].append({"file": member, "dest": dest})
-                except Exception as e:
-                    result["errors"].append({"file": member, "error": str(e)})
+        result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
 
     if layout.get("load_order_file"):
         _update_load_order(game_root, game_slug, layout, load_order)
@@ -436,6 +822,7 @@ def _install_bepinex(archive_path: str, game_root: str, game_slug: str = "") -> 
                 return f"{subdir}/{pkg}/{tail}" if namespaced else f"{subdir}/{tail}"
             return f"BepInEx/plugins/{pkg}/{norm}"               # 散 dll 兜底
 
+        operations = []
         for member in members:
             norm = member.replace("\\", "/")
             rel_dest = _route(norm)
@@ -452,14 +839,12 @@ def _install_bepinex(archive_path: str, game_root: str, game_slug: str = "") -> 
                 result["skipped"].append(member)
                 continue
 
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if os.path.exists(dest):
-                _backup_file(dest, game_root, game_slug)
-            try:
-                shutil.copy2(os.path.join(walk_root, member), dest)
-                result["installed"].append({"file": member, "dest": dest})
-            except Exception as e:
-                result["errors"].append({"file": member, "error": str(e)})
+            operations.append({
+                "src": os.path.join(walk_root, member), "dest": dest,
+                "record": {"file": member},
+            })
+
+        result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
 
         if not has_bep and not game_has_loader:
             result.setdefault("notes", []).append(
@@ -527,6 +912,7 @@ def install_mod_custom(archive_path: str, game_root: str, game_slug: str,
             raise RuntimeError(f"解压失败: {e}") from e
         walk_root = _strip_wrapper_dirs(tmp)   # 与 conflict_check 同款剥壳,保证包内路径对得上
 
+        operations = []
         for src_rel, dst_rel in mapping.items():
             src_norm = str(src_rel).replace("\\", "/").lstrip("/")
             src_full = os.path.join(walk_root, src_norm.replace("/", os.sep))
@@ -545,23 +931,23 @@ def install_mod_custom(archive_path: str, game_root: str, game_slug: str,
             existed = os.path.exists(dest)
             if existed:
                 result["warnings"].append(f"覆盖已存在文件: {rel}")
-                _backup_file(dest, game_root, game_slug)   # 覆盖前备份(C-0 集中区)
             if os.path.splitext(dest)[1].lower() in _EXEC_EXTS and rel.count("/") == 0:
                 result["warnings"].append(
                     f"可执行文件落游戏根: {rel}(疑似注入器/替换官方文件,请确认来源可信)")
 
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            try:
-                shutil.copy2(src_full, dest)
-                result["installed"].append({
-                    "src": src_rel, "dest": dest, "rel": rel, "overwrote": existed,
-                })
-            except Exception as e:
-                entry = {"src": src_rel, "error": str(e)}
-                if isinstance(e, OSError):
-                    from .diagnostics import classify_oserror
-                    entry.update(classify_oserror(e, dest))   # 可行动归因(游戏在跑/磁盘满…)
-                result["errors"].append(entry)
+            operations.append({
+                "src": src_full, "dest": dest,
+                "record": {"src": src_rel, "rel": rel, "overwrote": existed},
+            })
+
+        try:
+            result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
+        except Exception as e:
+            entry = {"src": "<transaction>", "error": str(e)}
+            if isinstance(e, OSError):
+                from .diagnostics import classify_oserror
+                entry.update(classify_oserror(e, game_root))
+            result["errors"].append(entry)
 
     return result
 
@@ -640,10 +1026,21 @@ def uninstall_mod(mod_id: str, game_root: str, files_installed: list[str],
                   记录移除,【绝不删磁盘】,防止卸载 A 时删掉 B 依赖的共享文件
                   (根因修复:UE4SS 与 CNS 共享 UE4SS-settings.ini 的互删事故)。
     """
-    result = {"removed": [], "kept_shared": [], "not_found": [], "errors": []}
+    result = {
+        "removed": [], "kept_shared": [], "not_found": [],
+        "blocked_unsafe": [], "errors": [],
+    }
     shared = shared_files or set()
 
     for f in files_installed:
+        managed_path, unsafe_reason = resolve_managed_game_path(f, game_root)
+        if not managed_path:
+            result["blocked_unsafe"].append({
+                "file": str(f), "reason": unsafe_reason,
+            })
+            continue
+        f = managed_path
+
         # ── 共享文件保护:仍被其他 mod 拥有 → 不动磁盘 ──
         if os.path.normcase(os.path.abspath(f)) in shared:
             result["kept_shared"].append(f)
@@ -717,6 +1114,15 @@ def conflict_check(archive_path: str, game_root: str, game_slug: str) -> dict:
             "error": f"无法读取压缩包内容: {e}",
         }
 
+    if layout.get("handler") == "ff7r":
+        plugin_roots = {
+            m.split("/", 1)[0].lower()
+            for m in archive_contents if m.lower().endswith(".uplugin") and "/" in m
+        }
+        incoming_files = [d for d in (
+            _ff7r_dest(member, plugin_roots, game_root) for member in archive_contents
+        ) if d]
+
     if not patterns:
         return {
             "conflicts": [], "missing_deps": [], "incoming_files_count": 0,
@@ -757,10 +1163,20 @@ def _get_installed_files_map() -> dict[str, str]:
     return result
 
 
-def disable_mod(files_installed: list[str]) -> dict:
+def disable_mod(files_installed: list[str], game_root: str) -> dict:
     """禁用 mod：重命名文件加 .disabled 后缀"""
-    result = {"disabled": [], "changed": [], "not_found": [], "errors": []}
+    result = {
+        "disabled": [], "changed": [], "not_found": [],
+        "blocked_unsafe": [], "errors": [],
+    }
     for f in files_installed:
+        managed_path, unsafe_reason = resolve_managed_game_path(f, game_root)
+        if not managed_path:
+            result["blocked_unsafe"].append({
+                "file": str(f), "reason": unsafe_reason,
+            })
+            continue
+        f = managed_path
         if os.path.exists(f):
             try:
                 os.rename(f, f + ".disabled")
@@ -786,10 +1202,20 @@ def is_mod_disabled(files_installed: list[str]) -> bool:
     return True
 
 
-def enable_mod(files_installed: list[str]) -> dict:
+def enable_mod(files_installed: list[str], game_root: str) -> dict:
     """启用 mod：去掉 .disabled 后缀"""
-    result = {"enabled": [], "changed": [], "not_found": [], "errors": []}
+    result = {
+        "enabled": [], "changed": [], "not_found": [],
+        "blocked_unsafe": [], "errors": [],
+    }
     for f in files_installed:
+        managed_path, unsafe_reason = resolve_managed_game_path(f, game_root)
+        if not managed_path:
+            result["blocked_unsafe"].append({
+                "file": str(f), "reason": unsafe_reason,
+            })
+            continue
+        f = managed_path
         target = f + ".disabled" if not f.endswith(".disabled") else f
         original = f.replace(".disabled", "") if f.endswith(".disabled") else f
         if os.path.exists(target):

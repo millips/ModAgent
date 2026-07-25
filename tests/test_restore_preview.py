@@ -71,16 +71,19 @@ check("C2 gate did not touch disk", os.path.exists(B)
 check("C3 gate preview carries lists", r["preview"]["to_delete"] == ["BepInEx/plugins/modB.dll"])
 
 # ── B+C. 带 confirmed 执行,且结果与预览一致 ──
-r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s1, "confirmed": True}, cfg))
+r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s1, "confirmed": True,
+                                                    "confirmation_token": r["confirmation_token"]}, cfg))
 check("B1 executed: deleted==preview", r["deleted"] == pv2["to_delete_count"] == 1
       and not os.path.exists(B))
 check("B2 executed: restored==preview", r["restored"] == pv2["to_restore_count"] == 1
       and open(A).read() == "AAAA")
-check("B3 files_restored compat = deleted+restored", r["files_restored"] == 2)
+check("B3 files_restored means actual copied files", r["files_restored"] == 1
+      and r["operations_applied"] == 2 and r["complete"] is False
+      and r["status"] == "incomplete")
 check("B4 missing file skipped, no failure charged", "failed" not in r,
       f"failed={r.get('failed')}")
 
-# ── D. 硬编码域游戏不设门:palworld 一次调用直达 ──
+# ── D. 硬编码域游戏也必须预览确认 ──
 GP = os.path.join(TMP, "Palworld")
 w(os.path.join(GP, "Pal", "Binaries", "Win64", "Palworld-Win64-Shipping.exe"), "EXE")
 PA = os.path.join(GP, "Pal", "Content", "Paks", "~mods", "modA_P.pak"); w(PA, "AAAA")
@@ -89,8 +92,11 @@ PB = os.path.join(GP, "Pal", "Content", "Paks", "~mods", "modB_P.pak"); w(PB, "B
 cfgp = types.SimpleNamespace(nexus_api_key="", game_slug="palworld", game_id=6063,
                              game_root=GP, tier="free", chrome_cdp_port=18888)
 r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": sp}, cfgp))
-check("D1 curated domain: no gate, executed", "requires_confirmation" not in r
-      and r["deleted"] == 1 and not os.path.exists(PB))
+check("D1 curated domain: confirmation required", r.get("requires_confirmation") is True
+      and os.path.exists(PB))
+r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": sp, "confirmed": True,
+                                                    "confirmation_token": r["confirmation_token"]}, cfgp))
+check("D2 curated domain: confirmed execution", r["deleted"] == 1 and not os.path.exists(PB))
 
 # ── E. 失败记账:文件被占用(Windows 下打开即锁删除)──
 w(PB, "BBBB")
@@ -111,7 +117,9 @@ check("E1 locked file charged to failed.delete + classified", locked_ok,
 w(PB, "BBBB")
 fh = open(PB, "r")
 try:
-    r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": sp}, cfgp))
+    gate = json.loads(tools.execute("snapshot_restore", {"snapshot_id": sp}, cfgp))
+    r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": sp, "confirmed": True,
+                                                        "confirmation_token": gate["confirmation_token"]}, cfgp))
 finally:
     fh.close()
 check("E2 tool surfaces warning", "warning" in r and r["failed"]["delete"], f"got {r}")

@@ -1,35 +1,30 @@
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.venv/
-venv/
-
-# Node / build output
 node_modules/
 downloads/
 dist/
-build/
+/build/
 *.log
 .DS_Store
 snapshots/
 *.egg-info/
 
-# Local workspace and application state
+# Local workspace state and historical copies must never enter releases.
 .claude/settings.local.json
-*.lnk
-*.exe
-.env
-.env.*
-.modagent/
 backups/
 _stage_backup/
 electron/release/
+electron/tmp-asar-*/
+electron/.smoke-*/
 
-# IDE / OS
-.idea/
-.vscode/
-Thumbs.db
-
-# Historical and scratch files
+# ModAgent P assets are injected only by the private release workspace.
+# Never stage them in the public GitHub repository.
+electron/src/assets/themes/
+electron/assets/license/
+electron/assets/icons/modagent-p.*
+electron/assets/icons/modagent-subscription.*
+design/technology-core-image-handoff/
+electron/feedback-lab/
+docs/CAT-THEME-AUDIO-REQUIREMENTS.md
+docs/THEME-DEVELOPMENT-SOP.md
+docs/commercial-audio-regeneration-prompts.md

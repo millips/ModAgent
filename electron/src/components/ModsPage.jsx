@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput } from 'lucide-react'
+import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput, Link2 } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
 
 const MOCK_MODS = [
@@ -35,13 +35,14 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const [dlUrl, setDlUrl] = useState('')
   const [dlBusy, setDlBusy] = useState(false)
   const [checking, setChecking] = useState(false)
+  const [binding, setBinding] = useState(false)
 
-  useEffect(() => { loadFromApi() }, [refreshKey, status?.game_slug])
+  useEffect(() => { loadFromApi() }, [refreshKey, status?.game_slug, status?.game_instance_id])
 
   const loadFromApi = async () => {
     try {
-      const slug = status?.game_slug || ''
-      const r = await fetch(slug ? `${api}/mods?game_slug=${encodeURIComponent(slug)}` : `${api}/mods`)
+      const scope = status?.game_instance_id || status?.game_slug || ''
+      const r = await fetch(scope ? `${api}/mods?game_slug=${encodeURIComponent(scope)}` : `${api}/mods`)
       if (!r.ok) throw new Error(`mods request failed: ${r.status}`)
       const apiMods = await r.json()
       if (!Array.isArray(apiMods)) throw new Error('mods response is not an array')
@@ -56,8 +57,8 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const reconcileMods = async () => {
     toast('对账中...')
     try {
-      const slug = status?.game_slug || ''
-      const r = await fetch(`${api}/mods/reconcile?game_slug=${encodeURIComponent(slug)}`, { method: 'POST' })
+      const scope = status?.game_instance_id || status?.game_slug || ''
+      const r = await fetch(`${api}/mods/reconcile?game_slug=${encodeURIComponent(scope)}`, { method: 'POST' })
       const d = await r.json()
       if (d.issues?.length) {
         const names = d.issues.slice(0, 3).map(i => `${i.name}(${i.problem})`).join('、')
@@ -99,6 +100,33 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     }
   }
 
+  const bindRecognized = async () => {
+    setBinding(true)
+    toast('正在把本地 Mod 对齐到维护来源…')
+    const controller = new AbortController()
+    const timeoutId = window.setTimeout(() => controller.abort(), 120000)
+    try {
+      const response = await fetch(api + '/tool/mod_source_align', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force_refresh: true }), signal: controller.signal,
+      })
+      const envelope = await response.json()
+      const result = JSON.parse(envelope.result || '{}')
+      if (result.error) throw new Error(result.error)
+      const summary = result.summary || {}
+      emitFeedback('notice', { source: 'source-align', count: summary.bound || 0 })
+      toast(`绑定完成：成功 ${summary.bound || 0}，歧义 ${summary.ambiguous || 0}，未匹配 ${summary.unmatched || 0}`)
+      loadFromApi()
+      onRefresh?.()
+    } catch (error) {
+      emitFeedback('error', { source: 'source-align' })
+      toast(error?.name === 'AbortError' ? '绑定耗时过长，已保留现有结果，可稍后继续' : '来源绑定失败', 'error')
+    } finally {
+      window.clearTimeout(timeoutId)
+      setBinding(false)
+    }
+  }
+
   // 下载新 Mod：粘贴 GitHub/Thunderstore/GameBanana 链接 → 下载（+可选安装）
   const doDownload = async () => {
     const url = dlUrl.trim()
@@ -111,6 +139,11 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
       if (data.error) { emitFeedback('error', { source: 'download' }); toast(friendlyErr(data.error), 'error'); setDlBusy(false); return }
+      if (data.already_installed) {
+        emitFeedback('notice', { source: 'download-dedup', name: data.name || '' })
+        toast(`${data.name || '该 Mod'} 已安装，已跳过重复下载`)
+        setShowDownload(false); setDlUrl(''); setDlBusy(false); loadFromApi(); onRefresh?.(); return
+      }
       toast(`已下载 ${data.name || ''}，正在安装...`)
       emitFeedback('install-start', { source: 'direct-install', name: data.name || '' })
       const r2 = await fetch(api + '/tool/mod_install', {
@@ -128,7 +161,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
 
   const friendlyErr = (raw) => {
     const s = String(raw || '')
-    if (s.includes('Chrome CDP')) return '请先启动 Chrome (端口 18888)'
+    if (s.includes('Chrome CDP') || s.includes('浏览器自动化服务')) return '请重启 ModAgent，程序会自动启动 Edge、Chrome 或 Brave'
     if (s.includes('API Key') || s.includes('apikey')) return 'API 密钥无效，请在设置中检查'
     if (s.includes('game_root') || s.includes('游戏目录')) return '请先选择游戏目录'
     if (s.length > 80) return '操作失败，请重试'
@@ -194,7 +227,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     setActionLock(null)
   }
 
-  const toggleMod = async (mod, confirmed = false) => {
+  const toggleMod = async (mod, confirmed = false, confirmationToken = '') => {
     const enabling = !!mod.disabled
     const action = enabling ? 'mod_enable' : 'mod_disable'
     setActionLock(mod.id)
@@ -202,7 +235,10 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     try {
       const r = await fetch(api + '/tool/' + action, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mod_id: mod.id, ...(confirmed ? { confirmed: true } : {}) })
+        body: JSON.stringify({
+          mod_id: mod.id,
+          ...(confirmed ? { confirmed: true, confirmation_token: confirmationToken } : {}),
+        })
       })
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
@@ -233,7 +269,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     const gate = dependencyGate
     if (!gate || gate.data.blocked) return
     setDependencyGate(null)
-    await toggleMod(gate.mod, true)
+    await toggleMod(gate.mod, true, gate.data.confirmation_token || '')
   }
 
   const previewBatchDelete = async () => {
@@ -330,13 +366,17 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               </button>
             ))}
           </div>
-          <div className="flex gap-1 ml-auto">
+          <div className="flex flex-wrap justify-end gap-1 ml-auto">
             <button className="btn-ghost flex items-center gap-1" onClick={reconcileMods}
               title="校验每个已装 mod 记录的文件是否还在磁盘上,揪出空账/缺文件">
               对账
             </button>
             <button className="btn-ghost flex items-center gap-1" onClick={checkUpdates} disabled={checking}>
               <RefreshCw size={14} className={checking ? 'animate-spin' : ''} /> 检查更新
+            </button>
+            <button className="btn-ghost flex items-center gap-1" onClick={bindRecognized} disabled={binding || checking}
+              title="将扫描到的本地 Mod 自动绑定到可信的 Nexus、Thunderstore 或 Steam 维护页，之后可统一检查和更新">
+              <Link2 size={14} className={binding ? 'animate-pulse' : ''} /> {binding ? '绑定中' : '一键绑定'}
             </button>
             <button className="btn-ghost flex items-center gap-1" onClick={loadFromApi}>
               刷新
@@ -471,14 +511,14 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
           </div>
         ))}
         {filtered.length === 0 && mods.length === 0 && (
-          <div className="flex flex-col items-center justify-center py-20 text-surface-500">
+          <div className="mods-empty-state flex flex-col items-center justify-center py-20 text-surface-500">
             <Archive size={32} className="mb-2 opacity-30" />
             <p className="text-sm">还没有 Mod</p>
             <p className="text-xs mt-1 opacity-60">去对话页让 Agent 帮你安装第一个 Mod</p>
           </div>
         )}
         {filtered.length === 0 && mods.length > 0 && (
-          <div className="flex flex-col items-center justify-center py-20 text-surface-500">
+          <div className="mods-empty-state mods-empty-search flex flex-col items-center justify-center py-20 text-surface-500">
             <Search size={32} className="mb-2 opacity-30" />
             <p className="text-sm">没有匹配的 Mod</p>
           </div>
@@ -580,6 +620,21 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
             </div>
             <div className="bg-surface-900 rounded-md p-3 mb-4 text-xs text-surface-400 space-y-2">
               <p>{dependencyGate.data.note}</p>
+              {!!dependencyGate.data.decision_support && (
+                <div className="space-y-2 border-l-2 border-cyber-yellow/60 pl-3">
+                  <p className="text-white">{dependencyGate.data.decision_support.summary}</p>
+                  <p><span className="text-cyber-yellow">你会暂时失去：</span>{dependencyGate.data.decision_support.player_impact?.map(item => `${item.name}（${item.role_label}）：${item.functionality_lost}`).join('；')}</p>
+                  {!!dependencyGate.data.decision_support.already_inactive?.length && (
+                    <p><span className="text-surface-500">无需重复处理：</span>{dependencyGate.data.decision_support.already_inactive.map(item => item.name).join('、')} 已经禁用</p>
+                  )}
+                  {!!dependencyGate.data.decision_support.retained?.length && (
+                    <p><span className="text-cyber-cyan">仍会保留：</span>{dependencyGate.data.decision_support.retained.map(item => item.name).join('、')}</p>
+                  )}
+                  <p><span className="text-white/80">为什么建议这样试：</span>{dependencyGate.data.decision_support.why_this_step}</p>
+                  <p><span className="text-white/80">建议：</span>{dependencyGate.data.decision_support.recommendation}</p>
+                  <p className="text-surface-500">{dependencyGate.data.decision_support.recovery}</p>
+                </div>
+              )}
               {!!dependencyGate.data.dependents?.length && (
                 <div>
                   <p className="text-cyber-yellow mb-1">依赖它、将被连带禁用：</p>

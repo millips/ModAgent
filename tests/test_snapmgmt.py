@@ -65,6 +65,15 @@ check("4 cross-game delete refused", "跨游戏删除已拒绝" in r.get("error"
 
 cfg.game_slug = "testgame"
 r = json.loads(tools.execute("snapshot_delete", {"snapshot_id": "snap_fake_024"}, cfg))
-check("4 same-game delete ok", r.get("deleted") == "snap_fake_024")
+check("4 same-game delete requires confirmation", r.get("requires_confirmation") is True)
+token = r.get("confirmation_token", "")
+denied = json.loads(tools.execute("snapshot_delete", {
+    "snapshot_id": "snap_fake_024", "confirmed": True, "confirmation_token": "bad",
+}, cfg))
+check("4 invalid token refused", denied.get("error") == "snapshot_delete_confirmation_invalid")
+r = json.loads(tools.execute("snapshot_delete", {
+    "snapshot_id": "snap_fake_024", "confirmed": True, "confirmation_token": token,
+}, cfg))
+check("4 confirmed same-game delete ok", r.get("deleted") == "snap_fake_024")
 
 print("\nALL PASS" if allok else "\nSOME FAILED")

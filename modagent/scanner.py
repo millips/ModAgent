@@ -9,6 +9,8 @@ GAME_MOD_PATHS = {
         ("archive/pc/mod/", ".archive"),
         ("bin/x64/plugins/", ".dll"),
         ("bin/x64/plugins/", ".asi"),
+        ("bin/x64/plugins/cyber_engine_tweaks/mods/", ".lua"),
+        ("red4ext/plugins/", ".dll"),
         ("r6/scripts/", ".reds"),
         ("r6/tweaks/", ".yaml"),
         ("r6/tweaks/", ".yml"),
@@ -28,7 +30,18 @@ GAME_MOD_PATHS = {
         ("SB/Content/Paks/~mods/", ".pak"),
         ("SB/Content/Paks/~mods/", ".ucas"),
         ("SB/Content/Paks/~mods/", ".utoc"),
+        ("SB/Content/Paks/LogicMods/", ".pak"),
+        ("SB/Content/Paks/LogicMods/", ".ucas"),
+        ("SB/Content/Paks/LogicMods/", ".utoc"),
+        ("SB/Content/Paks/mods/", ".pak"),
+        ("SB/Content/Paks/mods/", ".ucas"),
+        ("SB/Content/Paks/mods/", ".utoc"),
     ],
+}
+
+EXTERNAL_MOD_EXTENSIONS = {
+    ".archive", ".pak", ".ucas", ".utoc", ".dll", ".asi", ".reds",
+    ".yaml", ".yml", ".lua", ".esp", ".esm", ".esl", ".zip", ".7z", ".rar",
 }
 
 WELL_KNOWN_CP77 = {
@@ -167,21 +180,112 @@ def _workshop_local_meta(mod_dir: str) -> tuple:
     return "", ""
 
 
-def scan_existing_mods(game_root: str, game_slug: str, api_key: str) -> dict:
+def _scan_external_mod_root(root: str) -> list[dict]:
+    """Group a Vortex/MO2/Fluffy/custom directory by top-level entry."""
+    root = os.path.abspath(os.path.expanduser(root or ""))
+    if not os.path.isdir(root):
+        return []
+    try:
+        entries = list(os.scandir(root))
+    except (OSError, PermissionError):
+        return []
+    results = []
+    for entry in entries:
+        if entry.name.lower() in _LOADER_SKIP or entry.name.startswith("."):
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            files = [
+                os.path.join(base, filename)
+                for base, _, filenames in os.walk(entry.path)
+                for filename in filenames
+                if os.path.splitext(filename)[1].lower() in EXTERNAL_MOD_EXTENSIONS
+            ]
+            if files:
+                name, version = _parse_loader_name(entry.name)
+                results.append({
+                    "name": name, "version": version, "files": files,
+                    "filenames": [os.path.basename(item) for item in files],
+                    "source_root": root,
+                })
+        elif entry.is_file() and os.path.splitext(entry.name)[1].lower() in EXTERNAL_MOD_EXTENSIONS:
+            name, version = _parse_loader_name(os.path.splitext(entry.name)[0])
+            results.append({
+                "name": name, "version": version, "files": [entry.path],
+                "filenames": [entry.name], "source_root": root,
+            })
+    return results
+
+
+def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
+                       extra_roots: list[str] | None = None,
+                       game_instance_id: str = "") -> dict:
+    storage_id = game_instance_id or game_slug
     identified = []
     unidentified = []
     detected = 0
-    existing_names = {m.name.lower() for m in db.get_installed_mods(game_slug)}
+    existing_names = {m.name.lower() for m in db.get_installed_mods(storage_id)}
+    scanned_roots = [os.path.abspath(game_root)] if game_root else []
+    missing_roots = []
+    manifest_roots: set[str] = set()
+
+    # Prefer authoritative local metadata over folder-name guessing. SMAPI
+    # manifests are offline, fast, and prove the version on this machine.
+    if game_slug == "stardewvalley" and game_root:
+        try:
+            from . import stardew
+            for item in stardew.installed_manifests(game_root):
+                mod_dir = os.path.realpath(os.path.join(
+                    game_root, item.get("relative_dir") or ""
+                ))
+                if not os.path.isdir(mod_dir):
+                    continue
+                files = [
+                    os.path.join(current, filename)
+                    for current, _, filenames in os.walk(mod_dir)
+                    for filename in filenames
+                ]
+                if not files:
+                    continue
+                manifest_roots.add(os.path.normcase(mod_dir))
+                detected += 1
+                name = str(item.get("name") or item.get("unique_id") or "").strip()
+                if not name or name.lower() in existing_names:
+                    continue
+                identified.append({
+                    "mod_id": "",
+                    "name": name,
+                    "version": str(item.get("version") or "unknown"),
+                    "files": files,
+                    "filenames": [os.path.basename(mod_dir)],
+                    "endorsements": 0,
+                    "confidence": "local_manifest",
+                    "local_unique_id": str(item.get("unique_id") or ""),
+                    "game_slug": storage_id,
+                })
+                existing_names.add(name.lower())
+        except Exception:
+            # A malformed third-party manifest must not suppress generic scan.
+            manifest_roots.clear()
 
     # 0) 通用加载器探测（BepInEx/MelonLoader 等，文件夹式 mod，不依赖游戏名）
     for g in _scan_generic_loaders(game_root):
+        if manifest_roots and any(
+            any(
+                os.path.commonpath([
+                    os.path.normcase(os.path.realpath(path)), manifest_root
+                ]) == manifest_root
+                for manifest_root in manifest_roots
+            )
+            for path in g.get("files") or []
+        ):
+            continue
         detected += 1
         if g["name"].lower() in existing_names:
             continue
         identified.append({
             "mod_id": "", "name": g["name"], "version": g["version"],
             "files": g["files"], "filenames": g["filenames"],
-            "endorsements": 0, "confidence": "local", "game_slug": game_slug,
+            "endorsements": 0, "confidence": "local", "game_slug": storage_id,
         })
         existing_names.add(g["name"].lower())
 
@@ -193,20 +297,44 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str) -> dict:
         identified.append({
             "mod_id": w["id"], "name": w["name"], "version": w["version"],
             "files": w["files"], "filenames": w["filenames"],
-            "endorsements": 0, "confidence": "steam_workshop", "game_slug": game_slug,
+            "endorsements": 0, "confidence": "steam_workshop", "game_slug": storage_id,
         })
         existing_names.add(w["name"].lower())
 
+    # 0.75) Explicit manager/custom directories. MO2 virtual mods, purged
+    # Vortex staging and Fluffy libraries are not necessarily visible below
+    # the game root, so they must be supplied and remembered explicitly.
+    for extra_root in dict.fromkeys(extra_roots or []):
+        normalized = os.path.abspath(os.path.expanduser(extra_root or ""))
+        if not os.path.isdir(normalized):
+            missing_roots.append(normalized)
+            continue
+        scanned_roots.append(normalized)
+        for item in _scan_external_mod_root(normalized):
+            detected += 1
+            key = item["name"].lower()
+            if key in existing_names:
+                continue
+            identified.append({
+                "mod_id": "", "name": item["name"], "version": item["version"],
+                "files": item["files"], "filenames": item["filenames"],
+                "endorsements": 0, "confidence": "external_directory",
+                "game_slug": storage_id, "source_root": item["source_root"],
+            })
+            existing_names.add(key)
+
     # 没有该游戏的 Nexus 文件规则就到此为止（BepInEx 类游戏走通用探测即可）
     if game_slug not in GAME_MOD_PATHS:
-        return {"detected": detected, "identified": identified, "unidentified": unidentified}
+        return {"detected": detected, "identified": identified, "unidentified": unidentified,
+                "scanned_roots": scanned_roots, "missing_roots": missing_roots}
 
     patterns = GAME_MOD_PATHS.get(game_slug, [("", ".zip")])
     found_files = _scan_dirs(game_root, patterns)
     detected += len(found_files)
 
     if not found_files:
-        return {"detected": detected, "identified": identified, "unidentified": unidentified}
+        return {"detected": detected, "identified": identified, "unidentified": unidentified,
+                "scanned_roots": scanned_roots, "missing_roots": missing_roots}
 
     # Group files by guessed mod name
     groups: dict[str, list[tuple[str, str, str]]] = {}
@@ -219,6 +347,8 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str) -> dict:
         groups[name].append((rel_path, filename, wk["confidence"] if wk else ""))
 
     for name, files in groups.items():
+        if name.lower() in existing_names:
+            continue
         full_paths = [os.path.join(game_root, f[0]) for f in files]
         filenames = [f[1] for f in files]
         confidence = files[0][2] or "unknown"
@@ -227,30 +357,32 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str) -> dict:
         if wk:
             identified.append({
                 "mod_id": "", "name": wk["name"], "files": full_paths, "filenames": filenames,
-                "endorsements": 0, "confidence": "well_known", "game_slug": game_slug,
+                "endorsements": 0, "confidence": "well_known", "game_slug": storage_id,
             })
+            existing_names.add(wk["name"].lower())
             continue
 
-        match = _verify_on_nexus(name, game_slug, api_key)
-        if match:
-            mod_id = str(match["mod_id"])
-            existing = db.get_mod(mod_id, game_slug)
-            if existing:
-                continue
-            identified.append({
-                "mod_id": mod_id, "name": match["name"], "files": full_paths, "filenames": filenames,
-                "nexus_name": match["name"], "endorsements": match.get("endorsements", 0),
-                "confidence": match.get("confidence", "medium"), "game_slug": game_slug,
-            })
-        else:
-            unidentified.append({"files": full_paths, "filenames": filenames, "guess": name})
+        # Inventory is deliberately offline. Network matching here multiplied
+        # one scan into hundreds of CDP/API calls and caused large libraries to
+        # time out before anything reached the database. Source alignment is a
+        # separate, retryable phase and never controls whether a local file is
+        # acknowledged as installed.
+        identified.append({
+            "mod_id": "", "name": name, "version": "unknown",
+            "files": full_paths, "filenames": filenames,
+            "endorsements": 0, "confidence": "local_unverified",
+            "game_slug": storage_id,
+        })
+        existing_names.add(name.lower())
 
-    return {"detected": detected, "identified": identified, "unidentified": unidentified}
+    return {"detected": detected, "identified": identified, "unidentified": unidentified,
+            "scanned_roots": scanned_roots, "missing_roots": missing_roots}
 
 
 def import_mods(mods_to_import: list[dict]) -> int:
     import hashlib
     count = 0
+    pending = []
     existing_names_by_game: dict[str, set[str]] = {}
     for m in mods_to_import:
         game_slug = str(m.get("game_slug") or "")
@@ -276,9 +408,10 @@ def import_mods(mods_to_import: list[dict]) -> int:
             installed_by="imported",
             game_slug=game_slug,
         )
-        db.add_mod(mod)
+        pending.append(mod)
         existing_names.add(m["name"].lower())
         count += 1
+    db.add_mods(pending)
     return count
 
 
@@ -290,13 +423,15 @@ def _scan_dirs(game_root: str, patterns: list[tuple[str, str]]) -> list[tuple[st
         if not os.path.isdir(full):
             continue
         try:
-            for f in os.listdir(full):
-                fp = os.path.join(full, f)
-                if os.path.isfile(fp) and f.lower().endswith(ext.lower()):
-                    rel = os.path.join(subdir, f)
-                    if rel not in seen:
-                        seen.add(rel)
-                        found.append((rel, f))
+            for base, _, filenames in os.walk(full):
+                for f in filenames:
+                    fp = os.path.join(base, f)
+                    if f.lower().endswith(ext.lower()):
+                        rel = os.path.relpath(fp, game_root)
+                        key = os.path.normcase(os.path.abspath(fp))
+                        if key not in seen:
+                            seen.add(key)
+                            found.append((rel, f))
         except PermissionError:
             continue
     return found
@@ -318,9 +453,8 @@ def _guess_mod_name(filename: str, game_slug: str) -> str:
                     return full_name
 
     clean = re.sub(r"[_\.\-]+", " ", name)
-    clean = re.sub(r"^[#\d\s]+", "", clean)
+    clean = re.sub(r"^#+\s*", "", clean)
     clean = re.sub(r"\b(v\d+[\d\.]*)\b", "", clean, flags=re.IGNORECASE)
-    clean = re.sub(r"\b(\d+[\d\.]*k?)\b", "", clean)
     clean = re.sub(r"\s{2,}", " ", clean).strip()
 
     if not clean:

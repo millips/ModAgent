@@ -49,7 +49,9 @@ cfg = types.SimpleNamespace(nexus_api_key="", game_slug="testgame", game_id=0,
                             game_root=G, tier="free", chrome_cdp_port=18888)
 # testgame 是嗅探域(开放模式),工具层强制预览确认 → 带 confirmed 直达执行
 # (不带 confirmed 的门本身由 test_restore_preview.py 覆盖)
-r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s1, "confirmed": True}, cfg))
+preview = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s1}, cfg))
+r = json.loads(tools.execute("snapshot_restore", {"snapshot_id": s1, "confirmed": True,
+                                                    "confirmation_token": preview["confirmation_token"]}, cfg))
 
 check("1 B file rolled back", not os.path.exists(B))
 check("1 B ghost record cleaned", db.get_mod("modB") is None

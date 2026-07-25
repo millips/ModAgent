@@ -4,9 +4,37 @@ import sqlite3
 import time
 from dataclasses import dataclass, asdict
 from typing import Optional
-from .config import CONFIG_DIR, ensure_config_dir
+from .config import CONFIG_DIR, ensure_config_dir, load as load_config, game_storage_id
 
 DB_FILE = os.path.join(CONFIG_DIR, "state.db")
+
+
+def _scope_game(game_slug: str = "") -> str:
+    if not game_slug:
+        return ""
+    try:
+        return game_storage_id(load_config(), game_slug)
+    except Exception:
+        return str(game_slug or "")
+
+
+def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
+    """Assign unambiguous legacy rows to the currently selected install."""
+    if not legacy_slug or not instance_id or legacy_slug == instance_id:
+        return
+    conn = get_conn()
+    try:
+        for table in (
+            "installed_mods", "snapshots", "sessions",
+            "custom_domains", "mod_source_bindings",
+        ):
+            conn.execute(
+                f"UPDATE OR IGNORE {table} SET game_slug=? WHERE game_slug=?",
+                (instance_id, legacy_slug),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -79,7 +107,8 @@ def init_db():
             game_slug TEXT DEFAULT '',
             created_at REAL DEFAULT 0,
             updated_at REAL DEFAULT 0,
-            messages TEXT DEFAULT '[]'
+            messages TEXT DEFAULT '[]',
+            ui_state TEXT DEFAULT '{}'
         );
         -- T2:自定义安装(mod_install_custom)的落点登记。精确文件(相对 game_root 正斜杠),
         -- 由 snapshot._auto_detect_specs 并入快照域,保证非常规落点也能被回滚覆盖(铁律6)。
@@ -88,6 +117,20 @@ def init_db():
             path TEXT NOT NULL,
             added_at REAL DEFAULT 0,
             UNIQUE(game_slug, path)
+        );
+        CREATE TABLE IF NOT EXISTS mod_source_bindings (
+            game_slug TEXT NOT NULL,
+            mod_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            source_url TEXT DEFAULT '',
+            confidence REAL DEFAULT 0,
+            match_method TEXT DEFAULT '',
+            latest_version TEXT DEFAULT '',
+            metadata TEXT DEFAULT '{}',
+            bound_at REAL DEFAULT 0,
+            last_checked_at REAL DEFAULT 0,
+            PRIMARY KEY (game_slug, mod_id)
         );
     """)
     try:
@@ -108,6 +151,10 @@ def init_db():
         pass
     try:
         conn.execute("ALTER TABLE installed_mods ADD COLUMN game_slug TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN ui_state TEXT DEFAULT '{}'")
     except sqlite3.OperationalError:
         pass
     # v1.0 migration: Nexus/Workshop IDs are only unique inside a game.
@@ -134,6 +181,7 @@ def init_db():
 
 
 def add_mod(mod: InstalledMod):
+    mod.game_slug = _scope_game(mod.game_slug)
     conn = get_conn()
     mod.installed_at = time.time()
     conn.execute(
@@ -147,17 +195,21 @@ def add_mod(mod: InstalledMod):
 
 
 def remove_mod(mod_id: str, game_slug: str = ""):
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         conn.execute("DELETE FROM installed_mods WHERE id=? AND game_slug=?", (mod_id, game_slug))
+        conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
     else:
         conn.execute("DELETE FROM installed_mods WHERE id=?", (mod_id,))
+        conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=?", (mod_id,))
     _log(conn, "uninstall", json.dumps({"mod_id": mod_id, "game_slug": game_slug}))
     conn.commit()
     conn.close()
 
 
 def get_mod(mod_id: str, game_slug: str = "") -> Optional[InstalledMod]:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         row = conn.execute("SELECT * FROM installed_mods WHERE id=? AND game_slug=?",
@@ -170,6 +222,7 @@ def get_mod(mod_id: str, game_slug: str = "") -> Optional[InstalledMod]:
 
 
 def update_mod(mod: InstalledMod):
+    mod.game_slug = _scope_game(mod.game_slug)
     conn = get_conn()
     conn.execute(
         "UPDATE installed_mods SET name=?, version=?, snapshot_id=?, load_order=?,"
@@ -182,6 +235,7 @@ def update_mod(mod: InstalledMod):
 
 
 def get_installed_mods(game_slug: str = "") -> list:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         rows = conn.execute(
@@ -191,6 +245,129 @@ def get_installed_mods(game_slug: str = "") -> list:
         rows = conn.execute("SELECT * FROM installed_mods ORDER BY load_order, installed_at").fetchall()
     conn.close()
     return [InstalledMod(**dict(r)) for r in rows]
+
+
+def upsert_mod_source_binding(
+    game_slug: str,
+    mod_id: str,
+    source: str,
+    source_key: str,
+    source_url: str = "",
+    confidence: float = 0.0,
+    match_method: str = "",
+    latest_version: str = "",
+    metadata=None,
+):
+    game_slug = _scope_game(game_slug)
+    now = time.time()
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO mod_source_bindings
+        (game_slug,mod_id,source,source_key,source_url,confidence,match_method,
+         latest_version,metadata,bound_at,last_checked_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(game_slug,mod_id) DO UPDATE SET
+          source=excluded.source,
+          source_key=excluded.source_key,
+          source_url=excluded.source_url,
+          confidence=excluded.confidence,
+          match_method=excluded.match_method,
+          latest_version=excluded.latest_version,
+          metadata=excluded.metadata,
+          last_checked_at=excluded.last_checked_at
+        """,
+        (
+            str(game_slug or ""), str(mod_id), str(source), str(source_key),
+            str(source_url or ""), float(confidence or 0),
+            str(match_method or ""), str(latest_version or ""),
+            json.dumps(metadata or {}, ensure_ascii=False), now, now,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_mods(mods: list[InstalledMod]) -> int:
+    """Insert many discovered mods in one transaction.
+
+    Large libraries used to open/commit SQLite once per file group, making a
+    scan appear stuck. A single transaction keeps the operation proportional
+    to the actual inventory size.
+    """
+    if not mods:
+        return 0
+    for mod in mods:
+        mod.game_slug = _scope_game(mod.game_slug)
+    conn = get_conn()
+    now = time.time()
+    rows = []
+    for offset, mod in enumerate(mods):
+        mod.installed_at = now + offset * 0.000001
+        rows.append((
+            mod.id, mod.name, mod.version, mod.snapshot_id, mod.load_order,
+            mod.file_id, mod.installed_at, mod.files_installed, mod.dependencies,
+            mod.installed_by, mod.game_slug,
+        ))
+    conn.executemany(
+        "INSERT OR REPLACE INTO installed_mods VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    _log(conn, "import_batch", json.dumps({
+        "count": len(rows),
+        "games": sorted({mod.game_slug for mod in mods}),
+    }))
+    conn.commit()
+    conn.close()
+    return len(rows)
+
+
+def get_mod_source_binding(mod_id: str, game_slug: str = "") -> Optional[dict]:
+    game_slug = _scope_game(game_slug)
+    conn = get_conn()
+    if game_slug:
+        row = conn.execute(
+            "SELECT * FROM mod_source_bindings WHERE game_slug=? AND mod_id=?",
+            (game_slug, str(mod_id)),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM mod_source_bindings WHERE mod_id=? ORDER BY last_checked_at DESC",
+            (str(mod_id),),
+        ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_mod_source_bindings(game_slug: str = "") -> list[dict]:
+    game_slug = _scope_game(game_slug)
+    conn = get_conn()
+    if game_slug:
+        rows = conn.execute(
+            "SELECT * FROM mod_source_bindings WHERE game_slug=? ORDER BY mod_id",
+            (game_slug,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM mod_source_bindings ORDER BY game_slug,mod_id"
+        ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_mod_by_source(game_slug: str, source: str, source_key: str) -> Optional[InstalledMod]:
+    game_slug = _scope_game(game_slug)
+    """Find an installed row through its stable upstream binding."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT m.* FROM installed_mods m "
+        "JOIN mod_source_bindings b ON b.game_slug=m.game_slug AND b.mod_id=m.id "
+        "WHERE b.game_slug=? AND b.source=? AND b.source_key=? "
+        "ORDER BY b.confidence DESC LIMIT 1",
+        (game_slug, source, str(source_key)),
+    ).fetchone()
+    conn.close()
+    return InstalledMod(**dict(row)) if row else None
 
 
 def get_shared_files(mod_id: str, files: list, game_slug: str = "") -> set:
@@ -255,6 +432,7 @@ def get_dependent_chain(mod_id: str, game_slug: str = "") -> list[InstalledMod]:
     for mod in mods:
         for dependency_id in parse_dependencies(mod.dependencies):
             reverse.setdefault(dependency_id, []).append(str(mod.id))
+
     root_id = str(mod_id)
     visited = {root_id}
     ordered = []
@@ -304,6 +482,7 @@ def get_dependency_chain(mod_id: str, game_slug: str = "") -> tuple[list[Install
 
 
 def get_max_load_order(game_slug: str = "") -> int:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         row = conn.execute("SELECT COALESCE(MAX(load_order), -1) as mx FROM installed_mods WHERE game_slug=?",
@@ -315,6 +494,7 @@ def get_max_load_order(game_slug: str = "") -> int:
 
 
 def add_snapshot(snap: Snapshot):
+    snap.game_slug = _scope_game(snap.game_slug)
     conn = get_conn()
     conn.execute(
         "INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
@@ -336,6 +516,7 @@ def delete_snapshot(snap_id: str):
 
 def add_custom_domain_files(game_slug: str, paths: list) -> None:
     """登记自定义落点(精确文件,相对 game_root 正斜杠)进该游戏的快照域。幂等。"""
+    game_slug = _scope_game(game_slug)
     if not game_slug or not paths:
         return
     conn = get_conn()
@@ -350,6 +531,7 @@ def add_custom_domain_files(game_slug: str, paths: list) -> None:
 
 def get_custom_domain_files(game_slug: str) -> list:
     """该游戏登记过的自定义落点(精确相对路径,正斜杠)。供快照域并入。"""
+    game_slug = _scope_game(game_slug)
     if not game_slug:
         return []
     conn = get_conn()
@@ -362,6 +544,7 @@ def get_custom_domain_files(game_slug: str) -> list:
 
 def remove_custom_domain_files(game_slug: str, paths: list) -> None:
     """撤销登记(卸载 custom mod 时清理,避免登记表冗余堆积)。"""
+    game_slug = _scope_game(game_slug)
     if not game_slug or not paths:
         return
     conn = get_conn()
@@ -380,6 +563,7 @@ def get_snapshot(snap_id: str) -> Optional[Snapshot]:
 
 
 def list_snapshots(game_slug: str = "") -> list:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         rows = conn.execute("SELECT * FROM snapshots WHERE game_slug=? ORDER BY timestamp DESC", (game_slug,)).fetchall()
@@ -400,9 +584,19 @@ def _log(conn: sqlite3.Connection, action: str, details: str):
     conn.execute("INSERT INTO operation_log (timestamp, action, details) VALUES (?,?,?)", (time.time(), action, details))
 
 
+def log_operation(action: str, details) -> None:
+    """记录不隶属于单一 CRUD 的用户可见操作（如快照回滚）。"""
+    conn = get_conn()
+    payload = details if isinstance(details, str) else json.dumps(details, ensure_ascii=False)
+    _log(conn, action, payload)
+    conn.commit()
+    conn.close()
+
+
 # ── Sessions ──
 
 def list_sessions(game_slug: str = "") -> list:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         rows = conn.execute("SELECT id, title, game_slug, created_at, updated_at FROM sessions WHERE game_slug=? ORDER BY updated_at DESC", (game_slug,)).fetchall()
@@ -420,11 +614,14 @@ def get_session(sid: str) -> dict | None:
 
 
 def create_session(sid: str, title: str = "", game_slug: str = "") -> dict:
+    game_slug = _scope_game(game_slug)
     now = time.time()
     conn = get_conn()
     conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?)",
-        (sid, title, game_slug, now, now, "[]"),
+        "INSERT INTO sessions "
+        "(id,title,game_slug,created_at,updated_at,messages,ui_state) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (sid, title, game_slug, now, now, "[]", "{}"),
     )
     conn.commit()
     conn.close()
@@ -441,6 +638,16 @@ def update_session_title(sid: str, title: str):
 def update_session_messages(sid: str, messages: list):
     conn = get_conn()
     conn.execute("UPDATE sessions SET messages=?, updated_at=? WHERE id=?", (json.dumps(messages, ensure_ascii=False), time.time(), sid))
+    conn.commit()
+    conn.close()
+
+
+def update_session_ui_state(sid: str, state: dict):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE sessions SET ui_state=?, updated_at=? WHERE id=?",
+        (json.dumps(state or {}, ensure_ascii=False), time.time(), sid),
+    )
     conn.commit()
     conn.close()
 

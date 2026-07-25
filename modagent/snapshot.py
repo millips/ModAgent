@@ -3,10 +3,31 @@ import os
 import re
 import shutil
 import time
+import filecmp
 
 from .config import CONFIG_DIR
 
 SNAPSHOTS_DIR = os.path.join(CONFIG_DIR, "snapshots")
+
+
+def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
+    """Move legacy snapshot folders under the selected install identity."""
+    if not legacy_slug or not instance_id or legacy_slug == instance_id:
+        return
+    source = os.path.join(SNAPSHOTS_DIR, legacy_slug)
+    target = os.path.join(SNAPSHOTS_DIR, instance_id)
+    if not os.path.isdir(source):
+        return
+    os.makedirs(target, exist_ok=True)
+    for name in os.listdir(source):
+        old = os.path.join(source, name)
+        new = os.path.join(target, name)
+        if not os.path.exists(new):
+            shutil.move(old, new)
+    try:
+        os.rmdir(source)
+    except OSError:
+        pass
 
 # 每游戏快照保留上限,超出自动淘汰最老的(最早的原版基线除外)。
 # 硬链接方案下删旧快照是安全的:文件 inode 引用计数还在,新快照不受影响。
@@ -36,6 +57,14 @@ _UE_INJECTOR_RE = re.compile(
 )
 
 GAME_SNAPSHOT_SPECS: dict[str, list[dict]] = {
+    # FFVII Rebirth:仅管理插件目录、~mods 与已知注入器。绝不能把整个
+    # End/Binaries/Win64、Engine/Plugins 当作 mod 域，否则 Steam 更新后回滚
+    # 旧快照会把新版游戏原生 DLL 覆盖回旧版。
+    "finalfantasy7rebirth": [
+        {"dir": "End/Mods", "include": None},
+        {"dir": "End/Content/Paks/~mods", "include": None},
+        {"dir": "End/Binaries/Win64", "include": _UE_INJECTOR_RE},
+    ],
     "stellarblade": [
         {"dir": "SB/Content/Paks/~mods", "include": None},
         {"dir": "SB/Content/Paks/LogicMods", "include": None},   # CNS 本体 pak 住这儿,v0.8 漏了
@@ -80,6 +109,29 @@ GAME_SNAPSHOT_SPECS: dict[str, list[dict]] = {
     ],
 }
 
+_PROFILE_ALIASES = {
+    "local_final_fantasy_vii_rebirth": "finalfantasy7rebirth",
+    "final_fantasy_vii_rebirth": "finalfantasy7rebirth",
+}
+
+
+def _snapshot_profile(game_slug: str, game_root: str = "") -> str:
+    """把手动导入的 local_* slug 映射到已知安全快照域。"""
+    slug = str(game_slug or "").strip().lower()
+    if slug in GAME_SNAPSHOT_SPECS:
+        return slug
+    if slug in _PROFILE_ALIASES:
+        return _PROFILE_ALIASES[slug]
+    compact = re.sub(r"[^a-z0-9]+", "", slug)
+    root_compact = re.sub(r"[^a-z0-9]+", "", str(game_root or "").lower())
+    if "finalfantasyviirebirth" in compact or "finalfantasyviirebirth" in root_compact:
+        return "finalfantasy7rebirth"
+    return ""
+
+
+def is_known_snapshot_profile(game_slug: str, game_root: str = "") -> bool:
+    return bool(_snapshot_profile(game_slug, game_root))
+
 # 未知游戏:自动发现时命中这些目录名则纳入(整目录)
 _WATCH_DIR_NAMES = ("~mods", "mods", "mod", "plugins", "scripts",
                     "r6", "tweaks", "archive", "data", "skse", "win64")
@@ -101,7 +153,7 @@ def _auto_detect_specs(game_root: str, game_slug: str) -> list[dict]:
     """返回该游戏的快照域 spec 列表。已知游戏用硬编码表,未知游戏才走目录名嗅探;
     末尾并入该游戏 T2 登记的自定义落点(精确文件型 spec,不受嗌探目录名/6 目录上限约束)。
     custom_domains 表默认空 → 无登记时并入空集,现有游戏行为逐字不变。"""
-    known = GAME_SNAPSHOT_SPECS.get(game_slug)
+    known = GAME_SNAPSHOT_SPECS.get(_snapshot_profile(game_slug, game_root))
     if known:
         base = [s for s in known if os.path.isdir(os.path.join(game_root, s["dir"]))]
     elif not os.path.isdir(game_root):
@@ -234,6 +286,37 @@ def _same_file(a: str, b: str) -> bool:
         return False
 
 
+def _same_content(a: str, b: str) -> bool:
+    """回滚判定必须比较真实内容，不能只信可能被保留的 size/mtime。"""
+    try:
+        return filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
+
+
+def _path_in_specs(rel: str, specs: list[dict]) -> bool:
+    """判断清单路径是否仍属于当前安全域；用于隔离旧版过宽快照。"""
+    rel = _norm(rel).lstrip("./")
+    rel_lower = rel.lower()
+    for spec in specs:
+        if "files" in spec:
+            if rel_lower in {_norm(p).lstrip("./").lower() for p in spec["files"]}:
+                return True
+            continue
+        base = _norm(spec["dir"]).strip("/")
+        prefix = base + "/"
+        if rel_lower == base.lower():
+            inner = ""
+        elif rel_lower.startswith(prefix.lower()):
+            inner = rel[len(prefix):]
+        else:
+            continue
+        inc = spec.get("include")
+        if inc is None or inc.match(inner):
+            return True
+    return False
+
+
 def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
                     trigger_mod_name: str = "") -> str:
     """
@@ -251,6 +334,8 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
     if not os.path.isdir(game_root):
         raise FileNotFoundError(f"游戏目录不存在: {game_root}")
 
+    from .config import load as load_config, game_storage_id
+    game_instance_id = game_storage_id(load_config(), game_slug)
     specs = _auto_detect_specs(game_root, game_slug)
     rel_files = sorted(set(_iter_domain_files(game_root, specs)))
 
@@ -267,7 +352,7 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
 
     base = time.strftime("%Y%m%d_%H%M%S")
     snap_id = f"snap_{base}"
-    game_snap_root = os.path.join(SNAPSHOTS_DIR, game_slug)
+    game_snap_root = os.path.join(SNAPSHOTS_DIR, game_instance_id)
     # ID 去重必须同时查目录和 DB:目录按游戏分桶,DB 的 id 却是全局唯一——
     # 只查目录的话,同一秒内给两个不同游戏建快照会目录不撞、DB 撞(IntegrityError)。
     from .db import get_snapshot
@@ -300,6 +385,8 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
                         pass  # 跨卷/文件系统不支持 → 退回拷贝
             shutil.copy2(src, dst)
             copied += 1
+        from . import user_config
+        external_configs = user_config.capture_snapshot(game_slug, snap_dir)
     except Exception as e:
         shutil.rmtree(snap_dir, ignore_errors=True)
         raise RuntimeError(
@@ -311,9 +398,11 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
         "schema": 2,                     # v2: files 为相对路径
         "baseline": not rel_files,       # True = 原版基线(域内无 mod),回滚到它即清空所有 mod
         "workshop": _workshop_state(game_root),  # 工坊订阅集(不在游戏目录,以清单形式入快照)
+        "external_configs": external_configs,    # Documents/AppData 等受控用户配置
         "timestamp": time.time(),
         "game_root": game_root,
         "game_slug": game_slug,
+        "game_instance_id": game_instance_id,
         "specs": [({"files_count": len(s["files"])} if "files" in s
                    else {"dir": s["dir"], "filtered": s.get("include") is not None})
                   for s in specs],
@@ -331,10 +420,10 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
         id=snap_id, timestamp=time.time(),
         files=json.dumps(rel_files),
         trigger_mod_id=trigger_mod_id, trigger_mod_name=trigger_mod_name,
-        game_slug=game_slug,
+        game_slug=game_instance_id,
     ))
 
-    _prune_old_snapshots(game_slug)   # 保留策略:超上限淘汰最老的(基线除外),失败不阻塞
+    _prune_old_snapshots(game_instance_id)   # 保留策略:超上限淘汰最老的(基线除外),失败不阻塞
 
     return snap_id
 
@@ -385,6 +474,93 @@ def _prune_old_snapshots(game_slug: str) -> list[str]:
     return pruned
 
 
+def snapshot_storage_usage(game_slug: str = "") -> dict:
+    """Measure snapshot storage without double-counting incremental hard links.
+
+    ``logical_bytes`` is what a normal recursive size calculation reports.
+    ``deduplicated_bytes`` counts each filesystem file identity once and is the
+    useful approximation of actual payload stored on disk. ``exclusive_bytes``
+    per snapshot estimates what deleting that snapshot alone can immediately
+    release; shared hard-linked files intentionally count as zero there.
+    """
+    from .db import list_snapshots
+
+    rows = list_snapshots(game_slug) if game_slug else list_snapshots()
+    row_by_dir = {}
+    invalid = 0
+    for row in rows:
+        snap_dir = os.path.join(SNAPSHOTS_DIR, row.game_slug or "", row.id)
+        if not os.path.isdir(snap_dir):
+            legacy = os.path.join(SNAPSHOTS_DIR, row.id)
+            snap_dir = legacy if os.path.isdir(legacy) else ""
+        if snap_dir:
+            row_by_dir[os.path.normcase(os.path.realpath(snap_dir))] = row
+        else:
+            invalid += 1
+
+    # Also scan directories not present in the DB. Older builds could leave
+    # these behind after ledger resets/migrations; hiding them would make the
+    # capacity figure misleading even though they still consume disk space.
+    scan_roots = []
+    scoped_root = os.path.join(SNAPSHOTS_DIR, game_slug) if game_slug else ""
+    if scoped_root and os.path.isdir(scoped_root):
+        scan_roots.append(scoped_root)
+    elif not game_slug and os.path.isdir(SNAPSHOTS_DIR):
+        scan_roots.append(SNAPSHOTS_DIR)
+    discovered_dirs = set(row_by_dir)
+    for root in scan_roots:
+        for current, dirs, files in os.walk(root):
+            if "manifest.json" in files:
+                discovered_dirs.add(os.path.normcase(os.path.realpath(current)))
+                dirs[:] = []
+
+    unique_files: dict[tuple[int, int], int] = {}
+    details: dict[str, dict] = {}
+    total_logical = 0
+    orphan_count = orphan_logical = orphan_exclusive = 0
+    for normalized_dir in discovered_dirs:
+        snap_dir = normalized_dir
+        logical = exclusive = file_count = 0
+        for current, _, files in os.walk(snap_dir):
+            for filename in files:
+                path = os.path.join(current, filename)
+                try:
+                    stat = os.stat(path, follow_symlinks=False)
+                except OSError:
+                    continue
+                file_count += 1
+                logical += stat.st_size
+                identity = (stat.st_dev, stat.st_ino)
+                unique_files.setdefault(identity, stat.st_size)
+                if stat.st_nlink <= 1:
+                    exclusive += stat.st_size
+        total_logical += logical
+
+        row = row_by_dir.get(normalized_dir)
+        if row:
+            details[row.id] = {
+                "logical_bytes": logical,
+                "exclusive_bytes": exclusive,
+                "stored_files": file_count,
+            }
+        else:
+            orphan_count += 1
+            orphan_logical += logical
+            orphan_exclusive += exclusive
+
+    return {
+        "snapshot_count": len(rows),
+        "valid_snapshot_count": len(details),
+        "invalid_snapshot_count": invalid,
+        "orphan_snapshot_count": orphan_count,
+        "orphan_logical_bytes": orphan_logical,
+        "orphan_exclusive_bytes": orphan_exclusive,
+        "logical_bytes": total_logical,
+        "deduplicated_bytes": sum(unique_files.values()),
+        "snapshots": details,
+    }
+
+
 def _locate_snapshot(snapshot_id: str) -> tuple[str, dict]:
     """定位快照目录并读 manifest(按 <slug>/<id> 分桶,兼容旧版平铺布局)。"""
     from .db import get_snapshot
@@ -418,6 +594,8 @@ def _restore_plan(snap_dir: str, manifest: dict) -> dict:
     if not os.path.isdir(game_root):
         raise FileNotFoundError(f"游戏目录不存在: {game_root}")
 
+    specs = _auto_detect_specs(game_root, game_slug)
+
     # 兼容 v0.8 快照(schema 1:files 存的是绝对路径)
     raw_files = manifest.get("files", [])
     if manifest.get("schema", 1) >= 2:
@@ -430,7 +608,10 @@ def _restore_plan(snap_dir: str, manifest: dict) -> dict:
             except ValueError:
                 continue
 
-    specs = _auto_detect_specs(game_root, game_slug)
+    # schema 2 时代的开放模式会嗅探整个 Win64/Engine/Plugins，可能把游戏
+    # 原生文件写进快照。按当前安全域过滤旧清单，绝不把过宽历史载荷恢复回去。
+    ignored_unsafe = sorted(p for p in snap_files if not _path_in_specs(p, specs))
+    snap_files = {p for p in snap_files if _path_in_specs(p, specs)}
     live_files = set(_iter_domain_files(game_root, specs))
 
     to_delete = sorted(live_files - snap_files)      # 快照后新增物
@@ -443,7 +624,7 @@ def _restore_plan(snap_dir: str, manifest: dict) -> dict:
             missing_in_snapshot.append(rel)
             continue
         dst = os.path.join(game_root, rel.replace("/", os.sep))
-        if os.path.exists(dst) and _same_file(src, dst):
+        if os.path.exists(dst) and _same_content(src, dst):
             unchanged += 1                           # 内容一致,免拷
         else:
             to_restore.append(rel)
@@ -451,9 +632,10 @@ def _restore_plan(snap_dir: str, manifest: dict) -> dict:
     return {
         "game_root": game_root, "game_slug": game_slug,
         "specs": [(s["dir"] if "dir" in s else f"[自定义落点×{len(s['files'])}]") for s in specs],
-        "domain_sniffed": game_slug not in GAME_SNAPSHOT_SPECS,   # True = 开放模式嗅探域
+        "domain_sniffed": not is_known_snapshot_profile(game_slug, game_root),
         "to_delete": to_delete, "to_restore": to_restore,
         "unchanged": unchanged, "missing_in_snapshot": missing_in_snapshot,
+        "ignored_unsafe_snapshot_files": ignored_unsafe,
     }
 
 
@@ -462,6 +644,8 @@ def snapshot_restore_preview(snapshot_id: str) -> dict:
     前端确认弹窗与开放模式强制确认门都吃这份数据。"""
     snap_dir, manifest = _locate_snapshot(snapshot_id)
     plan = _restore_plan(snap_dir, manifest)
+    from . import user_config
+    external = user_config.preview_snapshot(snap_dir, manifest)
 
     ws = manifest.get("workshop")
     ws_preview = None
@@ -482,7 +666,10 @@ def snapshot_restore_preview(snapshot_id: str) -> dict:
         "to_restore": plan["to_restore"], "to_restore_count": len(plan["to_restore"]),
         "unchanged_count": plan["unchanged"],
         "missing_in_snapshot": plan["missing_in_snapshot"],
+        "ignored_unsafe_snapshot_files": plan["ignored_unsafe_snapshot_files"],
+        "ignored_unsafe_snapshot_count": len(plan["ignored_unsafe_snapshot_files"]),
         "workshop": ws_preview,
+        "external_configs": external,
     }
 
 
@@ -524,10 +711,54 @@ def snapshot_restore(snapshot_id: str) -> dict:
         except OSError as e:
             failed["restore"].append({"rel": rel, **classify_oserror(e, dst)})
 
+    # 文件删除后清掉域内空目录，避免诊断工具只看到 GITifa/FF7RML 等空壳目录
+    # 就误判为“Mod 仍残留”。只处理目录型安全域，绝不向上删除游戏目录。
+    directories_removed = 0
+    for spec in _auto_detect_specs(game_root, manifest.get("game_slug", "")):
+        if "dir" not in spec:
+            continue
+        base = os.path.join(game_root, spec["dir"].replace("/", os.sep))
+        if not os.path.isdir(base):
+            continue
+        for current, _, _ in os.walk(base, topdown=False):
+            if current == base:
+                continue
+            try:
+                os.rmdir(current)
+                directories_removed += 1
+            except OSError:
+                pass
+
     ws = manifest.get("workshop")
     ws_result = _reconcile_workshop(game_root, ws) if ws and ws.get("appid") else None
-    return {"deleted": deleted, "restored": restored, "failed": failed,
-            "files_restored": restored + deleted, "workshop": ws_result}
+    from . import user_config
+    external_result = user_config.restore_snapshot(snap_dir, manifest)
+    # 执行后用同一差分器重新核验。只有差分归零才叫完成；目录存在与否不能
+    # 替代文件级验证，也不能因 restored=0（原本一致）误判为未恢复。
+    after = _restore_plan(snap_dir, manifest)
+    complete = (not after["to_delete"] and not after["to_restore"]
+                and not after["missing_in_snapshot"]
+                and not failed["delete"] and not failed["restore"]
+                and external_result.get("complete"))
+    return {
+        "status": "complete" if complete else "incomplete",
+        "complete": complete,
+        "deleted": deleted,
+        "restored": restored,
+        "unchanged_verified": after["unchanged"],
+        "verified_target_files": after["unchanged"],
+        "pending_delete": after["to_delete"],
+        "pending_restore": after["to_restore"],
+        "missing_in_snapshot": after["missing_in_snapshot"],
+        "ignored_unsafe_snapshot_files": after["ignored_unsafe_snapshot_files"],
+        # 旧字段保留，但语义改为“实际复制还原数”；不再把删除伪装成还原。
+        "files_restored": restored,
+        "operations_applied": deleted + restored,
+        "directories_removed": directories_removed,
+        "failed": failed,
+        "workshop": ws_result,
+        "external_configs": external_result,
+    }
 
 
 def list_snapshots_dir() -> list[str]:

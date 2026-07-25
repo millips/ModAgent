@@ -24,6 +24,10 @@ for mod_id, version in (("1", "1.0"), ("2", "2.0"), ("src_local", "1.0")):
         id=mod_id, name=f"Mod {mod_id}", version=version, snapshot_id="",
         game_slug="repo",
     ))
+db.upsert_mod_source_binding(
+    "repo", "src_local", "nexus", "3",
+    "https://www.nexusmods.com/repo/mods/3", .99, "exact_name", "1.1",
+)
 
 active = 0
 max_active = 0
@@ -56,11 +60,12 @@ result = json.loads(tools.execute("mod_update_check", {}, cfg))
 tools.nexus.get_mod = real_get_mod
 
 assert max_active >= 2
-assert result["checked_nexus"] == 2
-assert result["unchecked_non_nexus"] == 1
-assert result["dependencies_refreshed"] == 2
+assert result["checked_nexus"] == 3
+assert result["unchecked_non_nexus"] == 0
+assert result["dependencies_refreshed"] == 3
 assert result["failed_checks"] == []
 assert result["updates_available"][0]["mod_id"] == "1"
+assert any(item["mod_id"] == "src_local" for item in result["updates_available"])
 assert db.parse_dependencies(db.get_mod("1", "repo").dependencies) == ["100"]
 assert db.parse_dependencies(db.get_mod("2", "repo").dependencies) == ["101"]
 

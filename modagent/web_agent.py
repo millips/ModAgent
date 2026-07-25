@@ -36,6 +36,7 @@ ALLOWED_HOST_SUFFIXES = (
 
 _TAB_HANDLES: dict[str, str] = {}
 _NEXT_TAB_HANDLE = 1
+_TARGET_HINTS: dict[tuple[str, str], dict] = {}
 
 
 def _stable_handle(tab_id: str) -> str:
@@ -105,7 +106,7 @@ def _select_tab(cdp_port: int, tab_id: str = "") -> dict:
             raise RuntimeError("指定页面不存在、已关闭或不属于允许的 Mod 站点")
         return match
     if not tabs:
-        raise RuntimeError("Chrome 中没有已打开的受支持 Mod 站点页面")
+        raise RuntimeError("ModAgent 浏览器中没有已打开的受支持 Mod 站点页面")
     # Chrome's /json/list normally returns the most recently active page first.
     return tabs[0]
 
@@ -143,7 +144,9 @@ async def _evaluate(tab: dict, expression: str, await_promise: bool = False):
             return result.get("result", {}).get("value")
 
 
-async def _native_click(tab: dict, target_id: str) -> dict:
+async def _native_click(
+    tab: dict, target_id: str, target_hint: Optional[dict] = None,
+) -> dict:
     """Click at the rendered element's centre using trusted CDP mouse events."""
     import websockets
 
@@ -151,10 +154,64 @@ async def _native_click(tab: dict, target_id: str) -> dict:
     if not ws_url:
         raise RuntimeError("页面缺少 CDP WebSocket 地址")
     safe_target = json.dumps(str(target_id))
+    safe_hint = json.dumps(target_hint or {}, ensure_ascii=False)
     prepare = f"""
     (() => {{
       const id = {safe_target};
-      const el = document.querySelector(`[data-modagent-target="${{CSS.escape(id)}}"]`);
+      const hint = {safe_hint};
+      const findDeep = root => {{
+        const direct = root.querySelector?.(`[data-modagent-target="${{CSS.escape(id)}}"]`);
+        if (direct) return direct;
+        for (const node of root.querySelectorAll?.('*') || []) {{
+          if (node.shadowRoot) {{
+            const found = findDeep(node.shadowRoot);
+            if (found) return found;
+          }}
+        }}
+        return null;
+      }};
+      let el = findDeep(document);
+      if (!el && (hint.text || hint.href)) {{
+        const visible = node => {{
+          const r = node.getBoundingClientRect();
+          const s = getComputedStyle(node);
+          return r.width > 0 && r.height > 0 &&
+            s.display !== 'none' && s.visibility !== 'hidden';
+        }};
+        const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+        const candidates = [];
+        const visit = root => {{
+          if (!root?.querySelectorAll) return;
+          for (const node of root.querySelectorAll(
+            'a[href],button,input,[role="button"],[role="link"]'
+          )) {{
+            if (visible(node)) candidates.push(node);
+            if (node.shadowRoot) visit(node.shadowRoot);
+          }}
+          for (const node of root.querySelectorAll('*')) {{
+            if (node.shadowRoot) visit(node.shadowRoot);
+          }}
+        }};
+        visit(document);
+        const exactHref = candidates.filter(node =>
+          hint.href && String(node.href || '') === String(hint.href)
+        );
+        const exactText = candidates.filter(node =>
+          hint.text && clean(
+            node.innerText || node.value || node.getAttribute('aria-label')
+          ) === clean(hint.text)
+        );
+        const ranked = (exactHref.length ? exactHref : exactText).sort(
+          (a, b) => Number(!!b.closest(
+            '[role="dialog"],dialog,.modal,[class*="modal"]'
+          )) - Number(!!a.closest(
+            '[role="dialog"],dialog,.modal,[class*="modal"]'
+          ))
+        );
+        if (ranked.length === 1 || (hint.href && exactHref.length >= 1)) {{
+          el = ranked[0];
+        }}
+      }}
       if (!el) return {{status:'target_missing', target_id:id}};
       if (el.disabled || el.getAttribute('aria-disabled') === 'true')
         return {{status:'target_disabled', target_id:id}};
@@ -249,7 +306,20 @@ _OBSERVE_SCRIPT = r"""
       Number(style.opacity || 1) > 0;
   };
   const selector = 'a[href],button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"]';
-  document.querySelectorAll('[data-modagent-target]')
+  const deepElements = root => {
+    const found = [];
+    const visit = node => {
+      if (!node?.querySelectorAll) return;
+      for (const el of node.querySelectorAll('*')) {
+        found.push(el);
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(root);
+    return found;
+  };
+  const allNodes = deepElements(document);
+  allNodes.filter(el => el.hasAttribute?.('data-modagent-target'))
     .forEach(el => el.removeAttribute('data-modagent-target'));
   const observationId = (window.__modAgentObservationId || 0) + 1;
   window.__modAgentObservationId = observationId;
@@ -263,7 +333,7 @@ _OBSERVE_SCRIPT = r"""
     if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') value += 15;
     return value;
   };
-  const elements = [...document.querySelectorAll(selector)]
+  const elements = allNodes.filter(el => el.matches?.(selector))
     .filter(visible)
     .sort((a, b) => score(b) - score(a))
     .slice(0, 180);
@@ -286,7 +356,8 @@ _OBSERVE_SCRIPT = r"""
       disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true'
     };
   });
-  const dialogs = [...document.querySelectorAll('[role="dialog"],dialog,.modal,[class*="modal"]')]
+  const dialogs = allNodes.filter(el =>
+      el.matches?.('[role="dialog"],dialog,.modal,[class*="modal"]'))
     .filter(visible)
     .map(el => clean(el.innerText).slice(0, 2000))
     .filter(Boolean)
@@ -326,6 +397,13 @@ def observe(cdp_port: int, tab_id: str = "") -> dict:
             raise RuntimeError("页面观察返回了异常数据")
         result["tab_id"] = tab.get("id")
         result["stable_id"] = _stable_handle(tab.get("id", ""))
+        for control in result.get("controls", []):
+            target_id = control.get("target_id")
+            if target_id:
+                _TARGET_HINTS[(tab.get("id", ""), target_id)] = dict(control)
+        if len(_TARGET_HINTS) > 1200:
+            for key in list(_TARGET_HINTS)[:400]:
+                _TARGET_HINTS.pop(key, None)
         enhanced = playwright_driver.aria_snapshot(
             cdp_port, result.get("url", ""), result.get("title", "")
         )
@@ -347,9 +425,11 @@ def click(cdp_port: int, target_id: str, tab_id: str = "") -> dict:
             cdp_port, tab.get("url", ""), target_id, tab.get("title", "")
         )
         if result.get("status") in {
-            "unavailable", "page_not_found", "failed"
+            "unavailable", "page_not_found", "failed",
+            "target_missing", "target_ambiguous",
         }:
-            result = asyncio.run(_native_click(tab, target_id))
+            hint = _TARGET_HINTS.get((tab.get("id", ""), target_id))
+            result = asyncio.run(_native_click(tab, target_id, hint))
         time.sleep(0.8)
         after_tabs = _tabs(cdp_port)
         new_tabs = [item for item in after_tabs if item.get("id") not in before_tabs]
@@ -373,7 +453,18 @@ def input_text(
     (() => {{
       const id = {safe_target};
       const value = {safe_value};
-      const el = document.querySelector(`[data-modagent-target="${{CSS.escape(id)}}"]`);
+      const findDeep = root => {{
+        const direct = root.querySelector?.(`[data-modagent-target="${{CSS.escape(id)}}"]`);
+        if (direct) return direct;
+        for (const node of root.querySelectorAll?.('*') || []) {{
+          if (node.shadowRoot) {{
+            const found = findDeep(node.shadowRoot);
+            if (found) return found;
+          }}
+        }}
+        return null;
+      }};
+      const el = findDeep(document);
       if (!el) return {{status:'target_missing', target_id:id}};
       const type = String(el.type || '').toLowerCase();
       const autocomplete = String(el.autocomplete || '').toLowerCase();

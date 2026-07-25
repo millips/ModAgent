@@ -1,4 +1,7 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, crashReporter } = require('electron');
+const {
+  app, BrowserWindow, Menu, ipcMain, shell, dialog, crashReporter,
+  Notification, clipboard, safeStorage,
+} = require('electron');
 const { spawn, exec } = require('child_process');
 const path = require('path');
 const http = require('http');
@@ -7,23 +10,36 @@ const os = require('os');
 const fs = require('fs');
 const { getAppIdentity } = require('./appIdentity');
 const { createSecurityStore } = require('./securityStore');
-const { createRuntimeDiagnostics } = require('./runtimeDiagnostics');
+const { createLicenseStore } = require('./licenseStore');
+const { createRuntimeDiagnostics, buildDiagnosticReport } = require('./runtimeDiagnostics');
 const { setupAutoUpdater } = require('./updater');
+const { findInstalledBrowser, profileDirectory } = require('./browserLauncher');
 
 const PACKAGE_INFO = require('./package.json');
 const IDENTITY = getAppIdentity(PACKAGE_INFO);
 const APP_EDITION = IDENTITY.edition;
 const IS_SMOKE_TEST = process.argv.includes('--smoke-test');
-const DATA_DIR = path.resolve(process.env.MODAGENT_DATA_DIR || path.join(os.homedir(), '.modagent'));
+// ModAgent's startup cue is part of the desktop shell, not page media. Allow it
+// to begin as soon as the renderer is ready; the renderer still retries safely
+// on the first gesture if a device is temporarily unavailable.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+const DEFAULT_DATA_FOLDER = IDENTITY.isBeta ? '.modagent-beta' : '.modagent';
+const DATA_DIR = path.resolve(process.env.MODAGENT_DATA_DIR || path.join(os.homedir(), DEFAULT_DATA_FOLDER));
 const BG_DIR = path.join(DATA_DIR, 'editions', APP_EDITION, 'bg');
 const APP_USER_DATA = IS_SMOKE_TEST && process.env.MODAGENT_USER_DATA_DIR
   ? path.resolve(process.env.MODAGENT_USER_DATA_DIR)
   : path.join(app.getPath('appData'), IDENTITY.userDataFolder);
-
 const TRUSTED_EXTERNAL_HOSTS = new Set([
   'www.nexusmods.com',
   'app.tavily.com',
   'platform.deepseek.com',
+  'platform.openai.com',
+  'github.com',
+  'www.github.com',
+  'afdian.com',
+  'www.afdian.com',
+  'ifdian.net',
+  'www.ifdian.net',
 ]);
 
 async function openTrustedExternal(rawUrl) {
@@ -51,6 +67,13 @@ const diagnostics = createRuntimeDiagnostics({
 });
 const { logger } = diagnostics;
 const securityStore = createSecurityStore(DATA_DIR, logger);
+const pLicenseStore = createLicenseStore({
+  dataDir: DATA_DIR,
+  edition: APP_EDITION,
+  safeStorage,
+  publicKeyPath: path.join(__dirname, 'assets', 'license', 'p-public-key.pem'),
+  logger,
+});
 const launchState = diagnostics.beginLaunch();
 
 fs.mkdirSync(path.join(diagnostics.logsDir, 'crashes'), { recursive: true });
@@ -58,11 +81,16 @@ app.setPath('crashDumps', path.join(diagnostics.logsDir, 'crashes'));
 
 let mainWindow = null;
 let pythonProcess = null;
-let chromeProcess = null;
+let browserProcess = null;
 let backendRestartTimer = null;
 let backendRestartCount = 0;
 let backendReady = false;
+let rendererReady = false;
+let healthMarkScheduled = false;
+let smokeTestCompleted = false;
+let smokeTestTimeout = null;
 let isQuitting = false;
+let replyAttentionPending = false;
 let activeSecrets = {};
 let API_PORT = 18890;
 let API_BASE = `http://127.0.0.1:${API_PORT}`;
@@ -72,10 +100,14 @@ const API_TOKEN = crypto.randomBytes(32).toString('hex');
 process.env.MODAGENT_API_TOKEN = API_TOKEN;
 process.env.MODAGENT_DATA_DIR = DATA_DIR;
 process.env.MODAGENT_EDITION = APP_EDITION;
+process.env.MODAGENT_CHANNEL = IDENTITY.channel;
 process.env.MODAGENT_SECURE_SECRETS = '1';
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock({ edition: APP_EDITION });
-if (!gotSingleInstanceLock) app.quit();
+if (!gotSingleInstanceLock) {
+  if (IS_SMOKE_TEST) process.exitCode = 1;
+  app.quit();
+}
 
 function findAvailableApiPort(preferredPort) {
   const probe = port => new Promise((resolve, reject) => {
@@ -93,19 +125,24 @@ function findAvailableApiPort(preferredPort) {
   });
 }
 
-function killStaleChrome(callback) {
-  const ps = "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'chrome.exe' -and $_.CommandLine -like '*remote-debugging-port=" + CDP_PORT + "*' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }";
+function killStaleCdpBrowser(callback) {
+  const ps = "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe','msedge.exe','brave.exe') -and $_.CommandLine -like '*remote-debugging-port=" + CDP_PORT + "*' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }";
   exec(`powershell -NoProfile -Command "${ps}"`, () => callback());
 }
 
-function startChrome() {
-  killStaleChrome(() => {
-    exec('reg query "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe" /ve', (error, stdout) => {
-      const match = stdout && stdout.match(/REG_SZ\s+(.+)/);
-      const chromePath = match ? match[1].trim() : path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe');
+function startCdpBrowser() {
+  killStaleCdpBrowser(() => {
+      const browser = findInstalledBrowser(process.env, DATA_DIR);
+      if (!browser) {
+        logger.error('No supported Chromium browser found', {
+          supported: ['Microsoft Edge', 'Google Chrome', 'Brave'],
+          port: CDP_PORT,
+        });
+        return;
+      }
       const args = [
         `--remote-debugging-port=${CDP_PORT}`,
-        `--user-data-dir=${path.join(DATA_DIR, 'chrome_profile')}`,
+        `--user-data-dir=${profileDirectory(DATA_DIR, browser.id)}`,
         '--window-size=1000,720',
         '--window-position=120,80',
         '--no-first-run',
@@ -114,13 +151,19 @@ function startChrome() {
         'https://steamcommunity.com/',
       ];
       try {
-        chromeProcess = spawn(chromePath, args, { stdio: 'ignore', detached: true });
-        chromeProcess.unref();
-        logger.info('Chrome CDP started', { port: CDP_PORT });
+        browserProcess = spawn(browser.executable, args, { stdio: 'ignore', detached: true });
+        browserProcess.unref();
+        browserProcess.once('error', spawnError => {
+          logger.error(`${browser.name} CDP failed to start`, spawnError);
+        });
+        logger.info('CDP browser started', {
+          browser: browser.name,
+          executable: browser.executable,
+          port: CDP_PORT,
+        });
       } catch (spawnError) {
-        logger.error('Chrome CDP failed to start', spawnError);
+        logger.error(`${browser.name} CDP failed to start`, spawnError);
       }
-    });
   });
 }
 
@@ -144,7 +187,7 @@ function startBackend() {
   const command = backendCommand();
   if (app.isPackaged && !fs.existsSync(command.executable)) {
     logger.error('Packaged backend executable is missing', command.executable);
-    dialog.showErrorBox(`${IDENTITY.productName} ????`, '?????????????????');
+    dialog.showErrorBox(`${IDENTITY.productName} 启动失败`, '应用后端组件缺失，请重新安装完整发行包。');
     return;
   }
   securityStore.applyToEnvironment(activeSecrets, process.env);
@@ -155,12 +198,16 @@ function startBackend() {
     env: {
       ...process.env,
       PYTHONUNBUFFERED: '1',
+      PYTHONIOENCODING: 'utf-8',
+      PYTHONUTF8: '1',
       MODAGENT_API_TOKEN: API_TOKEN,
       MODAGENT_API_PORT: String(API_PORT),
     },
   });
-  pythonProcess.stdout.on('data', data => logger.info('[API]', data.toString().trim()));
-  pythonProcess.stderr.on('data', data => logger.error('[API]', data.toString().trim()));
+  pythonProcess.stdout.setEncoding('utf8');
+  pythonProcess.stderr.setEncoding('utf8');
+  pythonProcess.stdout.on('data', data => logger.info('[API]', data.trim()));
+  pythonProcess.stderr.on('data', data => logger.error('[API]', data.trim()));
   pythonProcess.on('error', error => logger.error('Backend spawn error', error));
   pythonProcess.on('close', code => {
     logger.warn('Backend exited', { code, isQuitting });
@@ -194,15 +241,49 @@ function waitForAPI(retries = 30) {
   });
 }
 
+function finishSmokeTest(ok, detail = '') {
+  if (!IS_SMOKE_TEST || smokeTestCompleted) return;
+  smokeTestCompleted = true;
+  if (smokeTestTimeout) {
+    clearTimeout(smokeTestTimeout);
+    smokeTestTimeout = null;
+  }
+  if (!ok) {
+    process.exitCode = 1;
+    logger.error('Packaged smoke test failed', detail);
+  } else {
+    logger.info('Packaged smoke test passed', {
+      rendererReady,
+      backendReady,
+      api: API_BASE,
+    });
+  }
+  setTimeout(() => app.quit(), 250);
+}
+
+function markHealthyWhenReady() {
+  if (!backendReady || !rendererReady || healthMarkScheduled) return;
+  healthMarkScheduled = true;
+  if (IS_SMOKE_TEST) {
+    diagnostics.markHealthy();
+    finishSmokeTest(true);
+    return;
+  }
+  setTimeout(() => diagnostics.markHealthy(), 4000);
+}
+
 function verifyBuiltEdition() {
   if (process.argv.includes('--dev')) return true;
   try {
     const marker = require(path.join(__dirname, 'dist', 'edition.json'));
-    if (marker.edition === APP_EDITION) return true;
-    dialog.showErrorBox(`${IDENTITY.productName} ???????`, `????? ${APP_EDITION}?????? ${marker.edition || 'unknown'}???????`);
+    if (marker.edition === APP_EDITION && (marker.channel || 'stable') === IDENTITY.channel) return true;
+    dialog.showErrorBox(
+      `${IDENTITY.productName} 版本校验失败`,
+      `当前程序要求 ${APP_EDITION}/${IDENTITY.channel} 资源，但检测到 ${marker.edition || 'unknown'}/${marker.channel || 'stable'}。为防止版本资产混用，应用已停止启动。`,
+    );
   } catch (error) {
     logger.error('Edition marker missing', error);
-    dialog.showErrorBox(`${IDENTITY.productName} ??????`, '???????????????');
+    dialog.showErrorBox(`${IDENTITY.productName} 版本校验失败`, '未找到版本标记文件，请重新安装完整发行包。');
   }
   return false;
 }
@@ -211,12 +292,12 @@ async function offerRollbackIfNeeded() {
   if (!launchState.shouldOfferRollback) return false;
   const result = await dialog.showMessageBox({
     type: 'warning',
-    title: `${IDENTITY.productName} ????`,
-    message: '??????????????',
+    title: `${IDENTITY.productName} 启动恢复`,
+    message: '检测到新版本连续启动失败。',
     detail: launchState.previousVersion
-      ? `???????????? ${launchState.previousVersion}?`
-      : '?????????????',
-    buttons: ['??', '????'],
+      ? `是否运行已验证的安装程序，回退到 ${launchState.previousVersion}？`
+      : '是否运行上一个已验证版本的安装程序？',
+    buttons: ['回退', '暂不回退'],
     defaultId: 0,
     cancelId: 1,
     noLink: true,
@@ -230,12 +311,13 @@ async function offerRollbackIfNeeded() {
     return true;
   } catch (error) {
     logger.error('Rollback installer failed to launch', error);
-    dialog.showErrorBox('??????', '????????????????????????');
+    dialog.showErrorBox('回退失败', '无法启动回退安装程序。请导出诊断信息后联系支持。');
     return false;
   }
 }
 
 async function createWindow() {
+  Menu.setApplicationMenu(null);
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -244,6 +326,7 @@ async function createWindow() {
     title: IDENTITY.productName,
     icon: IDENTITY.iconPath,
     backgroundColor: '#0d1117',
+    autoHideMenuBar: true,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -252,6 +335,7 @@ async function createWindow() {
       sandbox: true,
     },
   });
+  mainWindow.setMenuBarVisibility(false);
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
     const allowed = url.startsWith('file://') || (process.argv.includes('--dev') && url.startsWith('http://localhost:3000'));
@@ -269,14 +353,20 @@ async function createWindow() {
     if (process.argv.includes('--dev')) mainWindow.webContents.openDevTools();
   });
   mainWindow.on('closed', () => { mainWindow = null; });
-  mainWindow.webContents.on('render-process-gone', (_, details) => logger.error('Renderer process gone', details));
+  mainWindow.webContents.on('render-process-gone', (_, details) => {
+    logger.error('Renderer process gone', details);
+    finishSmokeTest(false, `renderer process gone: ${details.reason || 'unknown'}`);
+  });
   mainWindow.webContents.on('console-message', (_, level, message, line, sourceId) => {
     if (level >= 2) logger.error('Renderer console', { message, line, sourceId });
   });
-  mainWindow.webContents.on('did-fail-load', (_, code, description, url) => logger.error('Renderer load failed', { code, description, url }));
+  mainWindow.webContents.on('did-fail-load', (_, code, description, url) => {
+    logger.error('Renderer load failed', { code, description, url });
+    finishSmokeTest(false, `renderer load failed (${code}): ${description}`);
+  });
   mainWindow.webContents.once('did-finish-load', () => {
-    if (backendReady) setTimeout(() => diagnostics.markHealthy(), IS_SMOKE_TEST ? 250 : 4000);
-    if (IS_SMOKE_TEST) setTimeout(() => app.quit(), 1200);
+    rendererReady = true;
+    markHealthyWhenReady();
   });
 
   if (process.argv.includes('--dev')) await mainWindow.loadURL('http://localhost:3000');
@@ -290,9 +380,9 @@ function stopChildren() {
     pythonProcess.kill();
     pythonProcess = null;
   }
-  if (chromeProcess) {
-    try { chromeProcess.kill(); } catch (_) {}
-    chromeProcess = null;
+  if (browserProcess) {
+    try { browserProcess.kill(); } catch (_) {}
+    browserProcess = null;
   }
 }
 
@@ -313,27 +403,42 @@ if (gotSingleInstanceLock) {
       compress: true,
     });
     if (await offerRollbackIfNeeded()) return;
-    if (!verifyBuiltEdition()) { app.quit(); return; }
+    if (!verifyBuiltEdition()) {
+      if (IS_SMOKE_TEST) finishSmokeTest(false, 'packaged edition verification failed');
+      else app.quit();
+      return;
+    }
     activeSecrets = securityStore.migratePlaintextConfig();
     securityStore.applyToEnvironment(activeSecrets, process.env);
     API_PORT = await findAvailableApiPort(API_PORT);
     API_BASE = `http://127.0.0.1:${API_PORT}`;
-    if (!IS_SMOKE_TEST) startChrome();
+    if (IS_SMOKE_TEST) {
+      smokeTestTimeout = setTimeout(
+        () => finishSmokeTest(false, 'renderer and backend did not become healthy within 45 seconds'),
+        45000,
+      );
+    }
+    if (!IS_SMOKE_TEST) startCdpBrowser();
     startBackend();
-    try {
-      await waitForAPI(30);
+    await createWindow();
+    setupAutoUpdater({ identity: IDENTITY, diagnostics, getMainWindow: () => mainWindow });
+    waitForAPI(30).then(() => {
       backendReady = true;
       backendRestartCount = 0;
       logger.info('ModAgent API ready', API_BASE);
-    } catch (error) {
+      markHealthyWhenReady();
+    }).catch(error => {
       logger.error('Backend failed health check', error);
-    }
-    await createWindow();
-    setupAutoUpdater({ identity: IDENTITY, diagnostics, getMainWindow: () => mainWindow });
+      finishSmokeTest(false, error.message || String(error));
+    });
   }).catch(error => {
     logger.error('Fatal startup error', error);
-    dialog.showErrorBox(`${IDENTITY.productName} ????`, error.message || String(error));
-    app.quit();
+    if (IS_SMOKE_TEST) {
+      finishSmokeTest(false, error.message || String(error));
+    } else {
+      dialog.showErrorBox(`${IDENTITY.productName} 启动失败`, error.message || String(error));
+      app.quit();
+    }
   });
 }
 
@@ -349,7 +454,90 @@ app.on('activate', () => {
 
 ipcMain.handle('get-api-base', () => API_BASE);
 ipcMain.on('get-api-base-sync', event => { event.returnValue = API_BASE; });
+ipcMain.on('get-app-identity-sync', event => {
+  event.returnValue = {
+    edition: APP_EDITION,
+    productName: IDENTITY.productName,
+    version: PACKAGE_INFO.version,
+    channel: IDENTITY.channel,
+  };
+});
+ipcMain.on('get-p-license-status-sync', event => {
+  event.returnValue = pLicenseStore.status();
+});
+ipcMain.handle('get-p-license-status', () => pLicenseStore.status());
+ipcMain.handle('activate-p-license', (_, code) => {
+  try {
+    const status = pLicenseStore.activate(code);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('p-license-status', status);
+    }
+    return { ok: true, status };
+  } catch (error) {
+    logger.warn('ModAgent P activation failed', error.message);
+    return { ok: false, error: error.message || '兑换码验证失败' };
+  }
+});
 ipcMain.handle('open-external', (_, url) => openTrustedExternal(url));
+ipcMain.handle('notify-reply-complete', () => {
+  if (!mainWindow || mainWindow.isFocused()) return { ok: true, shown: false };
+  if (!replyAttentionPending) {
+    replyAttentionPending = true;
+    if (process.platform === 'win32') mainWindow.flashFrame(true);
+    mainWindow.once('focus', () => {
+      replyAttentionPending = false;
+      if (process.platform === 'win32' && mainWindow) mainWindow.flashFrame(false);
+    });
+  }
+  if (!Notification.isSupported()) return { ok: true, shown: false };
+  const notification = new Notification({
+    title: IDENTITY.productName,
+    body: '回复已经完成，可以回来查看了。',
+    silent: true,
+  });
+  notification.on('click', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+  notification.show();
+  return { ok: true, shown: true };
+});
+ipcMain.handle('select-game-directory', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择游戏安装目录',
+    properties: ['openDirectory'],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  const selected = path.resolve(result.filePaths[0]);
+  return {
+    path: selected,
+    suggestedName: path.basename(selected),
+  };
+});
+ipcMain.handle('select-mod-directory', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择 Mod 目录（支持 Vortex、MO2、Fluffy 或自定义目录）',
+    properties: ['openDirectory'],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  return { path: path.resolve(result.filePaths[0]) };
+});
+ipcMain.handle('select-game-executable', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择游戏主程序',
+    filters: [{ name: 'Windows executable', extensions: ['exe'] }],
+    properties: ['openFile'],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  const executable = path.resolve(result.filePaths[0]);
+  return {
+    path: path.dirname(executable),
+    executable,
+    suggestedName: path.basename(executable, path.extname(executable)),
+  };
+});
 ipcMain.handle('save-secrets', (_, updates = {}) => {
   const allowed = {};
   for (const key of ['nexus_api_key', 'llm_api_key', 'tavily_api_key']) {
@@ -360,36 +548,69 @@ ipcMain.handle('save-secrets', (_, updates = {}) => {
   return { ok: true };
 });
 ipcMain.handle('open-diagnostics-folder', () => shell.openPath(diagnostics.logsDir));
+ipcMain.handle('open-maintenance-folder', (_, kind) => {
+  const folders = {
+    logs: diagnostics.logsDir,
+    data: DATA_DIR,
+    cache: app.getPath('sessionData'),
+  };
+  const target = folders[String(kind || '')];
+  if (!target) return 'Unsupported maintenance folder';
+  fs.mkdirSync(target, { recursive: true });
+  return shell.openPath(target);
+});
+ipcMain.handle('copy-maintenance-path', (_, kind) => {
+  const folders = {
+    logs: diagnostics.logsDir,
+    data: DATA_DIR,
+    cache: app.getPath('sessionData'),
+  };
+  const target = folders[String(kind || '')];
+  if (!target) return { ok: false, error: 'Unsupported maintenance folder' };
+  clipboard.writeText(target);
+  return { ok: true, path: target };
+});
 ipcMain.handle('open-legal-document', (_, filename) => {
   const allowed = new Set([
     'PRIVACY.md',
     'THIRD-PARTY-MODS-DISCLAIMER.md',
-    'LICENSE.md',
+    'SUBSCRIPTION-REFUND-SUPPORT.md',
+    'SUBSCRIPTION-SOFTWARE-LICENSE.md',
+    'PROPRIETARY-ASSETS-LICENSE.md',
     'THIRD_PARTY_NOTICES.md',
+    'LICENSE.md',
   ]);
-  if (!allowed.has(filename)) return 'Document is not available';
-  const legalRoot = app.isPackaged
-    ? path.join(process.resourcesPath, 'legal')
-    : path.resolve(__dirname, '..');
-  return shell.openPath(path.join(legalRoot, filename));
+  const requested = path.basename(String(filename || ''));
+  if (!allowed.has(requested)) return 'Unsupported legal document';
+  const legalPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'legal', requested)
+    : path.resolve(__dirname, '..', requested);
+  if (!fs.existsSync(legalPath)) return 'Legal document is missing';
+  return shell.openPath(legalPath);
 });
 ipcMain.handle('export-runtime-diagnostics', async () => {
+  const report = buildDiagnosticReport({
+    diagnostics, productName: IDENTITY.productName,
+    version: PACKAGE_INFO.version, edition: APP_EDITION,
+  });
+  const preview = await dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '预览脱敏后的诊断信息',
+    message: '诊断内容已统一脱敏。请在保存前检查以下预览。',
+    detail: report.slice(0, 12000) + (report.length > 12000 ? '\n\n[预览已截断，导出文件包含完整脱敏内容]' : ''),
+    buttons: ['继续保存', '取消'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (preview.response !== 0) return null;
   const result = await dialog.showSaveDialog(mainWindow, {
-    title: '?? ModAgent ????',
+    title: '导出 ModAgent 诊断信息',
     defaultPath: path.join(app.getPath('documents'), `${IDENTITY.artifactPrefix}-diagnostics.txt`),
     filters: [{ name: 'Text', extensions: ['txt'] }],
   });
   if (result.canceled || !result.filePath) return null;
-  const sections = [];
-  sections.push(`${IDENTITY.productName} ${PACKAGE_INFO.version}`);
-  sections.push(`Generated: ${new Date().toISOString()}`);
-  sections.push(`Edition: ${APP_EDITION}`);
-  for (const filename of ['desktop.log', 'updater.log']) {
-    const filePath = path.join(diagnostics.logsDir, filename);
-    if (fs.existsSync(filePath)) sections.push(`\n===== ${filename} =====\n${fs.readFileSync(filePath, 'utf8').slice(-500000)}`);
-  }
-  if (fs.existsSync(diagnostics.stateFile)) sections.push(`\n===== runtime-state.json =====\n${fs.readFileSync(diagnostics.stateFile, 'utf8')}`);
-  fs.writeFileSync(result.filePath, sections.join('\n'), 'utf8');
+  fs.writeFileSync(result.filePath, report, 'utf8');
   return result.filePath;
 });
 
@@ -406,7 +627,7 @@ ipcMain.handle('get-bg-data-url', (_, filename) => {
 
 ipcMain.handle('select-bg', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: '??????',
+    title: '选择背景图片',
     filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp'] }],
     properties: ['openFile'],
   });
