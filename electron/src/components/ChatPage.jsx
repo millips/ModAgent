@@ -1309,7 +1309,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   }
 
   return (
-    <div className="chat-layout flex flex-1 overflow-hidden">
+    <div className={`chat-layout flex flex-1 overflow-hidden ${
+      sidebarOpen ? 'has-session-rail' : 'without-session-rail'
+    }`}>
       {sidebarOpen && (
         <div className="chat-session-rail w-56 min-w-[224px] bg-surface-800 border-r border-surface-600 flex flex-col">
           <div className="p-3 border-b border-surface-600">
