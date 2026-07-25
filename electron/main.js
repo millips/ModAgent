@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, crashReporter, Notification } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, shell, dialog, crashReporter, Notification } = require('electron');
 const { spawn, exec } = require('child_process');
 const path = require('path');
 const http = require('http');
@@ -299,6 +299,7 @@ async function offerRollbackIfNeeded() {
 }
 
 async function createWindow() {
+  Menu.setApplicationMenu(null);
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -307,6 +308,7 @@ async function createWindow() {
     title: IDENTITY.productName,
     icon: IDENTITY.iconPath,
     backgroundColor: '#0d1117',
+    autoHideMenuBar: true,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -315,6 +317,7 @@ async function createWindow() {
       sandbox: true,
     },
   });
+  mainWindow.setMenuBarVisibility(false);
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
     const allowed = url.startsWith('file://') || (process.argv.includes('--dev') && url.startsWith('http://localhost:3000'));

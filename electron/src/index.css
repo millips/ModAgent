@@ -2,6 +2,146 @@
 @tailwind components;
 @tailwind utilities;
 
+.app-shell {
+  position: relative;
+  isolation: isolate;
+}
+
+.app-sidebar {
+  position: relative;
+  z-index: 4;
+  transition:
+    width 240ms cubic-bezier(.2, .72, .2, 1),
+    min-width 240ms cubic-bezier(.2, .72, .2, 1),
+    margin 240ms cubic-bezier(.2, .72, .2, 1),
+    clip-path 240ms cubic-bezier(.2, .72, .2, 1);
+}
+
+.layout-choice {
+  min-height: 68px;
+  padding: 10px 12px;
+  border: 1px solid rgba(139, 148, 158, .28);
+  border-radius: 8px;
+  background: rgba(13, 17, 23, .38);
+  transition: border-color 150ms ease, background 150ms ease, transform 150ms ease;
+}
+
+.layout-choice:hover {
+  border-color: rgba(0, 212, 255, .45);
+  background: rgba(0, 212, 255, .055);
+}
+
+.layout-choice.is-active {
+  border-color: rgba(0, 212, 255, .68);
+  background:
+    linear-gradient(135deg, rgba(0, 212, 255, .13), rgba(162, 89, 255, .055));
+  box-shadow: inset 3px 0 0 rgba(0, 212, 255, .82);
+}
+
+/* Optional composition layer shared by Free and Pro. It preserves component
+   behavior while changing proportion, rhythm and silhouette. */
+body[data-ma-layout="designed"] .app-shell {
+  gap: clamp(8px, .9vw, 14px);
+  padding: clamp(8px, .8vw, 12px) clamp(10px, 1vw, 16px) clamp(10px, 1vw, 16px) 0;
+}
+
+body[data-ma-layout="designed"] .app-shell::before,
+body[data-ma-layout="designed"] .app-shell::after {
+  content: '';
+  position: absolute;
+  z-index: 0;
+  pointer-events: none;
+}
+
+body[data-ma-layout="designed"] .app-shell::before {
+  top: 0;
+  right: 10%;
+  width: min(38.2vw, 520px);
+  height: 7px;
+  background: linear-gradient(90deg, transparent, var(--ma-accent1, #00d4ff));
+  transform: skewX(-34deg);
+  opacity: .62;
+}
+
+body[data-ma-layout="designed"] .app-shell::after {
+  right: 0;
+  bottom: 0;
+  width: min(23.6vw, 330px);
+  height: 5px;
+  background: linear-gradient(90deg, var(--ma-accent2, #a259ff), transparent);
+  transform: skewX(34deg);
+  opacity: .48;
+}
+
+body[data-ma-layout="designed"] .app-sidebar {
+  width: clamp(220px, 19.1vw, 268px) !important;
+  min-width: clamp(220px, 19.1vw, 268px) !important;
+  margin-top: clamp(8px, 1.2vh, 14px);
+  margin-bottom: clamp(2px, .6vh, 8px);
+  padding-right: 12px;
+  clip-path: polygon(0 0, 93% 0, 100% 6%, 97% 100%, 0 100%);
+  box-shadow: 14px 0 36px rgba(0, 0, 0, .2);
+}
+
+body[data-ma-layout="designed"] .app-sidebar .nav-item {
+  width: calc(100% - 4px);
+  clip-path: polygon(0 0, 94% 0, 100% 50%, 94% 100%, 0 100%, 3% 50%);
+}
+
+body[data-ma-layout="designed"] .app-sidebar .nav-item:nth-child(2n) {
+  width: calc(100% - 18px);
+  margin-left: 14px;
+}
+
+body[data-ma-layout="designed"] .app-sidebar .nav-item:nth-child(3n) {
+  width: calc(100% - 10px);
+  margin-left: 5px;
+}
+
+body[data-ma-layout="designed"] .app-page-stage {
+  z-index: 1;
+  margin-top: clamp(20px, 3.4vh, 34px);
+  border: 1px solid color-mix(in srgb, var(--ma-accent1, #00d4ff) 22%, transparent);
+  clip-path: polygon(1.6% 0, 100% 0, 100% 96%, 98.4% 100%, 0 100%, 0 5%);
+  box-shadow: -10px 18px 48px rgba(0, 0, 0, .22);
+}
+
+body[data-ma-layout="designed"] .chat-session-rail {
+  width: clamp(210px, 23.6%, 250px) !important;
+  min-width: clamp(210px, 23.6%, 250px) !important;
+  margin-bottom: 2.5%;
+  clip-path: polygon(0 0, 100% 0, 94% 100%, 0 100%);
+}
+
+body[data-ma-layout="designed"] .chat-primary-pane {
+  flex: 1.618 1 0% !important;
+}
+
+body[data-ma-layout="designed"] .chat-quick-sidebar {
+  flex: 1 1 0% !important;
+  margin-top: clamp(18px, 3vh, 32px);
+  min-width: 250px;
+  clip-path: polygon(8% 0, 100% 0, 100% 100%, 0 100%, 0 8%);
+  padding-left: clamp(20px, 2vw, 30px);
+}
+
+@media (max-width: 1100px) {
+  body[data-ma-layout="designed"] .app-sidebar {
+    width: 220px !important;
+    min-width: 220px !important;
+  }
+
+  body[data-ma-layout="designed"] .chat-quick-sidebar {
+    min-width: 220px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-sidebar,
+  .layout-choice {
+    transition-duration: 1ms;
+  }
+}
 
 .app-page-stage {
   position: relative;

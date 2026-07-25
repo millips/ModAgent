@@ -1309,9 +1309,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   }
 
   return (
-    <div className="flex flex-1 overflow-hidden">
+    <div className="chat-layout flex flex-1 overflow-hidden">
       {sidebarOpen && (
-        <div className="w-56 min-w-[224px] bg-surface-800 border-r border-surface-600 flex flex-col">
+        <div className="chat-session-rail w-56 min-w-[224px] bg-surface-800 border-r border-surface-600 flex flex-col">
           <div className="p-3 border-b border-surface-600">
             <button onClick={newSession} className="btn-cyber w-full flex items-center justify-center gap-2">
               <Plus size={14} /> 新对话
@@ -1353,7 +1353,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         </div>
       )}
 
-      <div className="flex-[7] flex flex-col min-w-0">
+      <div className="chat-primary-pane flex-[7] flex flex-col min-w-0">
         <div className="relative z-30 flex items-center gap-3 px-3 py-2 border-b border-surface-600 bg-surface-800">
             <div className="relative">
               <input

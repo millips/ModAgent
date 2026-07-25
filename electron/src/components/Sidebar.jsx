@@ -16,7 +16,7 @@ const NAV = [
 export default function Sidebar({ page, onNav, status }) {
   const connecting = !status.online && status.mods == null && status.snaps == null
   return (
-    <aside className="w-52 min-w-[208px] bg-surface-800 border-r border-surface-600 flex flex-col">
+    <aside className="app-sidebar w-52 min-w-[208px] bg-surface-800 border-r border-surface-600 flex flex-col">
       <div className="p-4 border-b border-surface-600">
         <h1 className="text-lg font-bold text-cyber-cyan tracking-wide flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-cyber-cyan shadow-[0_0_8px_#00d4ff]"></span>

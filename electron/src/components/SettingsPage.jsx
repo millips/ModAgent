@@ -1,7 +1,11 @@
 import React, { useState, useEffect } from 'react'
-import { Key, Cpu, Globe, Image, Trash2, FolderOpen, FileDown, RefreshCw, Scale, FileText } from 'lucide-react'
+import { Key, Cpu, Globe, Image, Trash2, FolderOpen, FileDown, RefreshCw, Scale, FileText, PanelLeft } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
 import { SettingsEditionPanel, applyEditionDefaultBackground } from '@edition'
+import {
+  readLayoutPreference,
+  saveLayoutPreference,
+} from '../theme/layoutPreference'
 
 const COMMON_LEGAL_DOCUMENTS = [
   { file: 'PRIVACY.md', label: '隐私说明' },
@@ -28,6 +32,7 @@ export default function SettingsPage({ toast, api }) {
   const [model, setModel] = useState('deepseek-v4-pro')
   const [endpoint, setEndpoint] = useState('https://api.deepseek.com/v1')
   const [recommendationLimit, setRecommendationLimit] = useState(10)
+  const [layoutMode, setLayoutMode] = useState(readLayoutPreference)
   const [bg, setBg] = useState(null)
   const [bgUrl, setBgUrl] = useState(null)
 
@@ -248,6 +253,39 @@ export default function SettingsPage({ toast, api }) {
                 Math.max(2, Math.min(Number(recommendationLimit) || 10, 20))
               )}
             />
+          </div>
+        </div>
+
+        <div className="card-cyber space-y-3">
+          <div className="flex items-center gap-2">
+            <PanelLeft size={14} className="text-cyber-purple" />
+            <span className="text-sm font-medium">界面布局</span>
+          </div>
+          <p className="text-xs leading-relaxed text-surface-500">
+            只调整区域比例、留白和分区轮廓，不改变按钮含义与操作流程。
+          </p>
+          <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="界面布局">
+            {[
+              ['plain', '朴素版', '规整矩形与均衡间距'],
+              ['designed', '设计版', '黄金比例与非对称分区'],
+            ].map(([value, label, note]) => (
+              <button
+                key={value}
+                type="button"
+                role="radio"
+                aria-checked={layoutMode === value}
+                className={`layout-choice text-left ${layoutMode === value ? 'is-active' : ''}`}
+                onClick={() => {
+                  const next = saveLayoutPreference(value)
+                  setLayoutMode(next)
+                  emitFeedback('notice', { source: 'layout', layout: next })
+                  toast(`已切换为${label}`)
+                }}
+              >
+                <span className="block text-xs font-medium text-white">{label}</span>
+                <span className="mt-1 block text-[10px] leading-relaxed text-surface-500">{note}</span>
+              </button>
+            ))}
           </div>
         </div>
 

@@ -211,7 +211,7 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden">
+    <div className="app-shell flex h-screen overflow-hidden">
       {configured === false ? (
         <SetupPage onDone={() => setConfigured(true)} toast={toast} api={API} />
       ) : (

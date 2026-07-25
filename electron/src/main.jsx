@@ -3,8 +3,10 @@ import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
 import { bootstrapEdition } from '@edition'
+import { applyLayoutPreference, readLayoutPreference } from './theme/layoutPreference'
 
 bootstrapEdition()
+applyLayoutPreference(readLayoutPreference())
 
 // Authenticate only requests to ModAgent's loopback API. Keeping this in the
 // renderer avoids a session-wide Electron network hook that can stall startup.
