@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from datetime import datetime, timezone
@@ -44,6 +45,26 @@ def _text(value: Any, fallback: str = "") -> str:
     return value if value else fallback
 
 
+def _plain_detail(*values: Any) -> str:
+    """Preserve useful source detail while removing page markup and noise."""
+    parts = []
+    for value in values:
+        text = _text(value)
+        if not text:
+            continue
+        text = re.sub(
+            r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>",
+            " ", text, flags=re.I | re.S,
+        )
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\[/?[a-z][^\]]*\]", " ", text, flags=re.I)
+        text = html.unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text and not any(text.casefold() == item.casefold() for item in parts):
+            parts.append(text)
+    return " ".join(parts)[:1600]
+
+
 def _source_coverage_text(payload: dict | None) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -59,42 +80,81 @@ def _source_coverage_text(payload: dict | None) -> str:
 
 
 def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str:
-    """Keep a compact model analysis while removing its duplicate table."""
-    text = _text(value)
-    result: list[str] = []
-    previous_blank = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if (
-            (stripped.startswith("|") and stripped.endswith("|"))
-            or _MARKDOWN_TABLE_SEPARATOR_RE.fullmatch(stripped)
-            or stripped in {"---", "***", "___"}
-        ):
-            continue
-        if not stripped:
-            if result and not previous_blank:
-                result.append("")
-            previous_blank = True
-            continue
-        result.append(line)
-        previous_blank = False
+    """Render every structured candidate; model prose may not omit rows."""
+    items = (payload or {}).get("items") or []
+    if not items:
+        text = _text(value, RECOMMENDATION_FALLBACK_TEXT)
+        kept = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if (
+                (stripped.startswith("|") and stripped.endswith("|"))
+                or _MARKDOWN_TABLE_SEPARATOR_RE.fullmatch(stripped)
+                or stripped in {"---", "***", "___"}
+            ):
+                continue
+            kept.append(line)
+        cleaned = "\n".join(kept).strip() or RECOMMENDATION_FALLBACK_TEXT
+        return cleaned + "\n\n请在下方清单中核对功能、来源与风险后再选择。"
 
-    cleaned = "\n".join(result).strip()
-    # The structured card already carries versions, activity and source metadata.
-    # Keep only a small decision-oriented preface in chat.
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", cleaned) if part.strip()]
-    cleaned = "\n\n".join(paragraphs[:6])
-    if len(cleaned) > 1200:
-        cleaned = cleaned[:1197].rstrip("，。；:： ") + "…"
-    if len(cleaned) < 20:
-        cleaned = RECOMMENDATION_FALLBACK_TEXT
+    verified = sum(1 for item in items if item.get("detail_verified"))
+    lines = [
+        f"找到了 {len(items)} 个候选，其中 {verified} 个已取得来源详情。"
+        "下面逐项说明它们具体做什么，以及选择前需要注意的条件：",
+        "",
+    ]
+    for index, item in enumerate(items, 1):
+        source = _text(item.get("source"))
+        source_id = _text(item.get("source_id"))
+        if source == "nexus" and item.get("mod_id"):
+            identity = f"Nexus #{item['mod_id']}"
+        elif source_id:
+            identity = f"{_text(item.get('source_label'), source)} {source_id}"
+        else:
+            identity = _text(item.get("source_label"), source)
+
+        lines.append(
+            f"{index}. **{_text(item.get('name'), '未命名 Mod')}**"
+            + (f" ({identity})" if identity else "")
+        )
+        lines.append(_text(item.get("content"), MISSING_CONTENT_TEXT))
+
+        facts = []
+        version = _text(item.get("version"))
+        if version and version != "待详情核验":
+            facts.append(f"版本 {version}")
+        dependencies = [
+            _text(dependency) for dependency in item.get("dependencies") or []
+            if _text(dependency)
+        ]
+        if dependencies:
+            facts.append("需要 " + "、".join(dependencies[:5]))
+        if item.get("detail_verified"):
+            facts.append("来源详情已核验")
+        else:
+            facts.append(
+                "详情核验受阻，暂不可加入安装计划"
+                if item.get("verification_status") == "blocked"
+                else "仅有搜索证据，暂不可加入安装计划"
+            )
+        conflict = _text(item.get("conflict"))
+        if conflict and conflict not in {
+            "基础详情已核验，安装包仍需检查",
+            "仅有搜索摘要，待详情核验",
+        }:
+            facts.append(conflict)
+        if facts:
+            lines.append("选择提示：" + "；".join(facts) + "。")
+        lines.append("")
+
     coverage = _source_coverage_text(payload)
-    return (
-        f"{cleaned}"
-        + (f"\n\n{coverage}" if coverage and coverage not in cleaned else "")
-        + "\n\n"
-        "请在下方清单中调整选择；优先候选已默认勾选，也可以取消、增添或全选。"
+    if coverage:
+        lines.extend([coverage, ""])
+    lines.append(
+        "请先根据上述功能说明选择；只有取得详情证据的候选才能进入安装计划，"
+        "下载后还会继续检查安装包和目标游戏版本。"
     )
+    return "\n".join(lines).strip()
 
 
 def needs_chinese_localization(value: Any) -> bool:
@@ -227,7 +287,13 @@ def _normalize_item(source: str, item: dict) -> dict:
     archived = bool(item.get("archived"))
     has_files = item.get("has_files")
     detail_verified = bool(item.get("_detail_verified"))
-    content = item.get("summary") or item.get("description")
+    verification_status = _text(item.get("verification_status"))
+    verification_error = _text(item.get("verification_error"))[:200]
+    content = _plain_detail(
+        item.get("summary"),
+        item.get("description"),
+        item.get("install_notes"),
+    )
     has_function_summary = bool(_text(content))
     staleness = item.get("staleness") if isinstance(item.get("staleness"), dict) else {}
     if archived:
@@ -239,6 +305,12 @@ def _normalize_item(source: str, item: dict) -> dict:
     elif staleness.get("stale"):
         conflict_status = "warning"
         conflict = staleness.get("note") or "较长时间未更新，需核对兼容性"
+    elif verification_status == "blocked":
+        conflict_status = "warning"
+        conflict = (
+            f"详情核验受阻：{verification_error}"
+            if verification_error else "详情核验受阻，请稍后重试"
+        )
     elif not has_function_summary:
         conflict_status = "unknown"
         conflict = "仅确认标题，功能、依赖与兼容性待核验"
@@ -255,7 +327,14 @@ def _normalize_item(source: str, item: dict) -> dict:
         item.get("mod_id") or item.get("id") or item.get("full_name")
         or item.get("url") or ""
     )
-    installable = not archived and has_files is not False and bool(source_id)
+    # Keep open-source discovery visible, but only authoritative detail or
+    # catalogue evidence may cross into an executable install plan.
+    installable = (
+        detail_verified
+        and not archived
+        and has_files is not False
+        and bool(source_id)
+    )
     return {
         "selection_key": _key(source, item),
         "source": source,
@@ -278,6 +357,12 @@ def _normalize_item(source: str, item: dict) -> dict:
             "known" if dependencies else "none_verified" if detail_verified else "unknown"
         ),
         "detail_verified": detail_verified,
+        "verification_status": (
+            "verified" if detail_verified
+            else verification_status or "pending"
+        ),
+        "verification_error": verification_error,
+        "verification_source": _text(item.get("verification_source"))[:80],
         "endorsements": item.get("endorsements") or item.get("endorsement_count") or 0,
         "downloads": item.get("downloads") or item.get("mod_downloads") or 0,
         "url": _text(item.get("url"))[:500],
@@ -499,4 +584,13 @@ def normalize_recommendations(
         "installed_skipped": installed_skipped,
         "installed_skipped_count": len(installed_skipped),
         "source_counts": source_counts,
+        "verification": {
+            "target_ratio": 0.95,
+            "total": len(items),
+            "verified": sum(1 for item in items if item["detail_verified"]),
+            "coverage_ratio": round(
+                sum(1 for item in items if item["detail_verified"]) / len(items),
+                4,
+            ) if items else 1.0,
+        },
     }

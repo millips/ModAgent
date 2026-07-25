@@ -15,7 +15,7 @@ const API = typeof exposedApiBase === 'string' ? exposedApiBase : 'http://127.0.
 
 export default function App() {
   const [page, setPage] = useState('chat')
-  const [status, setStatus] = useState({ online: false, game: '', mods: null, snaps: null, game_root: '', game_slug: '', bg: null })
+  const [status, setStatus] = useState({ online: false, game: '', mods: null, snaps: null, game_root: '', game_slug: '', game_instance_id: '', bg: null })
   const [games, setGames] = useState([])
   const [configured, setConfigured] = useState(null)
   const [toasts, setToasts] = useState([])
@@ -47,6 +47,7 @@ export default function App() {
             game: s.game_name || '',
             game_root: s.game_root || '',
             game_slug: s.game_slug || '',
+            game_instance_id: s.game_instance_id || '',
             bg: s.bg || null,
           }))
           if (s.bg) document.body.classList.add('has-bg')
@@ -81,16 +82,16 @@ export default function App() {
     // 新值,导致状态栏计数串成全局数(实测:快照数量显示 7 实际当前游戏 3)。cleanup 作废旧请求。
     let stale = false
     const load = async () => {
-      const slug = status.game_slug || ''
-      const mUrl = slug ? `${API}/mods?game_slug=${encodeURIComponent(slug)}` : `${API}/mods`
-      const snUrl = slug ? `${API}/snapshots?game_slug=${encodeURIComponent(slug)}` : `${API}/snapshots`
+      const scope = status.game_instance_id || status.game_slug || ''
+      const mUrl = scope ? `${API}/mods?game_slug=${encodeURIComponent(scope)}` : `${API}/mods`
+      const snUrl = scope ? `${API}/snapshots?game_slug=${encodeURIComponent(scope)}` : `${API}/snapshots`
       const m = await fetch(mUrl).then(r => r.json()).catch(() => [])
       const sn = await fetch(snUrl).then(r => r.json()).catch(() => [])
       if (!stale) setStatus(prev => ({ ...prev, mods: m.length, snaps: sn.length }))
     }
     load()
     return () => { stale = true }
-  }, [refreshToggle, status.game_slug])
+  }, [refreshToggle, status.game_slug, status.game_instance_id])
 
   useEffect(() => {
     let stale = false
@@ -124,6 +125,7 @@ export default function App() {
     const localSlug = 'local_' + (g.name || 'game').toLowerCase()
       .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40)
     let slug = g.slug || localSlug
+    const instanceId = g.game_instance_id || ''
     let gid = g.game_id
 
     setStatus(prev => ({
@@ -131,6 +133,7 @@ export default function App() {
       game: g.name,
       game_root: g.path,
       game_slug: slug,
+      game_instance_id: instanceId,
       mods: 0,
       snaps: 0,
     }))
@@ -160,6 +163,7 @@ export default function App() {
           body: JSON.stringify({
             game_name: g.name,
             game_slug: slug,
+            game_instance_id: instanceId,
             game_id: gid,
             game_root: g.path,
           }),

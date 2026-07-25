@@ -76,6 +76,9 @@ export function ChatEditionMessage({
   const sourceCount = new Set(items.map(item => item.source).filter(Boolean)).size
   const verifiedCount = items.filter(item => item.detail_verified).length
   const unavailableCount = items.filter(item => item.installable === false).length
+  const verificationCoverage = items.length
+    ? Math.round((verifiedCount / items.length) * 100)
+    : 100
 
   const update = keys => onChange?.([...new Set(keys)])
   const toggle = key => {
@@ -110,6 +113,9 @@ export function ChatEditionMessage({
             <span className="pro-recommendation-stat">{items.length} 个候选</span>
             <span className="pro-recommendation-stat">{sourceCount || 1} 个来源</span>
             <span className="pro-recommendation-stat">{verifiedCount} 项详情已核验</span>
+            <span className={`pro-recommendation-stat ${
+              verificationCoverage < 95 ? 'is-warning' : ''
+            }`}>核验覆盖 {verificationCoverage}%</span>
             {unavailableCount > 0 && (
               <span className="pro-recommendation-stat is-warning">{unavailableCount} 项暂不可安装</span>
             )}
@@ -166,7 +172,11 @@ export function ChatEditionMessage({
                           ? 'border-cyber-green/25 bg-cyber-green/10 text-cyber-green'
                           : 'border-surface-600 bg-surface-800 text-surface-500'
                       }`}>
-                        {item.detail_verified ? '详情已核验' : '搜索摘要'}
+                        {item.detail_verified
+                          ? '详情已核验'
+                          : item.verification_status === 'blocked'
+                            ? '详情核验受阻'
+                            : '待详情核验'}
                       </span>
                     </div>
                   </td>

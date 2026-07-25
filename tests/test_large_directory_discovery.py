@@ -66,6 +66,7 @@ def test_inventory_scan_is_queued_without_blocking(monkeypatch):
 
     before = time.monotonic()
     state = api._queue_inventory_scan("X:/HugeGame", slug, "", ["X:/HugeMods"])
+    instance_id = state["game_instance_id"]
     elapsed = time.monotonic() - before
 
     assert elapsed < 0.2
@@ -76,7 +77,7 @@ def test_inventory_scan_is_queued_without_blocking(monkeypatch):
     release.set()
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        state = api._inventory_scan_public_state(slug)
+        state = api._inventory_scan_public_state(instance_id)
         if state["status"] != "running":
             break
         time.sleep(0.01)
@@ -85,4 +86,4 @@ def test_inventory_scan_is_queued_without_blocking(monkeypatch):
     assert state["imported"] == 2
     assert state["detected"] == 2
     with api._inventory_scan_jobs_lock:
-        api._inventory_scan_jobs.pop(slug, None)
+        api._inventory_scan_jobs.pop(instance_id, None)

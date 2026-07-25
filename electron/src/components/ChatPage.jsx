@@ -415,12 +415,12 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     return () => { cancelled = true; clearInterval(timer) }
   }, [api, loading])
 
-  useEffect(() => { loadSessions(); setActiveSession(null); setMessages([]) }, [status.game_slug])
+  useEffect(() => { loadSessions(); setActiveSession(null); setMessages([]) }, [status.game_slug, status.game_instance_id])
 
   const loadSessions = async () => {
     try {
-      const slug = status.game_slug || ''
-      const url = slug ? `${api}/sessions?game_slug=${slug}` : `${api}/sessions`
+      const scope = status.game_instance_id || status.game_slug || ''
+      const url = scope ? `${api}/sessions?game_slug=${encodeURIComponent(scope)}` : `${api}/sessions`
       const r = await fetch(url)
       if (!r.ok) throw new Error(`sessions request failed: ${r.status}`)
       const data = await r.json()
@@ -563,8 +563,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     const recover = async () => {
       let taskFinished = false
       try {
-        const slug = status.game_slug || ''
-        const response = await fetch(`${api}/chat/tasks/active?game_slug=${encodeURIComponent(slug)}`)
+        const scope = status.game_instance_id || status.game_slug || ''
+        const response = await fetch(`${api}/chat/tasks/active?game_slug=${encodeURIComponent(scope)}`)
         const active = await response.json()
         if (cancelled || !active?.active || !active.session_id) return
         await selectSession({ id: active.session_id })
@@ -610,7 +610,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       if (recoveryTimerRef.current) clearInterval(recoveryTimerRef.current)
       recoveryTimerRef.current = null
     }
-  }, [api, status.game_slug])
+  }, [api, status.game_slug, status.game_instance_id])
 
   const newSession = async () => {
     try {
@@ -1141,7 +1141,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   // 与 detect 出的 path 因大小写/斜杠差异对不上,导致下拉框跳到第一个游戏(v0.8 老 bug)。
   const _normPath = (p) => (p || '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
   const currentGame = games.find(g =>
-    (status.game_slug && g.slug && g.slug === status.game_slug) ||
+    (status.game_instance_id && g.game_instance_id === status.game_instance_id) ||
     (status.game_root && _normPath(g.path) === _normPath(status.game_root))
   ) || null
   const gameSourceLabel = source => ({
@@ -1172,13 +1172,13 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     }))
   }
 
-  const monitorInventoryScan = async (gameSlug, label) => {
-    if (!gameSlug) return
+  const monitorInventoryScan = async (gameInstanceId, label) => {
+    if (!gameInstanceId) return
     for (let attempt = 0; attempt < 180; attempt += 1) {
       await new Promise(resolve => window.setTimeout(resolve, 1000))
       try {
         const response = await fetch(
-          `${api}/mods/scan-status?game_slug=${encodeURIComponent(gameSlug)}`
+          `${api}/mods/scan-status?game_instance_id=${encodeURIComponent(gameInstanceId)}`
         )
         if (!response.ok) continue
         const state = await response.json()
@@ -1223,7 +1223,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       const scanCount = Number(scan.identified_count ?? scan.imported ?? (scan.identified || []).length)
       if (scan.queued) {
         toast(`已导入 ${result.game?.name || gameImportForm.game_name}；正在后台扫描 Mod`)
-        void monitorInventoryScan(result.game?.slug, '游戏 Mod')
+        void monitorInventoryScan(result.game?.game_instance_id, '游戏 Mod')
       } else if (scan.error) {
         toast(scan.error, 'error')
       } else {
@@ -1252,7 +1252,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       const detected = Number(result.detected || 0)
       if (result.queued) {
         toast('Mod 目录已保存；正在后台扫描，大型目录不会阻塞界面')
-        void monitorInventoryScan(status.game_slug, '外部 Mod')
+        void monitorInventoryScan(status.game_instance_id || status.game_slug, '外部 Mod')
       } else if (imported > 0) toast(`已保存目录并导入 ${imported} 个 Mod`)
       else if (detected > 0) toast(`目录已保存；发现 ${detected} 项，均已在清单中`)
       else toast('目录已保存，但未发现受支持的 Mod 文件', 'error')
@@ -1478,7 +1478,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           </button>
           <button
             onClick={importModDirectory}
-            disabled={!status.online || !status.game_slug}
+            disabled={!status.online || !(status.game_instance_id || status.game_slug)}
             className="mt-2 w-full px-2 py-1.5 rounded text-xs border border-cyber-purple/30 text-cyber-purple hover:bg-cyber-purple/10 disabled:opacity-40 flex items-center justify-center gap-1.5"
             title="选择 Vortex 暂存、MO2 mods、Fluffy 或其他外部 Mod 目录；保存后每次扫描都会自动包含"
           >

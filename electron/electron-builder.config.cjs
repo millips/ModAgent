@@ -56,12 +56,13 @@ module.exports = {
   extraMetadata: {
     productName: identity.productName,
     modagentEdition: identity.edition,
+    modagentChannel: identity.channel,
   },
   artifactName: `${identity.artifactPrefix}-Setup-${packageInfo.version}.${'${ext}'}`,
   asar: true,
   electronUpdaterCompatibility: '>=2.16',
   directories: {
-    output: `release/${identity.edition}`,
+    output: `release/${identity.updateChannel}`,
   },
   files: [
     'dist/**/*',
@@ -99,7 +100,7 @@ module.exports = {
     shortcutName: identity.productName,
     uninstallDisplayName: identity.productName,
     deleteAppDataOnUninstall: false,
-    include: 'build/installer.nsh',
+    include: identity.isBeta ? 'build/installer-beta.nsh' : 'build/installer.nsh',
     runAfterFinish: true,
   },
   publish: updateBase ? [{ provider: 'generic', url: `${updateBase}/${identity.updateChannel}` }] : null,

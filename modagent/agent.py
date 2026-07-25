@@ -448,6 +448,8 @@ class Agent:
                 "selection_key": item.get("selection_key"),
                 "name": item.get("name"),
                 "content": item.get("content"),
+                "dependencies": item.get("dependencies") or [],
+                "conflict": item.get("conflict"),
             }
             for item in payload.get("items") or []
             if needs_chinese_localization(item.get("content"))
@@ -455,10 +457,12 @@ class Agent:
         if not pending:
             return payload
         prompt = (
-            "把下面 Mod 的 content 准确改写成简体中文功能介绍。"
+            "把下面每个 Mod 的 content 准确改写成简体中文功能介绍。"
             "保留专有名词，不翻译 selection_key，不虚构未提供的功能。"
-            "只翻译或压缩 content 中明确存在的信息，不可根据 Mod 名称猜测用途。"
-            "每项 15-70 个中文字，只返回 JSON："
+            "每项必须说明它具体改变什么；原文提到适用角色、第一/第三人称、"
+            "必需装备、前置、使用条件或已知限制时必须保留，不能只写泛化摘要。"
+            "只使用 content、dependencies 和 conflict 中已有的信息，不可根据名称猜测。"
+            "每项通常 40-140 个中文字，只返回 JSON："
             '{"items":[{"selection_key":"原值","content":"中文功能介绍"}]}。\n'
             + json.dumps(pending, ensure_ascii=False)
         )

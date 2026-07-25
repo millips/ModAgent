@@ -26,9 +26,24 @@ const IDENTITIES = {
 function getAppIdentity(packageInfo = {}) {
   const requested = process.env.MODAGENT_EDITION || packageInfo.modagentEdition;
   const edition = requested === 'subscription' ? 'subscription' : 'free';
-  const identity = IDENTITIES[edition];
+  const requestedChannel = process.env.MODAGENT_CHANNEL || packageInfo.modagentChannel;
+  const channel = requestedChannel === 'beta' ? 'beta' : 'stable';
+  const base = IDENTITIES[edition];
+  const identity = channel === 'beta'
+    ? {
+        ...base,
+        productName: `${base.productName} Beta`,
+        executableName: `${base.executableName}Beta`,
+        appId: `${base.appId}.beta`,
+        userDataFolder: `${base.userDataFolder} Beta`,
+        artifactPrefix: `${base.artifactPrefix}-Beta`,
+        updateChannel: `${base.updateChannel}-beta`,
+      }
+    : base;
   return {
     ...identity,
+    channel,
+    isBeta: channel === 'beta',
     version: packageInfo.version || '0.0.0',
     iconPath: path.join(__dirname, 'assets', 'icons', identity.iconName),
   };

@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modagent.config import (
     Config, load as load_config, save as save_config, CONFIG_DIR,
-    edition_data_dir, current_edition, entitlement_tier,
+    edition_data_dir, current_edition, current_channel, entitlement_tier,
+    game_storage_id, make_game_instance_id,
 )
 from modagent import db, games, installer, scanner, downloader, __version__
 from modagent import snapshot, confirmation        # ← 快照预览 + 一次性回滚确认令牌
@@ -59,6 +60,9 @@ async def lifespan(app: FastAPI):
     global cfg
     db.init_db()
     cfg = load_config()
+    if cfg.game_slug and cfg.game_instance_id:
+        db.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
+        snapshot.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
     downloader.cleanup_stale_downloads()
     run_startup_checks(build_prompt(cfg), build_tools_definitions(cfg.tier),
                        referenced_tools=PROMPT_REFERENCED_TOOLS)
@@ -218,6 +222,7 @@ class ConfigUpdate(BaseModel):
     nexus_api_key: Optional[str] = None
     game_name: Optional[str] = None
     game_slug: Optional[str] = None
+    game_instance_id: Optional[str] = None
     game_id: Optional[int] = None
     game_root: Optional[str] = None
     chrome_cdp_port: Optional[int] = None
@@ -252,8 +257,10 @@ def get_status():
     return {
         "game_name": cfg.game_name,
         "game_slug": cfg.game_slug,
+        "game_instance_id": game_storage_id(cfg),
         "game_root": cfg.game_root or "",
         "tier": cfg.tier,
+        "channel": current_channel(),
         "api_key_set": bool(cfg.nexus_api_key),
         "llm_set": bool(cfg.llm_api_key),
         "llm_model": cfg.llm_model,
@@ -328,11 +335,12 @@ def _public_scan_result(result: dict, imported: int = 0) -> dict:
     }
 
 
-def _inventory_scan_public_state(game_slug: str) -> dict:
+def _inventory_scan_public_state(game_instance_id: str) -> dict:
     with _inventory_scan_jobs_lock:
-        job = dict(_inventory_scan_jobs.get(game_slug) or {})
+        job = dict(_inventory_scan_jobs.get(game_instance_id) or {})
     state = {
-        "game_slug": game_slug,
+        "game_slug": job.get("game_slug", ""),
+        "game_instance_id": game_instance_id,
         "status": job.get("status", "idle"),
         "queued": job.get("status") == "running",
         "started_at": job.get("started_at"),
@@ -345,10 +353,10 @@ def _inventory_scan_public_state(game_slug: str) -> dict:
     return state
 
 
-def _inventory_scan_worker(game_slug: str) -> None:
+def _inventory_scan_worker(game_instance_id: str) -> None:
     while True:
         with _inventory_scan_jobs_lock:
-            job = _inventory_scan_jobs.get(game_slug)
+            job = _inventory_scan_jobs.get(game_instance_id)
             if not job:
                 return
             generation = int(job["generation"])
@@ -356,9 +364,10 @@ def _inventory_scan_worker(game_slug: str) -> None:
         try:
             result = scanner.scan_existing_mods(
                 request["game_root"],
-                game_slug,
+                request["game_slug"],
                 request.get("api_key", ""),
                 request.get("extra_roots", []),
+                game_instance_id,
             )
             imported = scanner.import_mods(result.get("identified", []))
             public_result = _public_scan_result(result, imported)
@@ -368,7 +377,7 @@ def _inventory_scan_worker(game_slug: str) -> None:
             error = f"Mod 扫描失败：{exc}"
 
         with _inventory_scan_jobs_lock:
-            job = _inventory_scan_jobs.get(game_slug)
+            job = _inventory_scan_jobs.get(game_instance_id)
             if not job:
                 return
             # If a newer directory was saved during this pass, repeat using
@@ -385,14 +394,18 @@ def _inventory_scan_worker(game_slug: str) -> None:
 
 
 def _queue_inventory_scan(game_root: str, game_slug: str, api_key: str = "",
-                          extra_roots: list[str] | None = None) -> dict:
+                          extra_roots: list[str] | None = None,
+                          game_instance_id: str = "") -> dict:
+    instance_id = game_instance_id or make_game_instance_id(game_root) or game_slug
     request = {
         "game_root": os.path.abspath(game_root),
+        "game_slug": game_slug,
         "api_key": api_key,
         "extra_roots": list(extra_roots or []),
     }
     with _inventory_scan_jobs_lock:
-        job = _inventory_scan_jobs.setdefault(game_slug, {})
+        job = _inventory_scan_jobs.setdefault(instance_id, {})
+        job["game_slug"] = game_slug
         job["generation"] = int(job.get("generation", 0)) + 1
         job["request"] = request
         job["status"] = "running"
@@ -405,11 +418,11 @@ def _queue_inventory_scan(game_root: str, game_slug: str, api_key: str = "",
     if should_start:
         threading.Thread(
             target=_inventory_scan_worker,
-            args=(game_slug,),
-            name=f"modagent-inventory-{game_slug[:24]}",
+            args=(instance_id,),
+            name=f"modagent-inventory-{instance_id[:24]}",
             daemon=True,
         ).start()
-    return _inventory_scan_public_state(game_slug)
+    return _inventory_scan_public_state(instance_id)
 
 
 @app.post("/games/import")
@@ -442,6 +455,7 @@ def import_game(body: GameImport):
     cfg.game_root = saved["path"]
     cfg.game_name = saved["name"]
     cfg.game_slug = saved["slug"]
+    cfg.game_instance_id = saved["game_instance_id"]
     cfg.game_id = saved["game_id"]
     save_config(cfg)
     resp["saved"] = True
@@ -450,15 +464,17 @@ def import_game(body: GameImport):
         saved["path"],
         saved["slug"],
         getattr(cfg, "nexus_api_key", ""),
-        (getattr(cfg, "manual_mod_dirs", {}) or {}).get(saved["slug"], []),
+        (getattr(cfg, "manual_mod_dirs", {}) or {}).get(saved["game_instance_id"], []),
+        saved["game_instance_id"],
     )
     return resp
 
 
 @app.get("/mods/import-directories")
 def list_mod_import_directories():
-    roots = (getattr(cfg, "manual_mod_dirs", {}) or {}).get(cfg.game_slug, [])
-    return {"game_slug": cfg.game_slug, "directories": roots}
+    scope = game_storage_id(cfg)
+    roots = (getattr(cfg, "manual_mod_dirs", {}) or {}).get(scope, [])
+    return {"game_slug": cfg.game_slug, "game_instance_id": scope, "directories": roots}
 
 
 @app.post("/mods/import-directory")
@@ -469,26 +485,28 @@ def import_mod_directory(body: ModDirectoryImport):
     if not os.path.isdir(selected):
         raise HTTPException(status_code=400, detail="所选 Mod 目录不存在或无法访问")
     mapping = dict(getattr(cfg, "manual_mod_dirs", {}) or {})
-    roots = list(mapping.get(cfg.game_slug, []))
+    scope = game_storage_id(cfg)
+    roots = list(mapping.get(scope, []))
     normalized = {os.path.normcase(os.path.abspath(item)) for item in roots}
     if os.path.normcase(selected) not in normalized:
         roots.append(selected)
-    mapping[cfg.game_slug] = roots
+    mapping[scope] = roots
     cfg.manual_mod_dirs = mapping
     save_config(cfg)
     public = _queue_inventory_scan(
-        cfg.game_root, cfg.game_slug, getattr(cfg, "nexus_api_key", ""), roots
+        cfg.game_root, cfg.game_slug, getattr(cfg, "nexus_api_key", ""), roots,
+        scope,
     )
     public["directories"] = roots
     return public
 
 
 @app.get("/mods/scan-status")
-def mod_scan_status(game_slug: str = ""):
-    slug = game_slug or getattr(cfg, "game_slug", "")
-    if not slug:
+def mod_scan_status(game_instance_id: str = "", game_slug: str = ""):
+    scope = game_instance_id or game_storage_id(cfg, game_slug)
+    if not scope:
         raise HTTPException(status_code=400, detail="请先选择游戏")
-    return _inventory_scan_public_state(slug)
+    return _inventory_scan_public_state(scope)
 
 
 @app.post("/config")
@@ -502,6 +520,9 @@ def update_config(body: ConfigUpdate):
     for key, value in data.items():
         setattr(cfg, key, value)
     cfg.tier = entitlement_tier()
+    if cfg.game_slug and cfg.game_instance_id:
+        db.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
+        snapshot.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
     save_config(cfg)
     if rebuild_llm_client:
         for agent in agents.values():
@@ -664,7 +685,7 @@ def chat(req: ChatRequest):
         session_id = req.session_id
         if not session_id:
             session_id = f"session_{int(time.time())}"
-            db.create_session(session_id, req.message[:20], cfg.game_slug)
+            db.create_session(session_id, req.message[:20], game_storage_id(cfg))
 
         existing = db.get_session(session_id)
         ag = _get_agent(session_id)
@@ -673,7 +694,7 @@ def chat(req: ChatRequest):
             history = json.loads(existing.get("messages", "[]")) if isinstance(existing.get("messages"), str) else (existing.get("messages") or [])
             ag.history = history
         else:
-            db.create_session(session_id, req.message[:20], cfg.game_slug)
+            db.create_session(session_id, req.message[:20], game_storage_id(cfg))
             ag.history = []
             existing = db.get_session(session_id)
 
@@ -695,7 +716,7 @@ def chat_stream(req: ChatRequest):
     session_id = req.session_id
     if not session_id:
         session_id = f"session_{int(time.time())}"
-        db.create_session(session_id, req.message[:20], cfg.game_slug)
+        db.create_session(session_id, req.message[:20], game_storage_id(cfg))
 
     with _chat_tasks_lock:
         active = _chat_tasks.get(session_id)
@@ -708,7 +729,7 @@ def chat_stream(req: ChatRequest):
                 history = json.loads(existing.get("messages", "[]")) if isinstance(existing.get("messages"), str) else (existing.get("messages") or [])
                 ag.history = history
             else:
-                db.create_session(session_id, req.message[:20], cfg.game_slug)
+                db.create_session(session_id, req.message[:20], game_storage_id(cfg))
                 ag.history = []
                 existing = db.get_session(session_id)
 
@@ -720,7 +741,7 @@ def chat_stream(req: ChatRequest):
             db.update_session_messages(session_id, pending)
             task = {
                 "session_id": session_id,
-                "game_slug": cfg.game_slug,
+                "game_slug": game_storage_id(cfg),
                 "events": [],
                 "done": False,
                 "error": "",
@@ -841,7 +862,7 @@ def list_sessions(game_slug: str = ""):
 @app.post("/sessions")
 def create_session(req: SessionCreate):
     sid = f"session_{int(time.time())}"
-    db.create_session(sid, req.title, req.game_slug or cfg.game_slug)
+    db.create_session(sid, req.title, req.game_slug or game_storage_id(cfg))
     return {"id": sid, "title": req.title}
 
 
@@ -951,7 +972,7 @@ def open_dropbox():
     """在系统文件管理器里打开当前游戏的投放文件夹,供用户把手动下载的 mod 拖进去。"""
     import subprocess
     from . import downloader
-    path = downloader.ensure_dropbox_dir(cfg.game_slug or "")
+    path = downloader.ensure_dropbox_dir(game_storage_id(cfg))
     try:
         if sys.platform == "win32":
             os.startfile(path)                                  # noqa: 只在 Windows 存在
@@ -983,7 +1004,7 @@ def _open_folder(path: str):
 def open_downloads():
     """Open the current game's managed Mod download cache."""
     from . import downloader
-    return _open_folder(downloader.ensure_downloads_dir(cfg.game_slug or "_unknown"))
+    return _open_folder(downloader.ensure_downloads_dir(game_storage_id(cfg) or "_unknown"))
 
 
 @app.post("/tools/open")

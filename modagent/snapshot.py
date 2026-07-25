@@ -9,6 +9,26 @@ from .config import CONFIG_DIR
 
 SNAPSHOTS_DIR = os.path.join(CONFIG_DIR, "snapshots")
 
+
+def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
+    """Move legacy snapshot folders under the selected install identity."""
+    if not legacy_slug or not instance_id or legacy_slug == instance_id:
+        return
+    source = os.path.join(SNAPSHOTS_DIR, legacy_slug)
+    target = os.path.join(SNAPSHOTS_DIR, instance_id)
+    if not os.path.isdir(source):
+        return
+    os.makedirs(target, exist_ok=True)
+    for name in os.listdir(source):
+        old = os.path.join(source, name)
+        new = os.path.join(target, name)
+        if not os.path.exists(new):
+            shutil.move(old, new)
+    try:
+        os.rmdir(source)
+    except OSError:
+        pass
+
 # 每游戏快照保留上限,超出自动淘汰最老的(最早的原版基线除外)。
 # 硬链接方案下删旧快照是安全的:文件 inode 引用计数还在,新快照不受影响。
 MAX_SNAPSHOTS = 20
@@ -314,6 +334,8 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
     if not os.path.isdir(game_root):
         raise FileNotFoundError(f"游戏目录不存在: {game_root}")
 
+    from .config import load as load_config, game_storage_id
+    game_instance_id = game_storage_id(load_config(), game_slug)
     specs = _auto_detect_specs(game_root, game_slug)
     rel_files = sorted(set(_iter_domain_files(game_root, specs)))
 
@@ -330,7 +352,7 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
 
     base = time.strftime("%Y%m%d_%H%M%S")
     snap_id = f"snap_{base}"
-    game_snap_root = os.path.join(SNAPSHOTS_DIR, game_slug)
+    game_snap_root = os.path.join(SNAPSHOTS_DIR, game_instance_id)
     # ID 去重必须同时查目录和 DB:目录按游戏分桶,DB 的 id 却是全局唯一——
     # 只查目录的话,同一秒内给两个不同游戏建快照会目录不撞、DB 撞(IntegrityError)。
     from .db import get_snapshot
@@ -380,6 +402,7 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
         "timestamp": time.time(),
         "game_root": game_root,
         "game_slug": game_slug,
+        "game_instance_id": game_instance_id,
         "specs": [({"files_count": len(s["files"])} if "files" in s
                    else {"dir": s["dir"], "filtered": s.get("include") is not None})
                   for s in specs],
@@ -397,10 +420,10 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
         id=snap_id, timestamp=time.time(),
         files=json.dumps(rel_files),
         trigger_mod_id=trigger_mod_id, trigger_mod_name=trigger_mod_name,
-        game_slug=game_slug,
+        game_slug=game_instance_id,
     ))
 
-    _prune_old_snapshots(game_slug)   # 保留策略:超上限淘汰最老的(基线除外),失败不阻塞
+    _prune_old_snapshots(game_instance_id)   # 保留策略:超上限淘汰最老的(基线除外),失败不阻塞
 
     return snap_id
 

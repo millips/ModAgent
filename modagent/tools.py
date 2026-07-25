@@ -2304,12 +2304,33 @@ def execute(name: str, args: dict, cfg: Config) -> str:
 
 def _recommend_nexus(
     query: str, slug: str, api_key: str, limit: int = 10,
+    cdp_port: int = 18888,
 ) -> dict:
-    """Nexus discovery. Dependency expansion is deferred until selection."""
-    results = nexus.search(query[:60], slug, api_key)
+    """Search Nexus, then verify usable results through the detail endpoint."""
+    import concurrent.futures as cf
+
+    import inspect
+    search_parameters = inspect.signature(nexus.search).parameters
+    if "cdp_port" in search_parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in search_parameters.values()
+    ):
+        results = nexus.search(
+            query[:60], slug, api_key, cdp_port=cdp_port
+        )
+    else:
+        # Keep source adapters replaceable by small third-party/test adapters
+        # that implement the original three-argument search contract.
+        results = nexus.search(query[:60], slug, api_key)
     recs = []
     for r in (results or [])[:max(2, min(int(limit or 10), 20))]:
-        mod_id = r.get("mod_id", 0)
+        try:
+            mod_id = int(r.get("mod_id") or 0)
+        except (TypeError, ValueError):
+            mod_id = 0
+        # Category, search and game-home pages are discovery noise, not mods.
+        if mod_id <= 0:
+            continue
         recs.append({
             "mod_id": mod_id,
             "name": r.get("name", ""),
@@ -2325,7 +2346,78 @@ def _recommend_nexus(
             "dependencies": [],
             "dependencies_pending_detail": bool(mod_id),
         })
-    return {"recommendations": recs, "install_plan": []}
+
+    verified_by_id = {}
+    errors = {}
+
+    def verify(row):
+        mod_id = int(row["mod_id"])
+        try:
+            detail_parameters = inspect.signature(nexus.get_detail).parameters
+            if "cdp_port" in detail_parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in detail_parameters.values()
+            ):
+                detail = nexus.get_detail(
+                    mod_id, slug, api_key, cdp_port=cdp_port
+                )
+            else:
+                detail = nexus.get_detail(mod_id, slug, api_key)
+            return mod_id, detail, ""
+        except Exception as exc:
+            return mod_id, {}, (str(exc) or type(exc).__name__)[:160]
+
+    if recs:
+        pool = cf.ThreadPoolExecutor(
+            max_workers=min(8, len(recs)),
+            thread_name_prefix="recommend-detail",
+        )
+        futures = [pool.submit(verify, row) for row in recs]
+        done, not_done = cf.wait(futures, timeout=30)
+        for future in done:
+            mod_id, detail, error = future.result()
+            if detail:
+                verified_by_id[mod_id] = detail
+            elif error:
+                errors[mod_id] = error
+        for future in not_done:
+            future.cancel()
+        pool.shutdown(wait=False)
+
+    enriched = []
+    for row in recs:
+        mod_id = int(row["mod_id"])
+        detail = verified_by_id.get(mod_id)
+        if detail:
+            merged = dict(row)
+            merged.update({
+                key: value for key, value in detail.items()
+                if value not in (None, "", [], {})
+            })
+            merged["_detail_verified"] = True
+            merged["verification_source"] = "nexus_detail"
+            enriched.append(merged)
+        else:
+            row["_detail_verified"] = False
+            row["verification_status"] = "blocked"
+            row["verification_error"] = errors.get(
+                mod_id, "详情核验超过 30 秒预算"
+            )
+            enriched.append(row)
+
+    attempted = len(recs)
+    verified = len(verified_by_id)
+    return {
+        "recommendations": enriched,
+        "install_plan": [],
+        "verification": {
+            "target_ratio": 0.95,
+            "attempted": attempted,
+            "verified": verified,
+            "blocked": max(0, attempted - verified),
+            "coverage_ratio": round(verified / attempted, 4) if attempted else 1.0,
+        },
+    }
 
 
 def _recommend_thunderstore(community: str, query: str, limit: int = 5) -> list:
@@ -2359,7 +2451,8 @@ def _recommend(query: str, cfg: Config) -> dict:
     ex = cf.ThreadPoolExecutor(max_workers=5)
     if effective_slug:
         tasks["nexus"] = ex.submit(
-            _recommend_nexus, query, effective_slug, api_key, per_source_limit
+            _recommend_nexus, query, effective_slug, api_key, per_source_limit,
+            cfg.chrome_cdp_port,
         )
     if src.get("workshop"):
         from .sources import steam_workshop as sw
@@ -2387,7 +2480,7 @@ def _recommend(query: str, cfg: Config) -> dict:
            "sources_attempted": list(tasks),
            "sources_consulted": [], "sources_empty": [],
            "sources_failed": {}, "sources_skipped": {},
-           "source_evidence": source_status}
+           "source_evidence": source_status, "verification": {}}
     for source_name in ("nexus", "workshop", "thunderstore", "gamebanana", "github"):
         if source_name not in tasks:
             state = source_status.get(source_name, {})
@@ -2413,6 +2506,7 @@ def _recommend(query: str, cfg: Config) -> dict:
         if name == "nexus":
             out["recommendations"] = r["recommendations"]
             out["install_plan"] = r["install_plan"]
+            out["verification"]["nexus"] = r.get("verification") or {}
             if not r["recommendations"]:
                 out["sources_empty"].append(name)
         else:

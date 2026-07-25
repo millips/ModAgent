@@ -18,6 +18,7 @@ payload = {
             "version": "1.2.0",
             "updated_at": "2026-07-01",
             "dependencies": [9],
+            "_detail_verified": True,
         },
         {"mod_id": 102, "name": "Nexus second"},
     ],
@@ -28,6 +29,7 @@ payload = {
             "name": "Package",
             "summary": "Adds a feature",
             "url": "https://thunderstore.io/package/Owner/Package/",
+            "_detail_verified": True,
         }
     ],
     "gamebanana": [
@@ -44,6 +46,7 @@ payload = {
             "summary": "Tooling",
             "url": "https://github.com/owner/repo",
             "updated_at": "2026-06-01",
+            "_detail_verified": True,
         },
         {
             "full_name": "owner/archived",
@@ -61,6 +64,8 @@ assert [item["source"] for item in result["items"][:5]] == [
     "nexus", "workshop", "thunderstore", "gamebanana", "github",
 ]
 assert len(result["selected_keys"]) == 3
+assert result["verification"]["verified"] == 3
+assert result["verification"]["coverage_ratio"] == 0.5
 assert len(set(item["selection_key"] for item in result["items"])) == 6
 
 many = normalize_recommendations({
@@ -91,12 +96,28 @@ assert framework["content"] == "Loads costume mods"
 workshop_item = next(item for item in result["items"] if item["name"] == "Workshop item")
 assert "功能与适配性尚未核验" in workshop_item["content"]
 assert workshop_item["has_function_summary"] is False
+assert workshop_item["installable"] is False
 assert workshop_item["selection_key"] not in result["selected_keys"]
 
 no_files = next(item for item in result["items"] if item["name"] == "No files")
 assert no_files["installable"] is False
 assert no_files["selection_key"] not in result["selected_keys"]
 assert no_files["conflict"] == "未提供下载文件"
+
+rich = normalize_recommendations({
+    "recommendations": [{
+        "mod_id": 5245,
+        "name": "Become Adam Smasher - Male V",
+        "summary": "Turns Male V into Adam Smasher.",
+        "description": (
+            "Works in first and third person. Gorilla Arms must be equipped "
+            "for Adam Smasher's arms to appear."
+        ),
+        "_detail_verified": True,
+    }],
+})
+assert "first and third person" in rich["items"][0]["content"]
+assert "Gorilla Arms" in rich["items"][0]["content"]
 
 evidence_result = recommendations_from_tool_evidence([
     ("mod_recommend", json.dumps({
@@ -153,6 +174,10 @@ assert "Dresscode 依赖" in analysis
 assert "| # |" not in analysis
 assert "| 1 |" not in analysis
 assert "下方清单" in analysis
+
+complete_analysis = recommendation_analysis_text("", evidence_result)
+assert "1. **Tifa Mermaid Bikini** (Nexus #816)" in complete_analysis
+assert "2. **Aerith Sexy Red Dress** (Nexus #1791)" in complete_analysis
 
 localized = apply_chinese_descriptions(evidence_result, {
     "items": [

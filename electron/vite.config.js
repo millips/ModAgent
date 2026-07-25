@@ -6,6 +6,7 @@ import postcss from 'postcss'
 
 const packageInfo = createRequire(import.meta.url)('./package.json')
 const edition = process.env.MODAGENT_EDITION === 'free' ? 'free' : 'subscription'
+const channel = process.env.MODAGENT_CHANNEL === 'beta' ? 'beta' : 'stable'
 
 const freeCssSanitizer = () => ({
   name: 'modagent-free-css-sanitizer',
@@ -34,7 +35,7 @@ const editionMarker = () => ({
     this.emitFile({
       type: 'asset',
       fileName: 'edition.json',
-      source: JSON.stringify({ edition, version: packageInfo.version }),
+      source: JSON.stringify({ edition, channel, version: packageInfo.version }),
     })
   },
 })

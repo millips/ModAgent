@@ -4,9 +4,37 @@ import sqlite3
 import time
 from dataclasses import dataclass, asdict
 from typing import Optional
-from .config import CONFIG_DIR, ensure_config_dir
+from .config import CONFIG_DIR, ensure_config_dir, load as load_config, game_storage_id
 
 DB_FILE = os.path.join(CONFIG_DIR, "state.db")
+
+
+def _scope_game(game_slug: str = "") -> str:
+    if not game_slug:
+        return ""
+    try:
+        return game_storage_id(load_config(), game_slug)
+    except Exception:
+        return str(game_slug or "")
+
+
+def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
+    """Assign unambiguous legacy rows to the currently selected install."""
+    if not legacy_slug or not instance_id or legacy_slug == instance_id:
+        return
+    conn = get_conn()
+    try:
+        for table in (
+            "installed_mods", "snapshots", "sessions",
+            "custom_domains", "mod_source_bindings",
+        ):
+            conn.execute(
+                f"UPDATE OR IGNORE {table} SET game_slug=? WHERE game_slug=?",
+                (instance_id, legacy_slug),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @dataclass
@@ -153,6 +181,7 @@ def init_db():
 
 
 def add_mod(mod: InstalledMod):
+    mod.game_slug = _scope_game(mod.game_slug)
     conn = get_conn()
     mod.installed_at = time.time()
     conn.execute(
@@ -166,6 +195,7 @@ def add_mod(mod: InstalledMod):
 
 
 def remove_mod(mod_id: str, game_slug: str = ""):
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         conn.execute("DELETE FROM installed_mods WHERE id=? AND game_slug=?", (mod_id, game_slug))
@@ -179,6 +209,7 @@ def remove_mod(mod_id: str, game_slug: str = ""):
 
 
 def get_mod(mod_id: str, game_slug: str = "") -> Optional[InstalledMod]:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         row = conn.execute("SELECT * FROM installed_mods WHERE id=? AND game_slug=?",
@@ -191,6 +222,7 @@ def get_mod(mod_id: str, game_slug: str = "") -> Optional[InstalledMod]:
 
 
 def update_mod(mod: InstalledMod):
+    mod.game_slug = _scope_game(mod.game_slug)
     conn = get_conn()
     conn.execute(
         "UPDATE installed_mods SET name=?, version=?, snapshot_id=?, load_order=?,"
@@ -203,6 +235,7 @@ def update_mod(mod: InstalledMod):
 
 
 def get_installed_mods(game_slug: str = "") -> list:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         rows = conn.execute(
@@ -225,6 +258,7 @@ def upsert_mod_source_binding(
     latest_version: str = "",
     metadata=None,
 ):
+    game_slug = _scope_game(game_slug)
     now = time.time()
     conn = get_conn()
     conn.execute(
@@ -263,6 +297,8 @@ def add_mods(mods: list[InstalledMod]) -> int:
     """
     if not mods:
         return 0
+    for mod in mods:
+        mod.game_slug = _scope_game(mod.game_slug)
     conn = get_conn()
     now = time.time()
     rows = []
@@ -287,6 +323,7 @@ def add_mods(mods: list[InstalledMod]) -> int:
 
 
 def get_mod_source_binding(mod_id: str, game_slug: str = "") -> Optional[dict]:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         row = conn.execute(
@@ -303,6 +340,7 @@ def get_mod_source_binding(mod_id: str, game_slug: str = "") -> Optional[dict]:
 
 
 def get_mod_source_bindings(game_slug: str = "") -> list[dict]:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         rows = conn.execute(
@@ -318,6 +356,7 @@ def get_mod_source_bindings(game_slug: str = "") -> list[dict]:
 
 
 def get_mod_by_source(game_slug: str, source: str, source_key: str) -> Optional[InstalledMod]:
+    game_slug = _scope_game(game_slug)
     """Find an installed row through its stable upstream binding."""
     conn = get_conn()
     row = conn.execute(
@@ -443,6 +482,7 @@ def get_dependency_chain(mod_id: str, game_slug: str = "") -> tuple[list[Install
 
 
 def get_max_load_order(game_slug: str = "") -> int:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         row = conn.execute("SELECT COALESCE(MAX(load_order), -1) as mx FROM installed_mods WHERE game_slug=?",
@@ -454,6 +494,7 @@ def get_max_load_order(game_slug: str = "") -> int:
 
 
 def add_snapshot(snap: Snapshot):
+    snap.game_slug = _scope_game(snap.game_slug)
     conn = get_conn()
     conn.execute(
         "INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
@@ -475,6 +516,7 @@ def delete_snapshot(snap_id: str):
 
 def add_custom_domain_files(game_slug: str, paths: list) -> None:
     """登记自定义落点(精确文件,相对 game_root 正斜杠)进该游戏的快照域。幂等。"""
+    game_slug = _scope_game(game_slug)
     if not game_slug or not paths:
         return
     conn = get_conn()
@@ -489,6 +531,7 @@ def add_custom_domain_files(game_slug: str, paths: list) -> None:
 
 def get_custom_domain_files(game_slug: str) -> list:
     """该游戏登记过的自定义落点(精确相对路径,正斜杠)。供快照域并入。"""
+    game_slug = _scope_game(game_slug)
     if not game_slug:
         return []
     conn = get_conn()
@@ -501,6 +544,7 @@ def get_custom_domain_files(game_slug: str) -> list:
 
 def remove_custom_domain_files(game_slug: str, paths: list) -> None:
     """撤销登记(卸载 custom mod 时清理,避免登记表冗余堆积)。"""
+    game_slug = _scope_game(game_slug)
     if not game_slug or not paths:
         return
     conn = get_conn()
@@ -519,6 +563,7 @@ def get_snapshot(snap_id: str) -> Optional[Snapshot]:
 
 
 def list_snapshots(game_slug: str = "") -> list:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         rows = conn.execute("SELECT * FROM snapshots WHERE game_slug=? ORDER BY timestamp DESC", (game_slug,)).fetchall()
@@ -551,6 +596,7 @@ def log_operation(action: str, details) -> None:
 # ── Sessions ──
 
 def list_sessions(game_slug: str = "") -> list:
+    game_slug = _scope_game(game_slug)
     conn = get_conn()
     if game_slug:
         rows = conn.execute("SELECT id, title, game_slug, created_at, updated_at FROM sessions WHERE game_slug=? ORDER BY updated_at DESC", (game_slug,)).fetchall()
@@ -568,6 +614,7 @@ def get_session(sid: str) -> dict | None:
 
 
 def create_session(sid: str, title: str = "", game_slug: str = "") -> dict:
+    game_slug = _scope_game(game_slug)
     now = time.time()
     conn = get_conn()
     conn.execute(

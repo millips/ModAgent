@@ -88,7 +88,11 @@ try:
     recommendation_events = [event for event in pro_events if "recommendations" in event]
     assert len(recommendation_events) == 1
     assert len(recommendation_events[0]["recommendations"]["items"]) == 2
-    assert any("One**：维护较活跃" in event.get("chunk", "") for event in pro_events)
+    narrative = "\n".join(event.get("chunk", "") for event in pro_events)
+    assert "1. **One**" in narrative
+    assert "2. **Two**" in narrative
+    assert "One 的中文功能介绍" in narrative
+    assert "Two 的中文功能介绍" in narrative
     assert not any("| 1 | One |" in event.get("chunk", "") for event in pro_events)
     assert all(
         "中文功能介绍" in item["content"]

@@ -37,12 +37,12 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const [checking, setChecking] = useState(false)
   const [binding, setBinding] = useState(false)
 
-  useEffect(() => { loadFromApi() }, [refreshKey, status?.game_slug])
+  useEffect(() => { loadFromApi() }, [refreshKey, status?.game_slug, status?.game_instance_id])
 
   const loadFromApi = async () => {
     try {
-      const slug = status?.game_slug || ''
-      const r = await fetch(slug ? `${api}/mods?game_slug=${encodeURIComponent(slug)}` : `${api}/mods`)
+      const scope = status?.game_instance_id || status?.game_slug || ''
+      const r = await fetch(scope ? `${api}/mods?game_slug=${encodeURIComponent(scope)}` : `${api}/mods`)
       if (!r.ok) throw new Error(`mods request failed: ${r.status}`)
       const apiMods = await r.json()
       if (!Array.isArray(apiMods)) throw new Error('mods response is not an array')
@@ -57,8 +57,8 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const reconcileMods = async () => {
     toast('对账中...')
     try {
-      const slug = status?.game_slug || ''
-      const r = await fetch(`${api}/mods/reconcile?game_slug=${encodeURIComponent(slug)}`, { method: 'POST' })
+      const scope = status?.game_instance_id || status?.game_slug || ''
+      const r = await fetch(`${api}/mods/reconcile?game_slug=${encodeURIComponent(scope)}`, { method: 'POST' })
       const d = await r.json()
       if (d.issues?.length) {
         const names = d.issues.slice(0, 3).map(i => `${i.name}(${i.problem})`).join('、')

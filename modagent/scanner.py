@@ -217,23 +217,75 @@ def _scan_external_mod_root(root: str) -> list[dict]:
 
 
 def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
-                       extra_roots: list[str] | None = None) -> dict:
+                       extra_roots: list[str] | None = None,
+                       game_instance_id: str = "") -> dict:
+    storage_id = game_instance_id or game_slug
     identified = []
     unidentified = []
     detected = 0
-    existing_names = {m.name.lower() for m in db.get_installed_mods(game_slug)}
+    existing_names = {m.name.lower() for m in db.get_installed_mods(storage_id)}
     scanned_roots = [os.path.abspath(game_root)] if game_root else []
     missing_roots = []
+    manifest_roots: set[str] = set()
+
+    # Prefer authoritative local metadata over folder-name guessing. SMAPI
+    # manifests are offline, fast, and prove the version on this machine.
+    if game_slug == "stardewvalley" and game_root:
+        try:
+            from . import stardew
+            for item in stardew.installed_manifests(game_root):
+                mod_dir = os.path.realpath(os.path.join(
+                    game_root, item.get("relative_dir") or ""
+                ))
+                if not os.path.isdir(mod_dir):
+                    continue
+                files = [
+                    os.path.join(current, filename)
+                    for current, _, filenames in os.walk(mod_dir)
+                    for filename in filenames
+                ]
+                if not files:
+                    continue
+                manifest_roots.add(os.path.normcase(mod_dir))
+                detected += 1
+                name = str(item.get("name") or item.get("unique_id") or "").strip()
+                if not name or name.lower() in existing_names:
+                    continue
+                identified.append({
+                    "mod_id": "",
+                    "name": name,
+                    "version": str(item.get("version") or "unknown"),
+                    "files": files,
+                    "filenames": [os.path.basename(mod_dir)],
+                    "endorsements": 0,
+                    "confidence": "local_manifest",
+                    "local_unique_id": str(item.get("unique_id") or ""),
+                    "game_slug": storage_id,
+                })
+                existing_names.add(name.lower())
+        except Exception:
+            # A malformed third-party manifest must not suppress generic scan.
+            manifest_roots.clear()
 
     # 0) 通用加载器探测（BepInEx/MelonLoader 等，文件夹式 mod，不依赖游戏名）
     for g in _scan_generic_loaders(game_root):
+        if manifest_roots and any(
+            any(
+                os.path.commonpath([
+                    os.path.normcase(os.path.realpath(path)), manifest_root
+                ]) == manifest_root
+                for manifest_root in manifest_roots
+            )
+            for path in g.get("files") or []
+        ):
+            continue
         detected += 1
         if g["name"].lower() in existing_names:
             continue
         identified.append({
             "mod_id": "", "name": g["name"], "version": g["version"],
             "files": g["files"], "filenames": g["filenames"],
-            "endorsements": 0, "confidence": "local", "game_slug": game_slug,
+            "endorsements": 0, "confidence": "local", "game_slug": storage_id,
         })
         existing_names.add(g["name"].lower())
 
@@ -245,7 +297,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
         identified.append({
             "mod_id": w["id"], "name": w["name"], "version": w["version"],
             "files": w["files"], "filenames": w["filenames"],
-            "endorsements": 0, "confidence": "steam_workshop", "game_slug": game_slug,
+            "endorsements": 0, "confidence": "steam_workshop", "game_slug": storage_id,
         })
         existing_names.add(w["name"].lower())
 
@@ -267,7 +319,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
                 "mod_id": "", "name": item["name"], "version": item["version"],
                 "files": item["files"], "filenames": item["filenames"],
                 "endorsements": 0, "confidence": "external_directory",
-                "game_slug": game_slug, "source_root": item["source_root"],
+                "game_slug": storage_id, "source_root": item["source_root"],
             })
             existing_names.add(key)
 
@@ -305,7 +357,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
         if wk:
             identified.append({
                 "mod_id": "", "name": wk["name"], "files": full_paths, "filenames": filenames,
-                "endorsements": 0, "confidence": "well_known", "game_slug": game_slug,
+                "endorsements": 0, "confidence": "well_known", "game_slug": storage_id,
             })
             existing_names.add(wk["name"].lower())
             continue
@@ -319,7 +371,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
             "mod_id": "", "name": name, "version": "unknown",
             "files": full_paths, "filenames": filenames,
             "endorsements": 0, "confidence": "local_unverified",
-            "game_slug": game_slug,
+            "game_slug": storage_id,
         })
         existing_names.add(name.lower())
 

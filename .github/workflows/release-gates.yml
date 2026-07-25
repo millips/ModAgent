@@ -30,6 +30,7 @@ jobs:
       - run: npm ci
       - run: npm run test:browser
       - run: npm run test:diagnostics
+      - run: npm run test:identity
       - run: npm run verify:text
       - run: npm run build
 

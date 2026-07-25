@@ -115,6 +115,15 @@ def search(community: str, query: str, limit: int = 12,
                 "pinned": p.get("is_pinned", False),
                 "owner": p.get("owner", ""),
                 "latest_version": str(versions[0].get("version_number", "")) if versions else "",
+                "dependencies": (
+                    versions[0].get("dependencies") or []
+                    if versions else []
+                ),
+                "has_files": bool(
+                    versions and versions[0].get("download_url")
+                ),
+                "_detail_verified": bool(versions),
+                "verification_source": "thunderstore_catalog",
             })
     out.sort(key=lambda x: x["downloads"], reverse=True)
     return out[:limit]

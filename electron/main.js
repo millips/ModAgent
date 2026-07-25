@@ -19,7 +19,8 @@ const IS_SMOKE_TEST = process.argv.includes('--smoke-test');
 // to begin as soon as the renderer is ready; the renderer still retries safely
 // on the first gesture if a device is temporarily unavailable.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-const DATA_DIR = path.resolve(process.env.MODAGENT_DATA_DIR || path.join(os.homedir(), '.modagent'));
+const DEFAULT_DATA_FOLDER = IDENTITY.isBeta ? '.modagent-beta' : '.modagent';
+const DATA_DIR = path.resolve(process.env.MODAGENT_DATA_DIR || path.join(os.homedir(), DEFAULT_DATA_FOLDER));
 const BG_DIR = path.join(DATA_DIR, 'editions', APP_EDITION, 'bg');
 const APP_USER_DATA = IS_SMOKE_TEST && process.env.MODAGENT_USER_DATA_DIR
   ? path.resolve(process.env.MODAGENT_USER_DATA_DIR)
@@ -66,6 +67,10 @@ let browserProcess = null;
 let backendRestartTimer = null;
 let backendRestartCount = 0;
 let backendReady = false;
+let rendererReady = false;
+let healthMarkScheduled = false;
+let smokeTestCompleted = false;
+let smokeTestTimeout = null;
 let isQuitting = false;
 let replyAttentionPending = false;
 let activeSecrets = {};
@@ -77,10 +82,14 @@ const API_TOKEN = crypto.randomBytes(32).toString('hex');
 process.env.MODAGENT_API_TOKEN = API_TOKEN;
 process.env.MODAGENT_DATA_DIR = DATA_DIR;
 process.env.MODAGENT_EDITION = APP_EDITION;
+process.env.MODAGENT_CHANNEL = IDENTITY.channel;
 process.env.MODAGENT_SECURE_SECRETS = '1';
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock({ edition: APP_EDITION });
-if (!gotSingleInstanceLock) app.quit();
+if (!gotSingleInstanceLock) {
+  if (IS_SMOKE_TEST) process.exitCode = 1;
+  app.quit();
+}
 
 function findAvailableApiPort(preferredPort) {
   const probe = port => new Promise((resolve, reject) => {
@@ -210,12 +219,46 @@ function waitForAPI(retries = 30) {
   });
 }
 
+function finishSmokeTest(ok, detail = '') {
+  if (!IS_SMOKE_TEST || smokeTestCompleted) return;
+  smokeTestCompleted = true;
+  if (smokeTestTimeout) {
+    clearTimeout(smokeTestTimeout);
+    smokeTestTimeout = null;
+  }
+  if (!ok) {
+    process.exitCode = 1;
+    logger.error('Packaged smoke test failed', detail);
+  } else {
+    logger.info('Packaged smoke test passed', {
+      rendererReady,
+      backendReady,
+      api: API_BASE,
+    });
+  }
+  setTimeout(() => app.quit(), 250);
+}
+
+function markHealthyWhenReady() {
+  if (!backendReady || !rendererReady || healthMarkScheduled) return;
+  healthMarkScheduled = true;
+  if (IS_SMOKE_TEST) {
+    diagnostics.markHealthy();
+    finishSmokeTest(true);
+    return;
+  }
+  setTimeout(() => diagnostics.markHealthy(), 4000);
+}
+
 function verifyBuiltEdition() {
   if (process.argv.includes('--dev')) return true;
   try {
     const marker = require(path.join(__dirname, 'dist', 'edition.json'));
-    if (marker.edition === APP_EDITION) return true;
-    dialog.showErrorBox(`${IDENTITY.productName} 版本校验失败`, `当前程序要求 ${APP_EDITION} 资源，但检测到 ${marker.edition || 'unknown'}。为防止版本资产混用，应用已停止启动。`);
+    if (marker.edition === APP_EDITION && (marker.channel || 'stable') === IDENTITY.channel) return true;
+    dialog.showErrorBox(
+      `${IDENTITY.productName} 版本校验失败`,
+      `当前程序要求 ${APP_EDITION}/${IDENTITY.channel} 资源，但检测到 ${marker.edition || 'unknown'}/${marker.channel || 'stable'}。为防止版本资产混用，应用已停止启动。`,
+    );
   } catch (error) {
     logger.error('Edition marker missing', error);
     dialog.showErrorBox(`${IDENTITY.productName} 版本校验失败`, '未找到版本标记文件，请重新安装完整发行包。');
@@ -285,14 +328,20 @@ async function createWindow() {
     if (process.argv.includes('--dev')) mainWindow.webContents.openDevTools();
   });
   mainWindow.on('closed', () => { mainWindow = null; });
-  mainWindow.webContents.on('render-process-gone', (_, details) => logger.error('Renderer process gone', details));
+  mainWindow.webContents.on('render-process-gone', (_, details) => {
+    logger.error('Renderer process gone', details);
+    finishSmokeTest(false, `renderer process gone: ${details.reason || 'unknown'}`);
+  });
   mainWindow.webContents.on('console-message', (_, level, message, line, sourceId) => {
     if (level >= 2) logger.error('Renderer console', { message, line, sourceId });
   });
-  mainWindow.webContents.on('did-fail-load', (_, code, description, url) => logger.error('Renderer load failed', { code, description, url }));
+  mainWindow.webContents.on('did-fail-load', (_, code, description, url) => {
+    logger.error('Renderer load failed', { code, description, url });
+    finishSmokeTest(false, `renderer load failed (${code}): ${description}`);
+  });
   mainWindow.webContents.once('did-finish-load', () => {
-    if (backendReady) setTimeout(() => diagnostics.markHealthy(), IS_SMOKE_TEST ? 250 : 4000);
-    if (IS_SMOKE_TEST) setTimeout(() => app.quit(), 1200);
+    rendererReady = true;
+    markHealthyWhenReady();
   });
 
   if (process.argv.includes('--dev')) await mainWindow.loadURL('http://localhost:3000');
@@ -329,11 +378,21 @@ if (gotSingleInstanceLock) {
       compress: true,
     });
     if (await offerRollbackIfNeeded()) return;
-    if (!verifyBuiltEdition()) { app.quit(); return; }
+    if (!verifyBuiltEdition()) {
+      if (IS_SMOKE_TEST) finishSmokeTest(false, 'packaged edition verification failed');
+      else app.quit();
+      return;
+    }
     activeSecrets = securityStore.migratePlaintextConfig();
     securityStore.applyToEnvironment(activeSecrets, process.env);
     API_PORT = await findAvailableApiPort(API_PORT);
     API_BASE = `http://127.0.0.1:${API_PORT}`;
+    if (IS_SMOKE_TEST) {
+      smokeTestTimeout = setTimeout(
+        () => finishSmokeTest(false, 'renderer and backend did not become healthy within 45 seconds'),
+        45000,
+      );
+    }
     if (!IS_SMOKE_TEST) startCdpBrowser();
     startBackend();
     await createWindow();
@@ -342,14 +401,19 @@ if (gotSingleInstanceLock) {
       backendReady = true;
       backendRestartCount = 0;
       logger.info('ModAgent API ready', API_BASE);
-      setTimeout(() => diagnostics.markHealthy(), IS_SMOKE_TEST ? 250 : 4000);
+      markHealthyWhenReady();
     }).catch(error => {
       logger.error('Backend failed health check', error);
+      finishSmokeTest(false, error.message || String(error));
     });
   }).catch(error => {
     logger.error('Fatal startup error', error);
-    dialog.showErrorBox(`${IDENTITY.productName} 启动失败`, error.message || String(error));
-    app.quit();
+    if (IS_SMOKE_TEST) {
+      finishSmokeTest(false, error.message || String(error));
+    } else {
+      dialog.showErrorBox(`${IDENTITY.productName} 启动失败`, error.message || String(error));
+      app.quit();
+    }
   });
 }
 

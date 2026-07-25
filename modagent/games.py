@@ -2,6 +2,7 @@ import os
 import json
 import re
 import heapq
+from .config import make_game_instance_id
 
 NEXUS_GAME_MAP = {
     "Skyrim Special Edition": ("skyrimspecialedition", 1704),
@@ -328,6 +329,7 @@ def detect_steam_games() -> list[dict]:
                 "name": name,
                 "path": full_path,
                 "slug": slug,
+                "game_instance_id": make_game_instance_id(full_path),
                 "game_id": gid,
                 "appid": info.get("appid", ""),
                 "real": alive["alive"],
@@ -381,6 +383,7 @@ def _game_record(name: str, game_path: str, source: str,
         "name": title,
         "path": path,
         "slug": slug,
+        "game_instance_id": make_game_instance_id(path),
         "game_id": gid,
         "real": bool(alive.get("alive")),
         "shipping_exe": alive.get("shipping_exe"),
@@ -727,6 +730,9 @@ def normalize_manual_game(entry: dict) -> dict | None:
         record["adapted"] = bool(level)
         record["adapted_by"] = level
     record["manual"] = True
+    record["game_instance_id"] = str(
+        entry.get("game_instance_id") or make_game_instance_id(path)
+    )
     return record
 
 
@@ -767,6 +773,7 @@ def upsert_manual_game(entries: list[dict] | None, name: str, game_root: str,
         "executable": os.path.realpath(executable) if executable else "",
         "slug": slug or matched_slug or _local_slug(title),
         "game_id": int(game_id or matched_id or 0),
+        "game_instance_id": make_game_instance_id(path),
     }
     merged = []
     target = os.path.normcase(os.path.realpath(path))

@@ -115,7 +115,9 @@ function inspectAsar(edition) {
   const packedPackage = JSON.parse(
     asar.extractFile(archive, 'package.json').toString('utf8')
   )
-  if (marker.edition !== edition || packedPackage.modagentEdition !== edition) {
+  if (marker.edition !== edition || marker.channel !== 'stable'
+      || packedPackage.modagentEdition !== edition
+      || packedPackage.modagentChannel !== 'stable') {
     throw new Error(`${edition} identity mismatch in packaged application`)
   }
   if (edition === 'free' && (mp3.length || paidRaster.length)) {
@@ -171,17 +173,26 @@ if (process.env.MODAGENT_SKIP_BUILD !== '1') {
   run('npm.cmd', ['run', 'build:backend'])
   for (const edition of ['free', 'subscription']) {
     cleanDirectory(path.join(releaseRoot, edition))
-    run('npm.cmd', ['run', 'build'], { MODAGENT_EDITION: edition })
+    run('npm.cmd', ['run', 'build'], {
+      MODAGENT_EDITION: edition,
+      MODAGENT_CHANNEL: 'stable',
+    })
     run('npx.cmd', [
       'electron-builder', '--win', 'nsis',
       '--config', 'electron-builder.config.cjs',
-    ], { MODAGENT_EDITION: edition })
+    ], { MODAGENT_EDITION: edition, MODAGENT_CHANNEL: 'stable' })
   }
 } else {
   cleanDirectory(verifiedRoot)
 }
 for (const edition of ['free', 'subscription']) {
-  reports.push(inspectAsar(edition))
+  const report = inspectAsar(edition)
+  run('node', [
+    'scripts/test-packaged-smoke.js',
+    '--exe', report.executable,
+    '--edition', edition,
+  ])
+  reports.push(report)
 }
 
 fs.mkdirSync(verifiedRoot, { recursive: true })

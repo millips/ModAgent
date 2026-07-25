@@ -12,6 +12,8 @@
     "verify:text": "node scripts/verify-release-text.js",
     "test:browser": "node scripts/test-browser-launcher.js",
     "test:diagnostics": "node scripts/test-runtime-diagnostics.js",
+    "test:identity": "node scripts/test-app-identity.js",
+    "test:packaged-smoke": "node scripts/test-packaged-smoke.js",
     "build": "npm run verify:audio && npm run verify:text && node scripts/clean-dist.js && vite build",
     "start": "electron .",
     "lab": "electron feedback-lab/main.js",
@@ -21,6 +23,7 @@
     "pack:win": "npm run build && npm run build:backend && electron-builder --win dir --config electron-builder.config.cjs",
     "dist:win": "npm run build && npm run build:backend && electron-builder --win nsis --config electron-builder.config.cjs",
     "release:all": "node scripts/release-all.js",
+    "release:public-beta": "node scripts/release-public-beta.js",
     "release:github-free": "node scripts/prepare-github-free.js",
     "release:promote": "node scripts/promote-verified.js"
   },

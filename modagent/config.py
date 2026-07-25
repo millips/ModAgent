@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 from dataclasses import dataclass, asdict, field
 
 CONFIG_DIR = os.path.abspath(os.environ.get(
@@ -11,6 +12,32 @@ PROMPT_FILE = os.path.join(CONFIG_DIR, "prompt.md")
 def current_edition() -> str:
     value = (os.environ.get("MODAGENT_EDITION") or "free").strip().lower()
     return value if value in {"free", "subscription"} else "free"
+
+
+def current_channel() -> str:
+    value = (os.environ.get("MODAGENT_CHANNEL") or "stable").strip().lower()
+    return value if value in {"stable", "beta"} else "stable"
+
+
+def make_game_instance_id(game_root: str) -> str:
+    """Return a stable local-install identity, separate from catalogue slugs."""
+    if not game_root:
+        return ""
+    normalized = os.path.normcase(os.path.realpath(os.path.abspath(
+        os.path.expandvars(os.path.expanduser(game_root))
+    )))
+    digest = hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return f"gi_{digest[:20]}"
+
+
+def game_storage_id(cfg, requested: str = "") -> str:
+    """Resolve legacy catalogue-slug callers to the selected install instance."""
+    requested = str(requested or "")
+    instance_id = str(getattr(cfg, "game_instance_id", "") or "")
+    catalogue_slug = str(getattr(cfg, "game_slug", "") or "")
+    if instance_id and (not requested or requested in {catalogue_slug, instance_id}):
+        return instance_id
+    return requested or catalogue_slug
 
 
 def entitlement_tier() -> str:
@@ -27,6 +54,7 @@ class Config:
     nexus_api_key: str = ""
     game_name: str = ""
     game_slug: str = ""
+    game_instance_id: str = ""
     game_id: int = 0
     game_root: str = ""
     mod_loader: str = ""
@@ -62,6 +90,21 @@ def load() -> Config:
             data = json.load(f)
     filtered = {k: v for k, v in data.items() if k in Config.__dataclass_fields__}
     cfg = Config(**filtered)
+    if cfg.game_root and not cfg.game_instance_id:
+        cfg.game_instance_id = make_game_instance_id(cfg.game_root)
+    normalized_manual_games = []
+    for entry in cfg.manual_games or []:
+        normalized = dict(entry)
+        path = str(normalized.get("path") or normalized.get("game_root") or "")
+        if path and not normalized.get("game_instance_id"):
+            normalized["game_instance_id"] = make_game_instance_id(path)
+        normalized_manual_games.append(normalized)
+    cfg.manual_games = normalized_manual_games
+    if cfg.game_instance_id and cfg.game_slug:
+        roots = dict(cfg.manual_mod_dirs or {})
+        if cfg.game_instance_id not in roots and cfg.game_slug in roots:
+            roots[cfg.game_instance_id] = list(roots[cfg.game_slug])
+        cfg.manual_mod_dirs = roots
     try:
         cfg.recommendation_limit = max(2, min(int(cfg.recommendation_limit), 20))
     except (TypeError, ValueError):

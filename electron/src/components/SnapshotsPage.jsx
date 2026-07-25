@@ -9,12 +9,12 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
   const [delConfirm, setDelConfirm] = useState(null)
   const [restoreConfirm, setRestoreConfirm] = useState(null)   // 回滚预览确认弹窗数据
 
-  useEffect(() => { loadSnaps() }, [status.game_slug])
+  useEffect(() => { loadSnaps() }, [status.game_slug, status.game_instance_id])
 
   const loadSnaps = async () => {
     try {
-      const slug = status.game_slug || ''
-      const url = slug ? `${api}/snapshots?game_slug=${slug}` : `${api}/snapshots`
+      const scope = status.game_instance_id || status.game_slug || ''
+      const url = scope ? `${api}/snapshots?game_slug=${encodeURIComponent(scope)}` : `${api}/snapshots`
       const r = await fetch(url)
       if (!r.ok) throw new Error(`snapshots request failed: ${r.status}`)
       const data = await r.json()
@@ -29,8 +29,8 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
 
   const reconcile = async () => {
     try {
-      const slug = status.game_slug || ''
-      const r = await fetch(`${api}/snapshots/reconcile?game_slug=${encodeURIComponent(slug)}`, { method: 'POST' })
+      const scope = status.game_instance_id || status.game_slug || ''
+      const r = await fetch(`${api}/snapshots/reconcile?game_slug=${encodeURIComponent(scope)}`, { method: 'POST' })
       const d = await r.json()
       if (d.invalid?.length) { emitFeedback('warning', { source: 'snapshot-reconcile', count: d.invalid.length }); toast(`对账完成: ${d.invalid.length}/${d.checked} 个快照已失效(磁盘文件丢失),已标灰`, 'error') }
       else { emitFeedback('notice', { source: 'snapshot-reconcile' }); toast(`对账完成: ${d.checked} 个快照全部完好`) }

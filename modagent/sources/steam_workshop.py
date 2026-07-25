@@ -179,6 +179,10 @@ async def search(query: str, appid: int, cdp_port: int = 18888) -> list:
         for key, value in detail.items():
             if value not in (None, "", [], {}):
                 merged[key] = value
+        merged["_detail_verified"] = bool(detail)
+        merged["verification_source"] = (
+            "steam_published_file_details" if detail else "steam_search"
+        )
         enriched.append(merged)
     return enriched
 
