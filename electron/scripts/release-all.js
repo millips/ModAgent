@@ -220,12 +220,23 @@ for (const edition of ['free', 'subscription']) {
   reports.push(report)
 }
 
+run('node', ['scripts/build-cleanup-tool.js'])
 fs.mkdirSync(verifiedRoot, { recursive: true })
 for (const report of reports) {
   const target = path.join(verifiedRoot, path.basename(report.installer))
   fs.copyFileSync(report.installer, target)
   report.verifiedInstaller = target
 }
+const cleanupSource = path.join(
+  releaseRoot,
+  'tools',
+  `ModAgent-Cleanup-${packageInfo.version}.exe`,
+)
+if (!fs.existsSync(cleanupSource)) {
+  throw new Error(`Cleanup tool missing: ${cleanupSource}`)
+}
+const cleanupTarget = path.join(verifiedRoot, path.basename(cleanupSource))
+fs.copyFileSync(cleanupSource, cleanupTarget)
 for (const manifestName of ['free-update.json', 'p-update.json']) {
   fs.copyFileSync(
     path.join(repoRoot, 'updates', manifestName),
@@ -235,6 +246,16 @@ for (const manifestName of ['free-update.json', 'p-update.json']) {
 const proReport = reports.find(item => item.edition === 'subscription')
 const proPortable = path.join(verifiedRoot, 'ModAgentP')
 copyTree(path.dirname(proReport.executable), proPortable)
+for (const [sourceName, targetName] of [
+  ['USER-GUIDE-v1.3.0.md', '使用教程.md'],
+  ['MODAGENT-P-MEMBERSHIP-GUIDE.md', 'ModAgent-P-会员教程.md'],
+  ['RELEASE-SECURITY-REVIEW-v1.3.0.md', '发行安全审查.md'],
+]) {
+  fs.copyFileSync(
+    path.join(repoRoot, 'docs', sourceName),
+    path.join(verifiedRoot, targetName),
+  )
+}
 
 const manifest = {
   schema: 1,
@@ -243,6 +264,10 @@ const manifest = {
   dirty,
   builtAt: new Date().toISOString(),
   sourceRoot: repoRoot,
+  cleanupTool: {
+    file: path.basename(cleanupTarget),
+    sha256: sha256(cleanupTarget),
+  },
   reports: reports.map(report => ({
     edition: report.edition,
     marker: report.marker,
@@ -258,5 +283,13 @@ const manifest = {
 fs.writeFileSync(
   path.join(verifiedRoot, 'release-manifest.json'),
   JSON.stringify(manifest, null, 2)
+)
+fs.writeFileSync(
+  path.join(verifiedRoot, 'SHA256SUMS.txt'),
+  [
+    ...reports.map(report => `${report.installerSha256}  ${path.basename(report.verifiedInstaller)}`),
+    `${manifest.cleanupTool.sha256}  ${manifest.cleanupTool.file}`,
+  ].join('\n') + '\n',
+  'utf8',
 )
 console.log(`Verified release ready: ${verifiedRoot}`)
