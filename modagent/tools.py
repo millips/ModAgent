@@ -416,12 +416,23 @@ def _version_relation(current: str, latest: str) -> str:
     return "different"
 
 
-def _execute_toggle_plan(mods, enabling: bool, game_slug: str = "") -> dict:
+def _execute_toggle_plan(
+    mods, enabling: bool, game_slug: str = "", game_root: str = "",
+) -> dict:
     """Preflight and execute a toggle chain; roll back newly renamed files on failure."""
     issues = []
     for mod in mods:
         for tracked in _mod_files(mod):
-            original = tracked[:-9] if tracked.endswith(".disabled") else tracked
+            raw_original = tracked[:-9] if tracked.endswith(".disabled") else tracked
+            original, unsafe_reason = installer.resolve_managed_game_path(
+                raw_original, game_root,
+            )
+            if not original:
+                issues.append({
+                    "mod_id": mod.id, "file": str(raw_original),
+                    "problem": f"不安全的账本路径：{unsafe_reason}",
+                })
+                continue
             disabled = original + ".disabled"
             original_exists = os.path.exists(original)
             disabled_exists = os.path.exists(disabled)
@@ -437,12 +448,20 @@ def _execute_toggle_plan(mods, enabling: bool, game_slug: str = "") -> dict:
     changed = []
     operation = installer.enable_mod if enabling else installer.disable_mod
     for mod in mods:
-        result = operation(_mod_files(mod))
+        result = operation(_mod_files(mod), game_root)
         details.append({"mod_id": mod.id, "name": mod.name, **result})
         changed.extend(result.get("changed", []))
-        if result.get("errors") or result.get("not_found"):
-            rollback = (installer.disable_mod if enabling else installer.enable_mod)(list(reversed(changed)))
-            rollback_failed = bool(rollback.get("errors") or rollback.get("not_found"))
+        if (
+            result.get("errors") or result.get("not_found")
+            or result.get("blocked_unsafe")
+        ):
+            rollback = (installer.disable_mod if enabling else installer.enable_mod)(
+                list(reversed(changed)), game_root,
+            )
+            rollback_failed = bool(
+                rollback.get("errors") or rollback.get("not_found")
+                or rollback.get("blocked_unsafe")
+            )
             return {
                 "error": "文件启停过程中发生错误；已尝试撤销本轮变更。",
                 "rolled_back": not rollback_failed,
@@ -453,7 +472,9 @@ def _execute_toggle_plan(mods, enabling: bool, game_slug: str = "") -> dict:
         game_slug, [str(mod.id) for mod in mods], enabling=enabling,
     ) if game_slug else {"complete": True, "changed": [], "failed": []}
     if not config_result.get("complete"):
-        rollback_files = (installer.disable_mod if enabling else installer.enable_mod)(list(reversed(changed)))
+        rollback_files = (installer.disable_mod if enabling else installer.enable_mod)(
+            list(reversed(changed)), game_root,
+        )
         rollback_config = user_config.toggle_mod_configs(
             game_slug, [str(mod.id) for mod in mods], enabling=not enabling,
         )
@@ -1534,13 +1555,23 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             _files = ([] if is_ws else
                       (json.loads(mod.files_installed) if isinstance(mod.files_installed, str)
                        else (mod.files_installed or [])))
+            _unsafe = []
+            _safe_files = []
+            for _file in _files:
+                _managed, _reason = installer.resolve_managed_game_path(_file, root)
+                if _managed:
+                    _safe_files.append(_managed)
+                else:
+                    _unsafe.append({"file": str(_file), "reason": _reason})
             return json.dumps({
                 "requires_confirmation": True,
                 "mod_id": mid, "mod_name": mod.name,
                 "kind": "工坊订阅(卸载=退订)" if is_ws else "本地文件",
                 "will_unsubscribe": is_ws,
-                "will_delete_count": len(_files),
-                "will_delete_sample": [str(f) for f in _files[:20]],
+                "will_delete_count": len(_safe_files),
+                "will_delete_sample": [str(f) for f in _safe_files[:20]],
+                "blocked_unsafe_count": len(_unsafe),
+                "blocked_unsafe_sample": _unsafe[:20],
                 "dependents": [d["name"] for d in deps],
                 "note": ("卸载前会自动建快照,可回滚。"
                          + (f"⚠️ 有 {len(deps)} 个 mod 依赖它("
@@ -2302,7 +2333,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "verified": True,
                 "message": "目标及其依赖项已经禁用，本次未重复修改文件。",
             }, indent=2, ensure_ascii=False)
-        operation = _execute_toggle_plan(plan, enabling=False, game_slug=slug)
+        operation = _execute_toggle_plan(
+            plan, enabling=False, game_slug=slug, game_root=root,
+        )
         if operation.get("error"):
             return json.dumps(operation, indent=2, ensure_ascii=False)
         details = operation["details"]
@@ -2341,7 +2374,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "note": "此 Mod 需要以下前置依赖；继续会先启用依赖，再启用目标 Mod。",
             }, indent=2, ensure_ascii=False)
         plan = dependencies + [mod]
-        operation = _execute_toggle_plan(plan, enabling=True, game_slug=slug)
+        operation = _execute_toggle_plan(
+            plan, enabling=True, game_slug=slug, game_root=root,
+        )
         if operation.get("error"):
             return json.dumps(operation, indent=2, ensure_ascii=False)
         details = operation["details"]

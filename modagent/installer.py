@@ -17,6 +17,45 @@ from .config import CONFIG_DIR
 BACKUPS_DIR = os.path.join(CONFIG_DIR, "backups")
 
 
+def resolve_managed_game_path(path: str, game_root: str) -> tuple[str, str]:
+    """Resolve a ledger path and fail closed unless it is inside the game root.
+
+    Mod records are persistent input, not an authority boundary.  Old versions,
+    manual database edits, junctions and symlinks can all turn a once-valid
+    absolute path into a path outside the selected game.  Every destructive
+    ledger operation must call this helper immediately before touching disk.
+    """
+    try:
+        raw = os.fspath(path)
+    except TypeError:
+        return "", "记录不是有效文件路径"
+    if not isinstance(raw, str) or not raw.strip():
+        return "", "记录路径为空"
+    if not game_root:
+        return "", "未配置游戏根目录"
+
+    root_abs = os.path.abspath(game_root)
+    root_real = os.path.realpath(root_abs)
+    drive, _ = os.path.splitdrive(root_real)
+    anchor = drive + os.sep if drive else os.path.abspath(os.sep)
+    if os.path.normcase(root_real) == os.path.normcase(anchor):
+        return "", "游戏根目录不能是磁盘根目录"
+
+    candidate = raw if os.path.isabs(raw) else os.path.join(root_abs, raw)
+    candidate_abs = os.path.abspath(candidate)
+    candidate_real = os.path.realpath(candidate_abs)
+    try:
+        within = (
+            os.path.normcase(os.path.commonpath([root_real, candidate_real]))
+            == os.path.normcase(root_real)
+        )
+    except ValueError:
+        within = False
+    if not within or os.path.normcase(candidate_real) == os.path.normcase(root_real):
+        return "", "记录路径越出当前游戏目录"
+    return candidate_abs, ""
+
+
 def _file_fingerprint(path: str) -> tuple[int, str]:
     """Return size and SHA-256 for an on-disk commit verification."""
     digest = hashlib.sha256()
@@ -987,10 +1026,21 @@ def uninstall_mod(mod_id: str, game_root: str, files_installed: list[str],
                   记录移除,【绝不删磁盘】,防止卸载 A 时删掉 B 依赖的共享文件
                   (根因修复:UE4SS 与 CNS 共享 UE4SS-settings.ini 的互删事故)。
     """
-    result = {"removed": [], "kept_shared": [], "not_found": [], "errors": []}
+    result = {
+        "removed": [], "kept_shared": [], "not_found": [],
+        "blocked_unsafe": [], "errors": [],
+    }
     shared = shared_files or set()
 
     for f in files_installed:
+        managed_path, unsafe_reason = resolve_managed_game_path(f, game_root)
+        if not managed_path:
+            result["blocked_unsafe"].append({
+                "file": str(f), "reason": unsafe_reason,
+            })
+            continue
+        f = managed_path
+
         # ── 共享文件保护:仍被其他 mod 拥有 → 不动磁盘 ──
         if os.path.normcase(os.path.abspath(f)) in shared:
             result["kept_shared"].append(f)
@@ -1113,10 +1163,20 @@ def _get_installed_files_map() -> dict[str, str]:
     return result
 
 
-def disable_mod(files_installed: list[str]) -> dict:
+def disable_mod(files_installed: list[str], game_root: str) -> dict:
     """禁用 mod：重命名文件加 .disabled 后缀"""
-    result = {"disabled": [], "changed": [], "not_found": [], "errors": []}
+    result = {
+        "disabled": [], "changed": [], "not_found": [],
+        "blocked_unsafe": [], "errors": [],
+    }
     for f in files_installed:
+        managed_path, unsafe_reason = resolve_managed_game_path(f, game_root)
+        if not managed_path:
+            result["blocked_unsafe"].append({
+                "file": str(f), "reason": unsafe_reason,
+            })
+            continue
+        f = managed_path
         if os.path.exists(f):
             try:
                 os.rename(f, f + ".disabled")
@@ -1142,10 +1202,20 @@ def is_mod_disabled(files_installed: list[str]) -> bool:
     return True
 
 
-def enable_mod(files_installed: list[str]) -> dict:
+def enable_mod(files_installed: list[str], game_root: str) -> dict:
     """启用 mod：去掉 .disabled 后缀"""
-    result = {"enabled": [], "changed": [], "not_found": [], "errors": []}
+    result = {
+        "enabled": [], "changed": [], "not_found": [],
+        "blocked_unsafe": [], "errors": [],
+    }
     for f in files_installed:
+        managed_path, unsafe_reason = resolve_managed_game_path(f, game_root)
+        if not managed_path:
+            result["blocked_unsafe"].append({
+                "file": str(f), "reason": unsafe_reason,
+            })
+            continue
+        f = managed_path
         target = f + ".disabled" if not f.endswith(".disabled") else f
         original = f.replace(".disabled", "") if f.endswith(".disabled") else f
         if os.path.exists(target):
