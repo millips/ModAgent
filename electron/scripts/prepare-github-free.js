@@ -204,6 +204,16 @@ fs.mkdirSync(candidateRoot, { recursive: true })
 
 const installerTarget = path.join(candidateRoot, path.basename(report.installer))
 fs.copyFileSync(report.installer, installerTarget)
+const cleanupSource = path.join(
+  releaseRoot,
+  'tools',
+  `ModAgent-Cleanup-${packageInfo.version}.exe`
+)
+if (!fs.existsSync(cleanupSource)) {
+  throw new Error(`Cleanup tool missing; run npm run release:all first: ${cleanupSource}`)
+}
+const cleanupTarget = path.join(candidateRoot, path.basename(cleanupSource))
+fs.copyFileSync(cleanupSource, cleanupTarget)
 
 let portableTarget = null
 if (process.env.MODAGENT_SKIP_PORTABLE !== '1') {
@@ -234,6 +244,10 @@ copyIfExists(
   path.join(repoRoot, 'updates', 'free-update.json'),
   path.join(candidateRoot, 'free-update.json')
 )
+copyIfExists(
+  path.join(repoRoot, 'updates', 'p-update.json'),
+  path.join(candidateRoot, 'p-update.json')
+)
 
 const artifacts = [
   {
@@ -241,6 +255,12 @@ const artifacts = [
     file: path.basename(installerTarget),
     bytes: fileSize(installerTarget),
     sha256: sha256(installerTarget),
+  },
+  {
+    type: 'cleanup',
+    file: path.basename(cleanupTarget),
+    bytes: fileSize(cleanupTarget),
+    sha256: sha256(cleanupTarget),
   },
 ]
 if (portableTarget) {
