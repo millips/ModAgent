@@ -466,7 +466,7 @@ def get_download_url_api(
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
         "Application-Name": "ModAgent",
-        "Application-Version": "1.10.0",
+        "Application-Version": "1.3.0",
     })
     try:
         with urllib.request.urlopen(

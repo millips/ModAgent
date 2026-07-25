@@ -318,7 +318,7 @@ export default function SettingsPage({ toast, api }) {
             ))}
           </div>
           <div className="text-[11px] text-surface-500 border-t border-surface-600/60 pt-2">
-            {__MODAGENT_SUBSCRIPTION__ ? 'ModAgent Pro' : 'ModAgent'} v1.10 · 发布者：ModAgent Project
+            {__MODAGENT_SUBSCRIPTION__ ? 'ModAgent Pro' : 'ModAgent'} v{__MODAGENT_VERSION__} · 发布者：ModAgent Project
           </div>
         </div>
 

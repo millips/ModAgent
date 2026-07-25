@@ -2,7 +2,7 @@
 
 ## 安装
 
-1. 运行 `ModAgent-Pro-Setup-1.10.0.exe`。
+1. 运行 `ModAgent-Pro-Setup-1.3.0.exe`。
 2. Windows 若显示“未知发布者”，请确认文件名和开发者提供的 SHA-256 后再选择继续。
 3. 首次启动不会携带开发者的 API Key、聊天记录、壁纸、Mod、快照或下载文件。
 

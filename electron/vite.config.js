@@ -45,6 +45,7 @@ export default defineConfig({
   plugins: [freeCssSanitizer(), react(), editionMarker()],
   define: {
     __MODAGENT_SUBSCRIPTION__: JSON.stringify(edition === 'subscription'),
+    __MODAGENT_VERSION__: JSON.stringify(packageInfo.version),
   },
   resolve: {
     alias: {

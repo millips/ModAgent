@@ -3,7 +3,7 @@
   "productName": "ModAgent Pro",
   "description": "AI-assisted game mod manager",
   "modagentEdition": "subscription",
-  "version": "1.10.2",
+  "version": "1.3.0",
   "main": "main.js",
   "scripts": {
     "dev": "vite --port 3000",

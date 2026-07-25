@@ -7,7 +7,7 @@ function identity(edition, channel) {
   process.env.MODAGENT_EDITION = edition
   process.env.MODAGENT_CHANNEL = channel
   try {
-    return getAppIdentity({ version: '1.10.0' })
+    return getAppIdentity({ version: '1.3.0' })
   } finally {
     if (previousEdition === undefined) delete process.env.MODAGENT_EDITION
     else process.env.MODAGENT_EDITION = previousEdition

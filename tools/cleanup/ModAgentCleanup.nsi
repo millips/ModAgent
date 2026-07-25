@@ -9,7 +9,7 @@ ManifestDPIAware true
 !include "nsDialogs.nsh"
 
 !ifndef PRODUCT_VERSION
-  !define PRODUCT_VERSION "1.10.0"
+  !define PRODUCT_VERSION "1.3.0"
 !endif
 !ifndef OUTPUT_FILE
   !define OUTPUT_FILE "ModAgent-Cleanup.exe"

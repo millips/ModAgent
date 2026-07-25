@@ -104,7 +104,7 @@ export default function SetupPage({ onDone, api, toast }) {
           <h2 className="text-lg font-bold text-white">ModAgent 首次配置</h2>
         </div>
         <p className="text-xs text-surface-500 mb-6">
-          当前 v1.10 面向中文用户并正式支持 DeepSeek。三个 Key 均保存在本机 Windows 加密存储中。
+          当前 v{__MODAGENT_VERSION__} 面向中文用户并正式支持 DeepSeek。三个 Key 均保存在本机 Windows 加密存储中。
         </p>
 
         {step === 0 && (

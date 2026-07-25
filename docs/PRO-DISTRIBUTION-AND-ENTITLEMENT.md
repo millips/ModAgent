@@ -60,7 +60,7 @@
   "nbf": 0,
   "exp": 0,
   "grace_until": 0,
-  "min_version": "1.10.0",
+  "min_version": "1.3.0",
   "jti": "unique-token-id",
   "kid": "signing-key-id"
 }

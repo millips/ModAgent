@@ -22,7 +22,7 @@ export default function Sidebar({ page, onNav, status }) {
           <span className="w-2 h-2 rounded-full bg-cyber-cyan shadow-[0_0_8px_#00d4ff]"></span>
           ModAgent
         </h1>
-        <p className="text-[11px] text-surface-500 mt-1">AI Mod Manager v1.10</p>
+        <p className="text-[11px] text-surface-500 mt-1">AI Mod Manager v{__MODAGENT_VERSION__}</p>
       </div>
 
       <nav className="flex-1 p-2 flex flex-col gap-0.5">
