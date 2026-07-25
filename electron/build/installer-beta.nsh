@@ -1,9 +1,7 @@
 !macro customUnInstall
-  ; electron-builder only waits for the desktop executable. If it has already
-  ; been force-closed, its frozen Python child can remain alive and keep
-  ; resources\backend locked, leaving the custom install directory behind.
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ModAgentBackend.exe'
-  Sleep 800
+  ; Stop only the backend located inside this installation. Stable and Beta
+  ; editions may run side by side and must not terminate each other's backend.
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\uninstall-stop-backend.ps1" -InstallDir "$INSTDIR"'
 
   ${ifNot} ${isUpdated}
     MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON1 "是否保留 ModAgent 公测版的测试数据？选择“是”将保留公测设置、日志和测试记录；选择“否”将清理公测版数据，不影响正式版。" /SD IDYES IDYES beta_keep_data IDNO beta_remove_data

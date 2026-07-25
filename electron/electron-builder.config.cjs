@@ -82,6 +82,10 @@ module.exports = {
       to: 'backend',
       filter: ['**/*'],
     },
+    {
+      from: 'build/uninstall-stop-backend.ps1',
+      to: 'uninstall-stop-backend.ps1',
+    },
     ...commonLegalResources,
     ...editionLegalResources,
   ],

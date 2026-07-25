@@ -1,8 +1,7 @@
 !macro customUnInstall
-  ; Stop the packaged backend before electron-builder removes $INSTDIR. A
-  ; force-closed desktop process may otherwise leave this child process alive.
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ModAgentBackend.exe'
-  Sleep 800
+  ; Stop only the backend located inside this installation. Free and Pro
+  ; editions may run side by side and must not terminate each other's backend.
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\uninstall-stop-backend.ps1" -InstallDir "$INSTDIR"'
 
   ${ifNot} ${isUpdated}
     MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON1 "是否保留 ModAgent 的全部本地数据？选择“是”将保留业务数据、设置和缓存；选择“否”将继续选择清理范围。" /SD IDYES IDYES uninstall_keep_all IDNO uninstall_choose_cleanup
