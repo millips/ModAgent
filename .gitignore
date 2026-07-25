@@ -23,3 +23,8 @@ electron/src/assets/themes/
 electron/assets/license/
 electron/assets/icons/modagent-p.*
 electron/assets/icons/modagent-subscription.*
+design/technology-core-image-handoff/
+electron/feedback-lab/
+docs/CAT-THEME-AUDIO-REQUIREMENTS.md
+docs/THEME-DEVELOPMENT-SOP.md
+docs/commercial-audio-regeneration-prompts.md
