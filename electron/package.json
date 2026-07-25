@@ -29,6 +29,7 @@
     "release:public-beta": "node scripts/release-public-beta.js",
     "build:cleanup": "node scripts/build-cleanup-tool.js",
     "release:github-free": "node scripts/prepare-github-free.js",
+    "release:afdian-p": "node scripts/prepare-afdian-p.js",
     "release:promote": "node scripts/promote-verified.js"
   },
   "dependencies": {
