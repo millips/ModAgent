@@ -272,7 +272,6 @@ export function applyEditionDefaultBackground() {
 
 export function SettingsEditionPanel({ toast }) {
   const initial = readVisualPreferences()
-  const [controls, setControls] = useState(initial.controls)
   const [visual, setVisual] = useState(initial.visual)
   const [lighting, setLighting] = useState(initial.lighting)
   const [soundEditing, setSoundEditing] = useState(false)
@@ -299,7 +298,7 @@ export function SettingsEditionPanel({ toast }) {
           <Palette size={14} className="text-cyber-cyan" />
           <span className="text-sm font-medium">界面主题</span>
         </div>
-        <p className="text-xs text-surface-500">订阅版主题、氛围打光与科技核心控件。</p>
+        <p className="text-xs text-surface-500">订阅版主题与氛围打光；按钮外观会随主题自动匹配。</p>
         <label className="text-xs text-surface-500 block">主体配色</label>
         <select className="input-cyber" value={visual} onChange={event => {
           const value = event.target.value
@@ -313,20 +312,6 @@ export function SettingsEditionPanel({ toast }) {
           save('lighting', value, setLighting, `氛围打光：${LIGHTING_MODES.find(item => item.value === value)?.label || value}`)
         }}>
           {LIGHTING_MODES.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}
-        </select>
-        <label className="text-xs text-surface-500 block">控件外壳</label>
-        <select className="input-cyber" value={controls} onChange={event => {
-          const value = event.target.value
-          const labels = {
-            classic: '已恢复经典控件',
-            'technology-core': '已启用科技核心完整主题',
-            'minimal-tech': '已启用现代简约科技主题',
-          }
-          save('controls', value, setControls, labels[value] || '控件主题已更新')
-        }}>
-          <option value="classic">经典界面</option>
-          <option value="technology-core">科技核心</option>
-          <option value="minimal-tech">现代简约科技</option>
         </select>
       </div>
 

@@ -474,6 +474,93 @@ def _prune_old_snapshots(game_slug: str) -> list[str]:
     return pruned
 
 
+def snapshot_storage_usage(game_slug: str = "") -> dict:
+    """Measure snapshot storage without double-counting incremental hard links.
+
+    ``logical_bytes`` is what a normal recursive size calculation reports.
+    ``deduplicated_bytes`` counts each filesystem file identity once and is the
+    useful approximation of actual payload stored on disk. ``exclusive_bytes``
+    per snapshot estimates what deleting that snapshot alone can immediately
+    release; shared hard-linked files intentionally count as zero there.
+    """
+    from .db import list_snapshots
+
+    rows = list_snapshots(game_slug) if game_slug else list_snapshots()
+    row_by_dir = {}
+    invalid = 0
+    for row in rows:
+        snap_dir = os.path.join(SNAPSHOTS_DIR, row.game_slug or "", row.id)
+        if not os.path.isdir(snap_dir):
+            legacy = os.path.join(SNAPSHOTS_DIR, row.id)
+            snap_dir = legacy if os.path.isdir(legacy) else ""
+        if snap_dir:
+            row_by_dir[os.path.normcase(os.path.realpath(snap_dir))] = row
+        else:
+            invalid += 1
+
+    # Also scan directories not present in the DB. Older builds could leave
+    # these behind after ledger resets/migrations; hiding them would make the
+    # capacity figure misleading even though they still consume disk space.
+    scan_roots = []
+    scoped_root = os.path.join(SNAPSHOTS_DIR, game_slug) if game_slug else ""
+    if scoped_root and os.path.isdir(scoped_root):
+        scan_roots.append(scoped_root)
+    elif not game_slug and os.path.isdir(SNAPSHOTS_DIR):
+        scan_roots.append(SNAPSHOTS_DIR)
+    discovered_dirs = set(row_by_dir)
+    for root in scan_roots:
+        for current, dirs, files in os.walk(root):
+            if "manifest.json" in files:
+                discovered_dirs.add(os.path.normcase(os.path.realpath(current)))
+                dirs[:] = []
+
+    unique_files: dict[tuple[int, int], int] = {}
+    details: dict[str, dict] = {}
+    total_logical = 0
+    orphan_count = orphan_logical = orphan_exclusive = 0
+    for normalized_dir in discovered_dirs:
+        snap_dir = normalized_dir
+        logical = exclusive = file_count = 0
+        for current, _, files in os.walk(snap_dir):
+            for filename in files:
+                path = os.path.join(current, filename)
+                try:
+                    stat = os.stat(path, follow_symlinks=False)
+                except OSError:
+                    continue
+                file_count += 1
+                logical += stat.st_size
+                identity = (stat.st_dev, stat.st_ino)
+                unique_files.setdefault(identity, stat.st_size)
+                if stat.st_nlink <= 1:
+                    exclusive += stat.st_size
+        total_logical += logical
+
+        row = row_by_dir.get(normalized_dir)
+        if row:
+            details[row.id] = {
+                "logical_bytes": logical,
+                "exclusive_bytes": exclusive,
+                "stored_files": file_count,
+            }
+        else:
+            orphan_count += 1
+            orphan_logical += logical
+            orphan_exclusive += exclusive
+
+    return {
+        "snapshot_count": len(rows),
+        "valid_snapshot_count": len(details),
+        "invalid_snapshot_count": invalid,
+        "orphan_snapshot_count": orphan_count,
+        "orphan_logical_bytes": orphan_logical,
+        "orphan_exclusive_bytes": orphan_exclusive,
+        "logical_bytes": total_logical,
+        "deduplicated_bytes": sum(unique_files.values()),
+        "snapshots": details,
+    }
+
+
 def _locate_snapshot(snapshot_id: str) -> tuple[str, dict]:
     """定位快照目录并读 manifest(按 <slug>/<id> 分桶,兼容旧版平铺布局)。"""
     from .db import get_snapshot

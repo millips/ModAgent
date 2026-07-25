@@ -314,7 +314,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   const [loading, setLoading] = useState(false)
   const [sessions, setSessions] = useState([])
   const [activeSession, setActiveSession] = useState(null)
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useState(
+    () => !window.matchMedia('(max-width: 1100px)').matches
+  )
   const [editingId, setEditingId] = useState(null)
   const [editTitle, setEditTitle] = useState('')
   const [editingMsgId, setEditingMsgId] = useState(null)
@@ -343,6 +345,17 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   const recoveryAgentRef = useRef({ id: null, text: '' })
   const idRef = useRef(0)
   const activeSessionRef = useRef(null)
+
+  useEffect(() => {
+    const query = window.matchMedia('(max-width: 1100px)')
+    const handleCompactChange = event => {
+      // Entering compact mode releases the workspace width. The user can
+      // still reopen the session list as a drawer with the existing button.
+      if (event.matches) setSidebarOpen(false)
+    }
+    query.addEventListener('change', handleCompactChange)
+    return () => query.removeEventListener('change', handleCompactChange)
+  }, [])
 
   const mkId = () => `m${Date.now()}_${++idRef.current}`
 

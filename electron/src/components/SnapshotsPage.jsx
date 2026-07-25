@@ -4,6 +4,7 @@ import { emitFeedback } from '../feedback/feedbackBus'
 
 export default function SnapshotsPage({ toast, api, status, onRefresh }) {
   const [snaps, setSnaps] = useState([])
+  const [storage, setStorage] = useState(null)
   const [actionLock, setActionLock] = useState(null)
   const [preview, setPreview] = useState(null)
   const [delConfirm, setDelConfirm] = useState(null)
@@ -15,16 +16,36 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
     try {
       const scope = status.game_instance_id || status.game_slug || ''
       const url = scope ? `${api}/snapshots?game_slug=${encodeURIComponent(scope)}` : `${api}/snapshots`
-      const r = await fetch(url)
+      const storageUrl = scope
+        ? `${api}/snapshots/storage?game_slug=${encodeURIComponent(scope)}`
+        : `${api}/snapshots/storage`
+      const [r, storageResponse] = await Promise.all([fetch(url), fetch(storageUrl)])
       if (!r.ok) throw new Error(`snapshots request failed: ${r.status}`)
       const data = await r.json()
       if (!Array.isArray(data)) throw new Error('snapshots response is not an array')
+      const storageData = storageResponse.ok ? await storageResponse.json() : null
+      setStorage(storageData)
       setSnaps(data.map(s => ({
         id: s.id, time: new Date(s.timestamp * 1000).toLocaleString(),
         trigger: s.trigger_mod_name || '', files: s.files_count || 0,
         baseline: !!s.baseline, valid: s.valid !== false,
+        logicalBytes: storageData?.snapshots?.[s.id]?.logical_bytes || 0,
+        exclusiveBytes: storageData?.snapshots?.[s.id]?.exclusive_bytes || 0,
       })))
     } catch (_) { toast('加载快照失败', 'error') }
+  }
+
+  const formatBytes = value => {
+    const bytes = Number(value || 0)
+    if (bytes < 1024) return `${bytes} B`
+    const units = ['KiB', 'MiB', 'GiB', 'TiB']
+    let size = bytes
+    let unit = -1
+    do {
+      size /= 1024
+      unit += 1
+    } while (size >= 1024 && unit < units.length - 1)
+    return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unit]}`
   }
 
   const reconcile = async () => {
@@ -140,6 +161,22 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
       <div className="flex items-center justify-between px-4 py-3 border-b border-surface-600">
         <h2 className="text-base font-semibold flex items-center gap-2">
           <Camera size={16} className="text-cyber-purple" /> 快照历史
+          {storage && (
+            <span
+              className="px-2 py-0.5 rounded text-[10px] font-normal bg-cyber-purple/10 text-cyber-purple border border-cyber-purple/25"
+              title={`普通目录统计会显示 ${formatBytes(storage.logical_bytes)}；硬链接去重后的实际数据约 ${formatBytes(storage.deduplicated_bytes)}`}
+            >
+              实际占用约 {formatBytes(storage.deduplicated_bytes)}
+            </span>
+          )}
+          {storage?.orphan_snapshot_count > 0 && (
+            <span
+              className="px-2 py-0.5 rounded text-[10px] font-normal bg-cyber-yellow/10 text-cyber-yellow border border-cyber-yellow/25"
+              title="旧版本遗留在磁盘、但已不在快照账本中的目录；当前不会自动删除，以免误删尚需恢复的数据。"
+            >
+              磁盘残留 {storage.orphan_snapshot_count} 份
+            </span>
+          )}
         </h2>
         <div className="flex gap-2">
           <button className="btn-ghost" onClick={reconcile} title="校验每个快照的磁盘文件是否还在,失效的标灰并禁用回滚">
@@ -173,7 +210,15 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
               </div>
             </div>
             <div className="flex items-center gap-4">
-              <span className="text-xs text-surface-500">{snap.baseline ? '原版' : `${snap.files} 文件`}</span>
+              <span
+                className="text-xs text-surface-500 text-right"
+                title={`本快照逻辑大小 ${formatBytes(snap.logicalBytes)}；单独删除预计释放 ${formatBytes(snap.exclusiveBytes)}。共享数据会在最后一个引用快照删除后释放。`}
+              >
+                {snap.baseline ? '原版' : `${snap.files} 文件`}
+                <span className="block text-[10px] text-surface-600">
+                  新增占用约 {formatBytes(snap.exclusiveBytes)}
+                </span>
+              </span>
               <button onClick={() => showPreview(snap.id)} className="btn-ghost p-1.5" title="预览" disabled={!snap.valid}>
                 <Eye size={14} />
               </button>

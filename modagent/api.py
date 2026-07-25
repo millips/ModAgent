@@ -590,6 +590,12 @@ def list_snapshots(game_slug: str = ""):
              "baseline": _count(s) == 0, "valid": _valid(s)} for s in snaps]
 
 
+@app.get("/snapshots/storage")
+def snapshot_storage(game_slug: str = ""):
+    """Return hard-link-aware storage usage for the selected game or all games."""
+    return snapshot.snapshot_storage_usage(game_slug)
+
+
 @app.get("/snapshots/{sid}")
 def get_snapshot_detail(sid: str):
     snap = db.get_snapshot(sid)

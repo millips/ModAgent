@@ -315,16 +315,93 @@ body[data-ma-layout="designed"] .card-cyber:nth-child(2n) {
 }
 
 @media (max-width: 1100px) {
+  /* Compact-window composition. Keep every operation reachable at the
+     BrowserWindow minimum width without squeezing the conversation to a
+     sliver: navigation becomes a labeled compact rail, sessions a drawer, and
+     the work/tools split remains visible. */
+  .app-shell.is-workspace .app-sidebar {
+    width: 132px !important;
+    min-width: 132px !important;
+    padding-right: 0;
+    overflow: hidden;
+  }
+
+  .app-sidebar .app-brand {
+    padding: 14px 8px;
+  }
+
+  .app-sidebar .app-brand-version,
+  .app-sidebar .sidebar-edition-addon {
+    display: none;
+  }
+
+  .app-sidebar nav {
+    padding-inline: 8px;
+  }
+
+  .app-sidebar .nav-item,
+  body[data-ma-layout="designed"] .app-sidebar .nav-item,
+  body[data-ma-layout="designed"] .app-sidebar .nav-item:nth-child(2n),
+  body[data-ma-layout="designed"] .app-sidebar .nav-item:nth-child(3n) {
+    width: 100%;
+    margin-left: 0;
+    padding-inline: 8px;
+    justify-content: flex-start;
+    transform: none;
+  }
+
+  body[data-ma-layout="designed"] .app-sidebar .nav-item > *,
+  body[data-ma-layout="designed"] .app-sidebar .nav-item:nth-child(2n) > *,
+  body[data-ma-layout="designed"] .app-sidebar .nav-item:nth-child(3n) > * {
+    transform: none;
+  }
+
+  .app-sidebar .sidebar-connection {
+    padding-inline: 8px;
+  }
+
+  .app-sidebar .sidebar-connection button {
+    margin-left: 0;
+  }
+
   body[data-ma-layout="designed"] .app-shell.is-workspace {
-    grid-template-columns: 208px minmax(0, 1fr);
+    grid-template-columns: 132px minmax(0, 1fr);
   }
 
-  body[data-ma-layout="designed"] .chat-layout.has-session-rail {
-    grid-template-columns: 200px minmax(260px, 1fr) 220px;
+  .chat-layout {
+    position: relative;
   }
 
+  .chat-layout.has-session-rail,
+  .chat-layout.without-session-rail,
+  body[data-ma-layout="designed"] .chat-layout.has-session-rail,
   body[data-ma-layout="designed"] .chat-layout.without-session-rail {
-    grid-template-columns: minmax(300px, 1fr) 220px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(210px, 30%);
+  }
+
+  .chat-layout .chat-session-rail,
+  body[data-ma-layout="designed"] .chat-layout .chat-session-rail {
+    position: absolute;
+    z-index: 60;
+    inset: 0 auto 0 0;
+    width: min(280px, 72vw) !important;
+    min-width: 0 !important;
+    box-shadow: 18px 0 42px rgba(0, 0, 0, .48);
+  }
+
+  .chat-layout .chat-primary-pane {
+    grid-column: 1;
+    min-width: 0;
+  }
+
+  .chat-layout .chat-quick-sidebar {
+    grid-column: 2;
+    width: auto;
+    min-width: 0;
+    padding: 12px;
+    gap: 12px;
+    overflow-y: auto;
   }
 }
 
