@@ -43,6 +43,7 @@ function sha256(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 }
 
+run('npm.cmd', ['run', 'test:uninstaller'])
 run('npm.cmd', ['run', 'build:backend'])
 run('npm.cmd', ['run', 'build'])
 run('npx.cmd', [
