@@ -1,5 +1,7 @@
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
+const { spawnSync } = require('child_process')
 
 const electronRoot = path.resolve(__dirname, '..')
 const repoRoot = path.resolve(electronRoot, '..')
@@ -29,6 +31,32 @@ function copy(source, targetName = path.basename(source)) {
   fs.copyFileSync(source, path.join(resolved, targetName))
 }
 
+function sha256(file) {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+}
+
+function createPortableZip(source, destination) {
+  const result = spawnSync(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-Command',
+      'Compress-Archive -Path (Join-Path $env:MODAGENT_PORTABLE_SOURCE "*") -DestinationPath $env:MODAGENT_PORTABLE_ZIP -CompressionLevel Optimal -Force',
+    ],
+    {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        MODAGENT_PORTABLE_SOURCE: source,
+        MODAGENT_PORTABLE_ZIP: destination,
+      },
+    },
+  )
+  if (result.status !== 0 || !fs.existsSync(destination)) {
+    throw new Error(`Could not create P portable archive: ${destination}`)
+  }
+}
+
 copy(path.join(verifiedRoot, report.installer))
 copy(path.join(verifiedRoot, manifest.cleanupTool.file))
 copy(path.join(verifiedRoot, 'p-update.json'))
@@ -37,10 +65,16 @@ copy(path.join(repoRoot, 'docs', 'USER-GUIDE-v1.3.0.md'), '使用教程.md')
 copy(path.join(repoRoot, 'docs', 'RELEASE-SECURITY-REVIEW-v1.3.0.md'), '发行安全审查.md')
 copy(path.join(repoRoot, 'docs', 'AFDIAN-P-LAUNCH-2026-07-26.md'), '爱发电发布文案.md')
 
+const portableName = `ModAgent-P-Portable-${packageInfo.version}.zip`
+const portablePath = path.join(resolved, portableName)
+createPortableZip(path.join(verifiedRoot, 'ModAgentP'), portablePath)
+const portableSha256 = sha256(portablePath)
+
 fs.writeFileSync(
   path.join(resolved, 'SHA256SUMS.txt'),
   [
     `${report.installerSha256}  ${report.installer}`,
+    `${portableSha256}  ${portableName}`,
     `${manifest.cleanupTool.sha256}  ${manifest.cleanupTool.file}`,
   ].join('\n') + '\n',
   'utf8',

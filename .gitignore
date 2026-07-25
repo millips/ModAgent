@@ -16,3 +16,10 @@ _stage_backup/
 electron/release/
 electron/tmp-asar-*/
 electron/.smoke-*/
+
+# ModAgent P assets are injected only by the private release workspace.
+# Never stage them in the public GitHub repository.
+electron/src/assets/themes/
+electron/assets/license/
+electron/assets/icons/modagent-p.*
+electron/assets/icons/modagent-subscription.*
