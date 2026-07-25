@@ -175,8 +175,13 @@ const statusLines = output(
   ['-c', `safe.directory=${safeRepo}`, '-c', 'core.quotePath=false', 'status', '--porcelain']
 ).split(/\r?\n/).filter(Boolean)
 const generatedPath = /(?:^|\/)(?:__pycache__|electron\/dist|electron\/release|build)(?:\/|$)|\.pyc$/i
+const untrackedReleaseSource = /^(?:electron|modagent|packaging|tools|updates|docs\/releases)\//i
 const relevantDirtyLines = statusLines.filter(
-  line => !generatedPath.test(line.slice(3).replaceAll('\\', '/'))
+  line => {
+    const sourcePath = line.slice(3).replaceAll('\\', '/')
+    if (generatedPath.test(sourcePath)) return false
+    return !line.startsWith('?? ') || untrackedReleaseSource.test(sourcePath)
+  }
 )
 const dirty = relevantDirtyLines.length > 0
 
