@@ -436,6 +436,39 @@ def _safe_mod_folder_name(value: str, fallback: str = "SMAPI-Mod") -> str:
     return (value or fallback)[:100]
 
 
+def _relative_child_path(path: str, root: str) -> str:
+    """Return a lexical child path while validating its canonical containment.
+
+    Windows can expose the same temporary directory through both a long path and
+    an 8.3 short path (for example ``RunnerAdmin`` and ``RUNNER~1``). Mixing a
+    canonical root with a lexical child makes ``relpath`` manufacture ``..``
+    segments. Keep both operands in their original absolute representation for
+    the relative path, and use real paths only for the containment check.
+    """
+    absolute_path = os.path.abspath(path)
+    absolute_root = os.path.abspath(root)
+    real_path = os.path.normcase(os.path.realpath(absolute_path))
+    real_root = os.path.normcase(os.path.realpath(absolute_root))
+    try:
+        if os.path.commonpath([real_root, real_path]) != real_root:
+            raise ValueError(f"路径越出根目录: {path}")
+    except ValueError as exc:
+        raise ValueError(f"路径不属于指定根目录: {path}") from exc
+
+    relative = os.path.relpath(absolute_path, absolute_root)
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        raise ValueError(f"相对路径越出根目录: {path}")
+    return relative
+
+
+def _is_same_or_child_path(path: str, root: str) -> bool:
+    try:
+        _relative_child_path(path, root)
+        return True
+    except ValueError:
+        return False
+
+
 def _install_stardew_smapi(
     archive_path: str, game_root: str, game_slug: str,
 ) -> dict:
@@ -469,7 +502,10 @@ def _install_stardew_smapi(
                 raise RuntimeError(
                     f"SMAPI manifest.json 缺少 Name/UniqueID: {manifest_path}"
                 )
-            manifest_roots.append((os.path.realpath(current), manifest))
+            # Preserve the lexical extraction path. Converting only this side to
+            # realpath can turn it into an 8.3 short path on Windows CI and make
+            # later relpath calculations escape through artificial ``..`` parts.
+            manifest_roots.append((os.path.abspath(current), manifest))
 
         if not manifest_roots:
             raise RuntimeError(
@@ -481,7 +517,7 @@ def _install_stardew_smapi(
         used_folders = set()
         root_targets = {}
         for manifest_root, manifest in manifest_roots:
-            relative = os.path.relpath(manifest_root, tmp)
+            relative = _relative_child_path(manifest_root, tmp)
             leaf = "" if relative == "." else os.path.basename(manifest_root)
             folder = _safe_mod_folder_name(
                 leaf or manifest.get("Name"),
@@ -498,31 +534,29 @@ def _install_stardew_smapi(
         operations = []
         for current, dirs, files in os.walk(tmp):
             dirs[:] = [name for name in dirs if name.casefold() != "__macosx"]
-            real_current = os.path.realpath(current)
             owner_root = next(
                 (
                     root for root, _ in manifest_roots
-                    if real_current == root
-                    or real_current.startswith(root + os.sep)
+                    if _is_same_or_child_path(current, root)
                 ),
                 "",
             )
             if not owner_root:
                 for filename in files:
                     result["skipped"].append(
-                        os.path.relpath(os.path.join(current, filename), tmp)
+                        _relative_child_path(os.path.join(current, filename), tmp)
                     )
                 continue
             folder = root_targets[owner_root]
             for filename in files:
                 source = os.path.join(current, filename)
-                relative = os.path.relpath(source, owner_root)
+                relative = _relative_child_path(source, owner_root)
                 destination = os.path.join(game_root, "Mods", folder, relative)
                 operations.append({
                     "src": source,
                     "dest": destination,
                     "record": {
-                        "file": os.path.relpath(source, tmp),
+                        "file": _relative_child_path(source, tmp),
                         "smapi_unique_id": next(
                             str(manifest.get("UniqueID") or "")
                             for root, manifest in manifest_roots
