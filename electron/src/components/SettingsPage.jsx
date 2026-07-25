@@ -104,9 +104,7 @@ export default function SettingsPage({ toast, api }) {
     const body = {
       llm_model: model,
       llm_endpoint: endpoint,
-      ...(__MODAGENT_SUBSCRIPTION__
-        ? { recommendation_limit: Math.max(2, Math.min(Number(recommendationLimit) || 10, 20)) }
-        : {}),
+      recommendation_limit: Math.max(2, Math.min(Number(recommendationLimit) || 10, 20)),
     }
     const secrets = {}
     if (nexusKey && nexusKey !== '********') { body.api_key = nexusKey; secrets.nexus_api_key = nexusKey }
@@ -223,37 +221,35 @@ export default function SettingsPage({ toast, api }) {
           </div>
         </div>
 
-        {__MODAGENT_SUBSCRIPTION__ && (
-          <div className="card-cyber space-y-3">
-            <div className="flex items-center gap-2">
-              <Cpu size={14} className="text-cyber-cyan" />
-              <span className="text-sm font-medium">智能推荐</span>
-            </div>
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <label htmlFor="recommendation-limit" className="text-xs text-surface-400">
-                  最大候选数
-                </label>
-                <p className="mt-1 text-[11px] leading-relaxed text-surface-500">
-                  默认 10 个，可设置为 2–20 个；实际数量取决于本轮有效搜索结果。
-                </p>
-              </div>
-              <input
-                id="recommendation-limit"
-                type="number"
-                min="2"
-                max="20"
-                step="1"
-                className="input-cyber w-20 text-center"
-                value={recommendationLimit}
-                onChange={event => setRecommendationLimit(event.target.value)}
-                onBlur={() => setRecommendationLimit(
-                  Math.max(2, Math.min(Number(recommendationLimit) || 10, 20))
-                )}
-              />
-            </div>
+        <div className="card-cyber space-y-3">
+          <div className="flex items-center gap-2">
+            <Cpu size={14} className="text-cyber-cyan" />
+            <span className="text-sm font-medium">智能推荐</span>
           </div>
-        )}
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <label htmlFor="recommendation-limit" className="text-xs text-surface-400">
+                最大候选数
+              </label>
+              <p className="mt-1 text-[11px] leading-relaxed text-surface-500">
+                默认 10 个，可设置为 2–20 个；实际数量取决于本轮有效搜索结果。
+              </p>
+            </div>
+            <input
+              id="recommendation-limit"
+              type="number"
+              min="2"
+              max="20"
+              step="1"
+              className="input-cyber w-20 text-center"
+              value={recommendationLimit}
+              onChange={event => setRecommendationLimit(event.target.value)}
+              onBlur={() => setRecommendationLimit(
+                Math.max(2, Math.min(Number(recommendationLimit) || 10, 20))
+              )}
+            />
+          </div>
+        </div>
 
         <SettingsEditionPanel toast={toast} />
 

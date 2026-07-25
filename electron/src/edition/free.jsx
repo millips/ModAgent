@@ -1,6 +1,8 @@
 import React from 'react'
 import defaultWallpaper from '../assets/default-wallpaper.png'
 
+export { RecommendationDecisionTable as ChatEditionMessage } from '../components/RecommendationDecisionTable'
+
 export function bootstrapEdition() {}
 
 export function SidebarEditionAddon() {
@@ -8,10 +10,6 @@ export function SidebarEditionAddon() {
 }
 
 export function SettingsEditionPanel() {
-  return null
-}
-
-export function ChatEditionMessage() {
   return null
 }
 

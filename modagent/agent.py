@@ -1,8 +1,7 @@
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _ToolTimeout
-from .config import Config
-from .config import current_edition
+from .config import Config, Tier
 from .prompts import build_prompt
 from .tools import build_tools_definitions, execute, refresh_local_inventory
 from . import db
@@ -651,12 +650,12 @@ class Agent:
                 ),
             })
         if (
-            current_edition() == "subscription"
+            Tier.can(getattr(self.cfg, "tier", Tier.FREE), "structured_recommendations")
             and recommendation_selection
             and selection_action in {"plan", "confirm"}
         ):
             selection = []
-            for item in recommendation_selection[:12]:
+            for item in recommendation_selection[:20]:
                 if not isinstance(item, dict):
                     continue
                 selection.append({
@@ -670,11 +669,18 @@ class Agent:
                     "dependencies": [
                         str(dep)[:120] for dep in (item.get("dependencies") or [])[:8]
                     ],
+                    "is_prerequisite": bool(item.get("is_prerequisite")),
+                    "required_by": [
+                        str(name)[:120] for name in (item.get("required_by") or [])[:8]
+                    ],
                 })
             if selection_action == "plan":
                 instruction = (
-                    "用户刚在 Pro 推荐表中选择了以下候选。请以这些稳定来源 ID 为准，"
-                    "核验详情、版本、依赖和已知风险，给出安装计划并停下等待最终确认。"
+                    "用户刚在推荐决策表中选择了以下候选。请以这些稳定来源 ID 为准，"
+                    "核验详情、版本、依赖和已知风险。安装计划必须先列出前置/必要依赖，"
+                    "说明每项被谁需要、版本条件、本机是否满足和核验状态，然后再列目标 Mod。"
+                    "未核验的必要依赖必须标为阻塞项，不得静默跳过。"
+                    "给出计划后停下等待最终确认。"
                     "这一轮不得下载、安装或创建快照。"
                 )
                 tools = [
@@ -684,9 +690,9 @@ class Agent:
                 ]
             else:
                 instruction = (
-                    "用户已在 Pro 安装确认表中明确确认以下最终勾选项。"
-                    "按正常安装流程继续；只能处理清单里的条目及其经核实的必需依赖，"
-                    "不得把未勾选候选重新加入。"
+                    "用户已在安装确认表中明确确认以下最终勾选项。"
+                    "按前置依赖优先的顺序继续；只能处理清单里的条目及其经核实的必要依赖，"
+                    "不得把未勾选候选重新加入。任何必要依赖仍未核验时必须停止执行并说明。"
                 )
             messages.append({
                 "role": "system",
@@ -744,7 +750,10 @@ class Agent:
                             args = {}
                         result = self._exec(t["function"]["name"], args)
                         if (
-                            current_edition() == "subscription"
+                            Tier.can(
+                                getattr(self.cfg, "tier", Tier.FREE),
+                                "structured_recommendations",
+                            )
                             and not selection_action
                         ):
                             recommendation_evidence.append(
@@ -838,7 +847,10 @@ class Agent:
                 final_text = self._ensure_disable_decision_support(final_text, persist)
                 recommendation_set = {}
                 if (
-                    current_edition() == "subscription"
+                    Tier.can(
+                        getattr(self.cfg, "tier", Tier.FREE),
+                        "structured_recommendations",
+                    )
                     and not selection_action
                 ):
                     try:

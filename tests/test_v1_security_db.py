@@ -32,10 +32,10 @@ check("A4 composite primary key", set(pk) == {"id", "game_slug"})
 
 xml = os.path.join(tmp, "plugin.xml")
 with open(xml, "w", encoding="utf-8") as f:
-    f.write("<root />")
+    f.write("<root><value>1</value></root>")
 result = patcher.patch_file(xml, "value=2")
-check("B1 unsupported patch reports failure", result.get("success") is False)
-check("B2 unsupported patch leaves file intact", open(xml, encoding="utf-8").read() == "<root />")
+check("B1 XML patch reports success", result.get("success") is True)
+check("B2 XML element updated", ">2</value>" in open(xml, encoding="utf-8").read())
 
 os.environ["MODAGENT_API_TOKEN"] = "test-secret"
 import modagent.api as api_module

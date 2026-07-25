@@ -709,10 +709,51 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     }
   }
 
-  const updateEditionSelection = (message, selectedKeys) => {
-    const payload = { ...message.payload, selected_keys: selectedKeys }
+  const updateEditionSelection = (message, selectedKeys, wantedKeys = message.payload.wanted_keys || []) => {
+    const payload = {
+      ...message.payload,
+      selected_keys: selectedKeys,
+      wanted_keys: wantedKeys,
+    }
     setMessages(prev => prev.map(item => item.id === message.id ? { ...item, payload } : item))
     persistEditionState(activeSession, payload)
+  }
+
+  const resolveEditionItem = async (message, item, action) => {
+    const wantedKeys = [...new Set([
+      ...(message.payload.wanted_keys || []),
+      item.selection_key,
+    ])]
+    updateEditionSelection(
+      message,
+      message.payload.selected_keys || [],
+      wantedKeys,
+    )
+    if (action === 'open_source') {
+      if (!item.url) {
+        toast('该候选尚无可打开的稳定来源页', 'warn')
+        return
+      }
+      const result = await window.modagent?.openExternal?.(item.url)
+      if (!result?.ok) toast(result?.error || '无法打开来源页', 'error')
+      return
+    }
+    const identity = [
+      item.source_label || item.source,
+      item.source_id || item.mod_id || '',
+    ].filter(Boolean).join(' ')
+    if (action === 'verify_detail') {
+      sendMsg(
+        `我仍然想要 ${item.name}${identity ? `（${identity}）` : ''}。请重新核验它的详情、可下载文件、前置依赖和适配风险；不要猜测同名项目，核验后告诉我怎样继续安装。`
+      )
+      return
+    }
+    if (action === 'manual_import') {
+      if (item.url) await window.modagent?.openExternal?.(item.url)
+      sendMsg(
+        `我仍然想要 ${item.name}${identity ? `（${identity}）` : ''}。如果站点不能自动下载，请保留这个目标，并指导我下载后通过本地安装包导入；导入前仍要核验文件身份、必要依赖和安装落点。`
+      )
+    }
   }
 
   const submitEditionSelection = (message, selectedItems) => {
@@ -743,7 +784,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       phase: 'confirm',
       selected_keys: selectedItems.map(item => item.selection_key),
     }
-    sendMsg(`请为我在 Pro 推荐表中勾选的 ${count} 个 Mod 生成安装计划。`, undefined, {
+    sendMsg(`请为我在推荐决策表中勾选的 ${count} 个 Mod 生成安装计划。`, undefined, {
       recommendationSelection: selectedItems,
       selectionAction: 'plan',
       confirmationPayload,
@@ -994,8 +1035,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           <ChatEditionMessage
             message={msg}
             disabled={loading}
-            onChange={selectedKeys => updateEditionSelection(msg, selectedKeys)}
+            onChange={(selectedKeys, wantedKeys) => updateEditionSelection(msg, selectedKeys, wantedKeys)}
             onSubmit={selectedItems => submitEditionSelection(msg, selectedItems)}
+            onResolve={(item, action) => resolveEditionItem(msg, item, action)}
           />
         </div>
       )

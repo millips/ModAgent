@@ -13,9 +13,11 @@ def patch_file(file_path: str, instruction: str) -> dict:
     try:
         if ext == ".json":
             return _patch_json(file_path, instruction)
-        elif ext in (".xml", ".esp", ".esm"):
+        elif ext == ".xml":
+            return _patch_xml(file_path, instruction)
+        elif ext in (".esp", ".esm"):
             return {"success": False, "error":
-                    f"{ext} 补丁尚未实现，未修改文件；请使用专用工具（如 xEdit）"}
+                    f"{ext} 属于二进制插件格式，未修改文件；请使用专用工具（如 xEdit）"}
         elif ext in (".ini", ".cfg", ".txt"):
             return _patch_text(file_path, instruction)
         else:
@@ -62,10 +64,49 @@ def _patch_xml(file_path: str, instruction: str) -> dict:
     with open(file_path, "r", encoding="utf-8") as f:
         original = f.read()
 
-    modified = original
+    patch_ops = _parse_instruction(instruction)
+    if not patch_ops:
+        return {"success": False, "error": f"无法解析指令: {instruction}"}
 
-    return {"success": True, "diff": _generate_diff(original, modified), "path": file_path,
-            "warning": "XML/ESP/ESM 补丁为占位实现，需要基于 xEdit 格式的解析器"}
+    root = ET.fromstring(original)
+    changed = []
+    for op in patch_ops:
+        raw_path = str(op.get("path") or "").strip().strip("/")
+        parts = [part for part in re.split(r"[./]", raw_path) if part]
+        if parts and parts[0] == root.tag:
+            parts.pop(0)
+        attribute = ""
+        if parts and parts[-1].startswith("@"):
+            attribute = parts.pop()[1:]
+        elif parts and "@" in parts[-1]:
+            parts[-1], attribute = parts[-1].split("@", 1)
+        target = root
+        for part in parts:
+            target = target.find(part)
+            if target is None:
+                return {
+                    "success": False,
+                    "error": f"XML 路径不存在，未修改文件: {raw_path}",
+                }
+        value = str(op.get("value", ""))
+        if attribute:
+            target.set(attribute, value)
+        else:
+            target.text = value
+        changed.append(raw_path)
+
+    ET.indent(root, space="  ")
+    modified = ET.tostring(root, encoding="unicode")
+    if original.lstrip().startswith("<?xml"):
+        modified = '<?xml version="1.0" encoding="utf-8"?>\n' + modified
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(modified)
+    return {
+        "success": True,
+        "diff": _generate_diff(original, modified),
+        "path": file_path,
+        "changed": changed,
+    }
 
 
 def _patch_text(file_path: str, instruction: str) -> dict:
@@ -73,13 +114,19 @@ def _patch_text(file_path: str, instruction: str) -> dict:
         original = f.read()
 
     patch_ops = _parse_instruction(instruction)
+    if not patch_ops:
+        return {"success": False, "error": f"无法解析指令: {instruction}"}
     modified = original
     for op in patch_ops:
         key = op.get("key", "")
         value = str(op.get("value", ""))
         pattern = rf"^{re.escape(key)}\s*=\s*.*$"
         replacement = f"{key} = {value}"
-        modified = re.sub(pattern, replacement, modified, flags=re.MULTILINE)
+        modified, count = re.subn(pattern, replacement, modified, flags=re.MULTILINE)
+        if count == 0:
+            if modified and not modified.endswith("\n"):
+                modified += "\n"
+            modified += replacement + "\n"
 
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(modified)

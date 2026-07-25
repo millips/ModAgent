@@ -880,12 +880,10 @@ def get_session(sid: str):
             display.append({"role": "user", "content": m.get("content", "")})
         elif m.get("role") == "assistant" and (m.get("content") or "").strip() and not m.get("tool_calls"):
             display.append({"role": "assistant", "content": m["content"]})
-    ui_state = {}
-    if current_edition() == "subscription":
-        try:
-            ui_state = json.loads(s.get("ui_state") or "{}")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            ui_state = {}
+    try:
+        ui_state = json.loads(s.get("ui_state") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        ui_state = {}
     return {"id": s["id"], "title": s["title"], "game_slug": s["game_slug"],
             "created_at": s["created_at"], "updated_at": s["updated_at"],
             "messages": display, "ui_state": ui_state}
@@ -925,8 +923,7 @@ def update_session_message_history(sid: str, req: SessionMessagesUpdate):
             raise HTTPException(400, "History only accepts user/assistant text messages")
         clean.append({"role": role, "content": content})
     db.update_session_messages(sid, clean)
-    if current_edition() == "subscription":
-        db.update_session_ui_state(sid, {})
+    db.update_session_ui_state(sid, {})
     if sid in agents:
         agents[sid].history = list(clean)
         _agent_last_used[sid] = time.time()
@@ -935,8 +932,6 @@ def update_session_message_history(sid: str, req: SessionMessagesUpdate):
 
 @app.put("/sessions/{sid}/ui-state")
 def update_session_ui_state(sid: str, req: SessionUiStateUpdate):
-    if current_edition() != "subscription":
-        raise HTTPException(404, "Not found")
     if not db.get_session(sid):
         raise HTTPException(404, "Session not found")
     encoded = json.dumps(req.state, ensure_ascii=False)
@@ -944,6 +939,7 @@ def update_session_ui_state(sid: str, req: SessionUiStateUpdate):
         raise HTTPException(400, "UI state is too large")
     allowed = {
         "kind", "phase", "items", "selected_keys",
+        "wanted_keys", "dependency_requirements",
         "anchor_after_text_count", "source_counts",
         "installed_skipped", "installed_skipped_count",
     }

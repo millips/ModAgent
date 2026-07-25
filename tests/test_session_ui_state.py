@@ -1,4 +1,4 @@
-"""Pro recommendation selection state survives a session reload."""
+"""Shared recommendation selection state survives a session reload."""
 import json
 import os
 import tempfile

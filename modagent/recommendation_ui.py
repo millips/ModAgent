@@ -1,4 +1,4 @@
-"""Normalize multi-source recommendations for the subscription chat UI."""
+"""Normalize multi-source recommendations for the shared recommendation UI."""
 
 from __future__ import annotations
 
@@ -103,6 +103,21 @@ def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str
         "下面逐项说明它们具体做什么，以及选择前需要注意的条件：",
         "",
     ]
+    requirements = (payload or {}).get("dependency_requirements") or []
+    if requirements:
+        lines.append("**前置 / 必要依赖（优先处理）**")
+        for requirement in requirements:
+            required_by = "、".join(requirement.get("required_by") or [])
+            status = {
+                "ready": "已匹配可安装候选",
+                "needs_resolution": "已匹配，但需要先处理",
+                "unresolved": "尚未匹配明确来源",
+            }.get(requirement.get("status"), "待核验")
+            lines.append(
+                f"- {requirement.get('name') or '未命名依赖'}：{status}"
+                + (f"；被 {required_by} 需要" if required_by else "")
+            )
+        lines.append("")
     for index, item in enumerate(items, 1):
         source = _text(item.get("source"))
         source_id = _text(item.get("source_id"))
@@ -121,7 +136,9 @@ def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str
             else original_name
         )
         lines.append(
-            f"{index}. **{display_name}**"
+            f"{index}. "
+            + ("**[前置依赖]** " if item.get("is_prerequisite") else "")
+            + f"**{display_name}**"
             + (f" ({identity})" if identity else "")
         )
         lines.append(_text(item.get("content"), MISSING_CONTENT_TEXT))
@@ -136,6 +153,8 @@ def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str
         ]
         if dependencies:
             facts.append("需要 " + "、".join(dependencies[:5]))
+        if item.get("required_by"):
+            facts.append("被 " + "、".join(item["required_by"][:5]) + " 需要")
         if item.get("detail_verified"):
             facts.append("来源详情已核验")
         else:
@@ -158,8 +177,8 @@ def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str
     if coverage:
         lines.extend([coverage, ""])
     lines.append(
-        "请先根据上述功能说明选择；只有取得详情证据的候选才能进入安装计划，"
-        "下载后还会继续检查安装包和目标游戏版本。"
+        "请先根据上述功能说明选择；暂不可安装的候选可以保留为待处理目标，"
+        "取得详情证据后才能进入安装计划。下载后还会继续检查安装包和目标游戏版本。"
     )
     return "\n".join(lines).strip()
 
@@ -359,6 +378,30 @@ def _normalize_item(source: str, item: dict) -> dict:
         and has_files is not False
         and bool(source_id)
     )
+    if installable:
+        resolution_kind = "ready"
+        resolution_title = "可以加入安装计划"
+        resolution_actions = []
+    elif archived:
+        resolution_kind = "archived"
+        resolution_title = "项目已归档；可保留目标并查看来源页或历史文件"
+        resolution_actions = ["keep", "open_source"]
+    elif has_files is False:
+        resolution_kind = "manual_download"
+        resolution_title = "来源未提供可自动取得的文件；可打开页面后手动下载并导入"
+        resolution_actions = ["keep", "open_source", "manual_import"]
+    elif verification_status == "blocked":
+        resolution_kind = "verification_blocked"
+        resolution_title = "详情核验受阻；完成站点验证或重新核验后可继续"
+        resolution_actions = ["keep", "verify_detail", "open_source"]
+    elif not detail_verified:
+        resolution_kind = "needs_verification"
+        resolution_title = "当前只有搜索证据；先核验详情再加入安装计划"
+        resolution_actions = ["keep", "verify_detail", "open_source"]
+    else:
+        resolution_kind = "source_unresolved"
+        resolution_title = "缺少稳定来源身份；需要选择正确来源"
+        resolution_actions = ["keep", "verify_detail", "open_source"]
     return {
         "selection_key": _key(source, item),
         "source": source,
@@ -392,8 +435,74 @@ def _normalize_item(source: str, item: dict) -> dict:
         "downloads": item.get("downloads") or item.get("mod_downloads") or 0,
         "url": _text(item.get("url"))[:500],
         "installable": installable,
+        "resolution_kind": resolution_kind,
+        "resolution_title": resolution_title,
+        "resolution_actions": resolution_actions,
+        "is_prerequisite": False,
+        "required_by": [],
         "default_selected": False,
     }
+
+
+def _dependency_requirements(items: list[dict]) -> list[dict]:
+    """Resolve declared dependency labels against visible candidates.
+
+    Requirements remain visible even when no candidate can be matched. This
+    keeps a missing prerequisite at the top of the decision table instead of
+    burying it inside a target Mod's risk cell.
+    """
+    requirements: dict[str, dict] = {}
+    for target in items:
+        for dependency in target.get("dependencies") or []:
+            label = _text(dependency)
+            key = label.casefold()
+            if not key:
+                continue
+            entry = requirements.setdefault(key, {
+                "name": label,
+                "required_by": [],
+                "matched_selection_key": "",
+                "status": "unresolved",
+            })
+            target_name = _text(
+                target.get("localized_name") or target.get("name"), "未命名 Mod"
+            )
+            if target_name not in entry["required_by"]:
+                entry["required_by"].append(target_name)
+
+    for item in items:
+        aliases = {
+            _text(item.get("name")).casefold(),
+            _text(item.get("localized_name")).casefold(),
+            _text(item.get("source_id")).casefold(),
+            _text(item.get("mod_id")).casefold(),
+        }
+        aliases.discard("")
+        match = next(
+            (
+                entry for key, entry in requirements.items()
+                if key in aliases
+                or any(key in alias or alias in key for alias in aliases)
+            ),
+            None,
+        )
+        if not match:
+            continue
+        match["matched_selection_key"] = item["selection_key"]
+        match["status"] = (
+            "ready" if item.get("installable")
+            else "needs_resolution"
+        )
+        item["is_prerequisite"] = True
+        item["required_by"] = list(match["required_by"])
+
+    return sorted(
+        requirements.values(),
+        key=lambda entry: (
+            0 if entry["matched_selection_key"] else 1,
+            entry["name"].casefold(),
+        ),
+    )
 
 
 def _decode_payload(value: Any) -> Any:
@@ -592,11 +701,31 @@ def normalize_recommendations(
             break
         index += 1
 
+    dependency_requirements = _dependency_requirements(items)
+    # Prerequisites are always rendered before target candidates.
+    items.sort(key=lambda item: 0 if item.get("is_prerequisite") else 1)
+
     selected = 0
     for item in items:
-        if item["installable"] and item["has_function_summary"] and selected < 4:
+        if (
+            not item.get("is_prerequisite")
+            and item["installable"]
+            and item["has_function_summary"]
+            and selected < 4
+        ):
             item["default_selected"] = True
             selected += 1
+    selected_target_names = {
+        _text(item.get("localized_name") or item.get("name"))
+        for item in items if item.get("default_selected")
+    }
+    for item in items:
+        if (
+            item.get("is_prerequisite")
+            and item.get("installable")
+            and selected_target_names.intersection(item.get("required_by") or [])
+        ):
+            item["default_selected"] = True
 
     return {
         "kind": "recommendation_set",
@@ -604,6 +733,8 @@ def normalize_recommendations(
         "selected_keys": [
             item["selection_key"] for item in items if item["default_selected"]
         ],
+        "wanted_keys": [],
+        "dependency_requirements": dependency_requirements,
         "sources_failed": payload.get("sources_failed") or {},
         "note": _text(payload.get("note")),
         "installed_skipped": installed_skipped,

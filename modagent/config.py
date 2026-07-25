@@ -147,21 +147,20 @@ class Tier:
     PRO = "pro"
     SUPER = "super"
 
-    CORE_FEATURES = ["search", "download", "install", "rollback"]
+    CORE_FEATURES = [
+        "search",
+        "download",
+        "install",
+        "rollback",
+        "patch",
+        "structured_recommendations",
+    ]
     FEATURES = {
         FREE: CORE_FEATURES,
-        PRO: CORE_FEATURES + [
-            "patch",
-            "structured_recommendations",
-            "subscription_experience",
-        ],
+        PRO: CORE_FEATURES + ["subscription_experience"],
         # Reserved internal tier. It does not represent a separately shipped
         # product and must not be advertised as an available edition.
-        SUPER: CORE_FEATURES + [
-            "patch",
-            "structured_recommendations",
-            "subscription_experience",
-        ],
+        SUPER: CORE_FEATURES + ["subscription_experience"],
     }
 
     @classmethod

@@ -1765,7 +1765,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
     # T12
     elif name == "mod_patch":
         if not Tier.can(cfg.tier, "patch"):
-            return json.dumps({"error": "当前层级不支持补丁。需要 Pro/Super。"}, ensure_ascii=False)
+            return json.dumps({"error": "当前版本不支持配置补丁。"}, ensure_ascii=False)
         mod = db.get_mod(str(args["mod_id"]), slug)
         target = args.get("file_hint", "")
         instruction = args.get("instruction", "")
@@ -1777,6 +1777,20 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     break
         if not target:
             return json.dumps({"error": "找不到可修改的配置文件，请指定 file_hint"}, ensure_ascii=False)
+        real_target = os.path.normcase(os.path.realpath(target))
+        real_game_root = os.path.normcase(os.path.realpath(root or ""))
+        try:
+            inside_game = bool(real_game_root) and os.path.commonpath(
+                [real_game_root, real_target]
+            ) == real_game_root
+        except ValueError:
+            inside_game = False
+        if not inside_game:
+            return json.dumps({
+                "error": "配置补丁目标不在当前游戏目录内；已拒绝修改。"
+                "外部用户配置请使用受控的 game_config_write。",
+                "target": target,
+            }, ensure_ascii=False)
         result = patcher.patch_file(target, instruction)
         return json.dumps(result, indent=2, ensure_ascii=False)
 

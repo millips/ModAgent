@@ -16,6 +16,8 @@ import {
   saveVisualPreference,
 } from '../theme/visualTheme'
 
+export { RecommendationDecisionTable as ChatEditionMessage } from '../components/RecommendationDecisionTable'
+
 const FEEDBACK_TESTS = [
   ['hover', 'UI.01', '悬浮'],
   ['press', 'UI.02', '普通按压'],
@@ -59,7 +61,7 @@ const conflictTone = {
   unknown: 'border-surface-600 bg-surface-800 text-surface-400',
 }
 
-export function ChatEditionMessage({
+function LegacyChatEditionMessage({
   message, onChange, onSubmit, disabled = false,
 }) {
   if (message?.payload?.kind !== 'recommendation_set') return null

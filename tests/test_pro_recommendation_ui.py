@@ -98,11 +98,43 @@ assert "功能与适配性尚未核验" in workshop_item["content"]
 assert workshop_item["has_function_summary"] is False
 assert workshop_item["installable"] is False
 assert workshop_item["selection_key"] not in result["selected_keys"]
+assert workshop_item["resolution_kind"] == "needs_verification"
+assert "verify_detail" in workshop_item["resolution_actions"]
 
 no_files = next(item for item in result["items"] if item["name"] == "No files")
 assert no_files["installable"] is False
 assert no_files["selection_key"] not in result["selected_keys"]
 assert no_files["conflict"] == "未提供下载文件"
+assert no_files["resolution_kind"] == "manual_download"
+assert "manual_import" in no_files["resolution_actions"]
+
+dependency_first = normalize_recommendations({
+    "recommendations": [
+        {
+            "mod_id": 500,
+            "name": "Target Outfit",
+            "summary": "Adds an outfit",
+            "dependencies": ["Dresscode"],
+            "_detail_verified": True,
+        },
+        {
+            "mod_id": 501,
+            "name": "Dresscode",
+            "summary": "Required outfit framework",
+            "_detail_verified": True,
+        },
+    ],
+})
+assert dependency_first["items"][0]["name"] == "Dresscode"
+assert dependency_first["items"][0]["is_prerequisite"] is True
+assert dependency_first["items"][0]["required_by"] == ["Target Outfit"]
+assert dependency_first["items"][0]["selection_key"] in dependency_first["selected_keys"]
+assert dependency_first["dependency_requirements"] == [{
+    "name": "Dresscode",
+    "required_by": ["Target Outfit"],
+    "matched_selection_key": dependency_first["items"][0]["selection_key"],
+    "status": "ready",
+}]
 
 rich = normalize_recommendations({
     "recommendations": [{

@@ -160,7 +160,7 @@
 安全:snapshot_create / snapshot_restore / snapshot_list / conflict_check
 诊断:game_diagnose(自动定位框架日志+错误归因;export=true 导出脱敏诊断包) / game_file_check(查单个文件是否存在+读末尾若干行) / stardew_smapi_status(星露谷 SMAPI 分阶段验收)
 检查:get_installed / read_readme
-修改(Pro/Super):mod_patch
+配置修改:mod_patch（JSON/INI/CFG/TXT/XML；修改前仍需确认）
 用户配置写入:game_config_write(仅限已核实的 Documents/Saved Games/AppData 相对路径；INI 合并且自动备份；game_file_check 不可用于这些目录)
 环境:scan_games / scan_existing_mods / import_existing_mods
 

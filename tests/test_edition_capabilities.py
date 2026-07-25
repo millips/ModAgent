@@ -19,15 +19,18 @@ def main():
         else:
             os.environ["MODAGENT_EDITION"] = previous
 
-    for feature in ("search", "download", "install", "rollback"):
+    for feature in (
+        "search",
+        "download",
+        "install",
+        "rollback",
+        "patch",
+        "structured_recommendations",
+    ):
         assert Tier.can(Tier.FREE, feature), feature
         assert Tier.can(Tier.PRO, feature), feature
 
-    for feature in (
-        "patch",
-        "structured_recommendations",
-        "subscription_experience",
-    ):
+    for feature in ("subscription_experience",):
         assert not Tier.can(Tier.FREE, feature), feature
         assert Tier.can(Tier.PRO, feature), feature
 

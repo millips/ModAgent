@@ -1,4 +1,4 @@
-"""Final structured recommendation SSE uses the whole subscription search turn."""
+"""Final structured recommendation SSE is shared by Free and Pro."""
 import json
 import os
 
@@ -32,8 +32,10 @@ tool_call = type("ToolCall", (), {
 
 
 class FakeAgent(Agent):
-    def __init__(self):
-        super().__init__(Config())
+    def __init__(self, tier="pro"):
+        cfg = Config()
+        cfg.tier = tier
+        super().__init__(cfg)
         self.round = 0
 
     def _stream(self, _messages, _tools):
@@ -100,8 +102,10 @@ try:
     )
 
     os.environ["MODAGENT_EDITION"] = "free"
-    free_events = [json.loads(value) for value in FakeAgent().chat_stream("recommend")]
-    assert not any("recommendations" in event for event in free_events)
+    free_events = [json.loads(value) for value in FakeAgent("free").chat_stream("recommend")]
+    free_recommendations = [event for event in free_events if "recommendations" in event]
+    assert len(free_recommendations) == 1
+    assert len(free_recommendations[0]["recommendations"]["items"]) == 2
 finally:
     agent_module.build_prompt = old_prompt
     agent_module.build_tools_definitions = old_tools
