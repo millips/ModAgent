@@ -3,6 +3,7 @@ const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const asar = require('@electron/asar')
+const { expectedAudioCount } = require('./verify-commercial-audio')
 
 const electronRoot = path.resolve(__dirname, '..')
 const repoRoot = path.resolve(electronRoot, '..')
@@ -123,8 +124,10 @@ function inspectAsar(edition) {
   if (edition === 'free' && (mp3.length || paidRaster.length)) {
     throw new Error(`Free build contains subscription assets: mp3=${mp3.length}, raster=${paidRaster.length}`)
   }
-  if (edition === 'subscription' && mp3.length !== 20) {
-    throw new Error(`Subscription build must contain exactly 20 sounds; found ${mp3.length}`)
+  if (edition === 'subscription' && mp3.length !== expectedAudioCount) {
+    throw new Error(
+      `Subscription build must contain exactly ${expectedAudioCount} verified sounds; found ${mp3.length}`
+    )
   }
   const legalFiles = fs.readdirSync(legalDir).sort()
   const subscriptionLegal = legalFiles.filter(file =>

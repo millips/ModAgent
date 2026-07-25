@@ -83,3 +83,7 @@ if (mismatches.length) {
 }
 const verifiedCount = packs.reduce((total, pack) => total + Object.keys(pack[2]).length, 0)
 console.log(`Commercial audio verified (${verifiedCount} files across ${packs.length} theme packs).`)
+
+module.exports = {
+  expectedAudioCount: verifiedCount,
+}
