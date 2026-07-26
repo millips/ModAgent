@@ -107,6 +107,9 @@ function inspectAsar(edition) {
     }
   }
   const mp3 = entries.filter(entry => entry.toLowerCase().endsWith('.mp3'))
+  const deprecatedMetalFrames = entries.filter(entry =>
+    /(?:primary|danger|icon|nav-active)-(?:frame-base|frame|emission-mask)/i.test(entry)
+  )
   const paidAssets = entries.filter(entry =>
     /(?:^|[\\/])assets[\\/](?:themes|audio|license)(?:[\\/]|$)|modagent-p\.(?:ico|png)$/i.test(entry)
   )
@@ -131,6 +134,11 @@ function inspectAsar(edition) {
   if (edition === 'subscription' && mp3.length !== expectedAudioCount) {
     throw new Error(
       `Subscription build must contain exactly ${expectedAudioCount} verified sounds; found ${mp3.length}`
+    )
+  }
+  if (deprecatedMetalFrames.length) {
+    throw new Error(
+      `${edition} build contains retired metal control frames: ${deprecatedMetalFrames.join(', ')}`
     )
   }
   const expectedIcon = edition === 'free' ? 'modagent-free.ico' : 'modagent-p.ico'

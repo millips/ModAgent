@@ -591,11 +591,11 @@ body.theme-technology-core .tc-danger-button::after {
 }
 
 body.theme-technology-core .btn-cyber::before {
-  border-image-source: url('./assets/themes/technology-core/primary-frame-base.9.png');
+  border-image-source: none;
   opacity: .96;
 }
 body.theme-technology-core .btn-cyber::after {
-  border-image-source: url('./assets/themes/technology-core/primary-emission-mask.9.png');
+  border-image-source: none;
   opacity: .14;
   filter: drop-shadow(0 0 2px #00d4ff);
 }
@@ -623,12 +623,12 @@ body.theme-technology-core .btn-danger:not([class~="p-1.5"]),
 body.theme-technology-core .tc-danger-button { color: #fff0ed; text-shadow: 0 1px 2px #000,0 0 7px rgba(248,81,73,.28); }
 body.theme-technology-core .btn-danger:not([class~="p-1.5"])::before,
 body.theme-technology-core .tc-danger-button::before {
-  border-image-source: url('./assets/themes/technology-core/danger-frame-base.9.png');
+  border-image-source: none;
   opacity: .96;
 }
 body.theme-technology-core .btn-danger:not([class~="p-1.5"])::after,
 body.theme-technology-core .tc-danger-button::after {
-  border-image-source: url('./assets/themes/technology-core/danger-emission-mask.9.png');
+  border-image-source: none;
   opacity: .18;
   filter: drop-shadow(0 0 2px #f85149);
 }
@@ -670,14 +670,14 @@ body.theme-technology-core button.btn-ghost[class~="p-1.5"]::before,
 body.theme-technology-core button.btn-ghost[class~="p-2"]::before,
 body.theme-technology-core button.btn-danger[class~="p-1.5"]::before,
 body.theme-technology-core .tc-icon-button::before {
-  background-image: url('./assets/themes/technology-core/icon-frame-base.png');
+  background-image: none;
   opacity: .82;
 }
 body.theme-technology-core button.btn-ghost[class~="p-1.5"]::after,
 body.theme-technology-core button.btn-ghost[class~="p-2"]::after,
 body.theme-technology-core button.btn-danger[class~="p-1.5"]::after,
 body.theme-technology-core .tc-icon-button::after {
-  background-image: url('./assets/themes/technology-core/icon-emission-mask.png');
+  background-image: none;
   opacity: .12;
   filter: drop-shadow(0 0 2px #00d4ff);
 }
@@ -715,11 +715,11 @@ body.theme-technology-core .nav-item-active::after {
   z-index: -1;
 }
 body.theme-technology-core .nav-item-active::before {
-  border-image-source: url('./assets/themes/technology-core/nav-active-frame.9.png');
+  border-image-source: none;
   opacity: .9;
 }
 body.theme-technology-core .nav-item-active::after {
-  border-image-source: url('./assets/themes/technology-core/nav-active-emission-mask.9.png');
+  border-image-source: none;
   opacity: .34;
   filter: drop-shadow(0 0 4px #00d4ff);
   animation: tc-nav-breathe 2.4s ease-in-out infinite;
@@ -1097,12 +1097,12 @@ body.theme-technology-core:not(.theme-classic-controls) .nav-item::after {
   transition: opacity 180ms ease, filter 200ms ease, transform 120ms ease;
 }
 body.theme-technology-core:not(.theme-classic-controls) .nav-item::before {
-  border-image-source: url('./assets/themes/technology-core/primary-frame-base.9.png');
+  border-image-source: none;
   opacity: .46;
   filter: saturate(.62) brightness(.68);
 }
 body.theme-technology-core:not(.theme-classic-controls) .nav-item::after {
-  border-image-source: url('./assets/themes/technology-core/primary-emission-mask.9.png');
+  border-image-source: none;
   opacity: .035;
   filter: drop-shadow(0 0 2px #00d4ff);
 }
@@ -1123,13 +1123,13 @@ body.theme-technology-core:not(.theme-classic-controls) .nav-item-active {
 }
 body.theme-technology-core:not(.theme-classic-controls) .nav-item-active::before {
   display: block !important;
-  border-image-source: url('./assets/themes/technology-core/primary-frame-base.9.png') !important;
+  border-image-source: none !important;
   opacity: .96;
   filter: saturate(1.1) brightness(1.02);
 }
 body.theme-technology-core:not(.theme-classic-controls) .nav-item-active::after {
   display: block !important;
-  border-image-source: url('./assets/themes/technology-core/primary-emission-mask.9.png') !important;
+  border-image-source: none !important;
   opacity: .62;
   filter: drop-shadow(0 0 6px #00d4ff) brightness(1.45);
   animation: tc-nav-v2-pulse 2.8s ease-in-out infinite;
