@@ -493,6 +493,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         norm.splice(0, norm.length, ...positioned)
       }
       setMessages(norm)
+      if (window.matchMedia?.('(max-width: 1280px)').matches) {
+        setSidebarOpen(false)
+      }
     } catch (_) { toast('加载会话失败', 'error') }
     setSkeleton(false)
   }
@@ -1322,17 +1325,26 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   }
 
   return (
-    <div className={`chat-layout flex flex-1 overflow-hidden ${
+    <div className={`chat-layout flex flex-1 h-full min-h-0 min-w-0 overflow-hidden ${
       sidebarOpen ? 'has-session-rail' : 'without-session-rail'
     }`}>
       {sidebarOpen && (
-        <div className="chat-session-rail w-56 min-w-[224px] bg-surface-800 border-r border-surface-600 flex flex-col">
-          <div className="p-3 border-b border-surface-600">
-            <button onClick={newSession} className="btn-cyber w-full flex items-center justify-center gap-2">
+        <div className="chat-session-rail w-56 min-w-[224px] h-full min-h-0 overflow-hidden bg-surface-800 border-r border-surface-600 flex flex-col">
+          <div className="chat-session-header shrink-0 flex items-center gap-2 p-3 border-b border-surface-600">
+            <button onClick={newSession} className="btn-cyber min-w-0 flex-1 flex items-center justify-center gap-2">
               <Plus size={14} /> 新对话
             </button>
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(false)}
+              className="chat-session-close btn-ghost shrink-0 p-2"
+              title="关闭会话列表"
+              aria-label="关闭会话列表"
+            >
+              <PanelLeftClose size={16} />
+            </button>
           </div>
-          <div className="flex-1 overflow-y-auto p-2 space-y-3">
+          <div className="chat-session-list flex-1 min-h-0 overflow-y-auto p-2 space-y-3">
             {['today', 'yesterday', 'older'].map(group => {
               const items = grouped[group]
               if (!items.length) return null
@@ -1368,8 +1380,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         </div>
       )}
 
-      <div className="chat-primary-pane flex-[7] flex flex-col min-w-0">
-        <div className="relative z-30 flex items-center gap-3 px-3 py-2 border-b border-surface-600 bg-surface-800">
+      <div className="chat-primary-pane flex-[7] h-full min-h-0 overflow-hidden flex flex-col min-w-0">
+        <div className="chat-primary-toolbar shrink-0 relative z-30 flex items-center gap-3 px-3 py-2 border-b border-surface-600 bg-surface-800">
             <div className="relative">
               <input
                 className="px-2 py-1 rounded text-xs bg-surface-700 border border-surface-500 text-white outline-none w-40 focus:border-cyber-cyan/50"
@@ -1443,7 +1455,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             )}
             <span className="text-[11px] text-surface-500 truncate flex-1">{status.game_root}</span>
           </div>
-        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+        <div className="chat-message-scroll flex-1 min-h-0 overflow-y-auto p-4 space-y-6">
           {skeleton && (
             <div className="space-y-3 py-4">
               <div className="skeleton h-12 w-3/4 ml-auto" />
@@ -1463,7 +1475,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           <div ref={bottomRef} />
         </div>
 
-        <div className="p-3 border-t border-surface-600 bg-surface-800 flex items-end gap-2">
+        <div className="chat-composer shrink-0 p-3 border-t border-surface-600 bg-surface-800 flex items-end gap-2">
           <button onClick={() => setSidebarOpen(!sidebarOpen)} className="btn-ghost p-2" title={sidebarOpen?'收起':'展开'}>
             {sidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeft size={16} />}
           </button>
@@ -1490,7 +1502,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         </div>
       </div>
 
-      <div className="chat-quick-sidebar flex-[3] border-l border-surface-600 bg-surface-800 p-4 flex flex-col gap-4 min-w-[220px]">
+      <div className="chat-quick-sidebar flex-[3] h-full min-h-0 overflow-x-hidden overflow-y-auto border-l border-surface-600 bg-surface-800 p-4 flex flex-col gap-4 min-w-[220px]">
         <h3 className="text-xs font-semibold text-surface-500 uppercase tracking-wider">状态</h3>
         <div className="card-cyber"><div className="flex items-center justify-between"><span className="text-xs text-surface-500">已安装 Mod</span><span className="text-xl font-bold text-cyber-cyan">{status.mods == null ? '…' : status.mods}</span></div></div>
         <div className="card-cyber"><div className="flex items-center justify-between"><span className="text-xs text-surface-500">快照数量</span><span className="text-xl font-bold text-cyber-purple">{status.snaps == null ? '…' : status.snaps}</span></div></div>
