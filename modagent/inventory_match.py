@@ -2,9 +2,34 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
+import re
 
 from . import db
 from .source_alignment import normalize_name
+
+
+_FAMILY_QUALIFIERS = {
+    "better", "best", "continued", "continuation", "fixed", "fix",
+    "updated", "update", "cosmetic", "comestic", "edition", "redux", "mod",
+}
+_FAMILY_ALIASES = {
+    "team": "shared",
+}
+
+
+def functional_family_name(value: str) -> str:
+    """Return a conservative family key for obvious alternative implementations."""
+    expanded = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(value or ""))
+    tokens = re.findall(r"[a-z0-9]+", expanded.casefold())
+    tokens = [
+        _FAMILY_ALIASES.get(token, token)
+        for token in tokens
+        if token not in _FAMILY_QUALIFIERS
+    ]
+    # A one-word family such as "map" or "jump" is too generic to be safe.
+    if len(tokens) < 2:
+        return ""
+    return "".join(tokens)
 
 
 def find_installed_duplicate(
@@ -50,3 +75,21 @@ def find_installed_duplicate(
         if score > best_score:
             best, best_score = mod, score
     return best if best_score >= .96 else None
+
+
+def find_installed_functional_equivalent(
+    target_name: str,
+    installed_mods,
+):
+    """Find an obvious same-purpose alternative without claiming exact identity."""
+    target_family = functional_family_name(target_name)
+    if len(target_family) < 8:
+        return None
+    matches = []
+    for mod in installed_mods or []:
+        installed_name = getattr(mod, "name", "")
+        if normalize_name(installed_name) == normalize_name(target_name):
+            continue
+        if functional_family_name(installed_name) == target_family:
+            matches.append(mod)
+    return matches[0] if len(matches) == 1 else None

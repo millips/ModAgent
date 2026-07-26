@@ -1685,6 +1685,7 @@ async def search_via_cdp(query: str, game_slug: str, game_id: int, cdp_port: int
         await asyncio.sleep(4)
 
         # Simulate typing in search box and submitting
+        query_literal = json.dumps(str(query or ""))
         search_expr = f"""
         (async () => {{
             // Find the search input — try multiple selectors
@@ -1701,7 +1702,7 @@ async def search_via_cdp(query: str, game_slug: str, game_id: int, cdp_port: int
 
             // Use native setter to set value
             const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            setter.call(input, '{query}');
+            setter.call(input, {query_literal});
             input.dispatchEvent(new Event('input', {{bubbles: true}}));
             input.dispatchEvent(new Event('change', {{bubbles: true}}));
             input.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', keyCode: 13, bubbles: true}}));
@@ -1744,7 +1745,36 @@ async def search_via_cdp(query: str, game_slug: str, game_id: int, cdp_port: int
                 result = msg.get("result", {}).get("result", {})
                 value = result.get("value") if isinstance(result, dict) else None
                 if isinstance(value, str):
-                    try: return json.loads(value)
+                    try:
+                        rows = json.loads(value)
+                        return _filter_cdp_search_results(query, rows)
                     except: pass
-                if isinstance(value, list): return value
+                if isinstance(value, list):
+                    return _filter_cdp_search_results(query, value)
                 return []
+
+
+def _filter_cdp_search_results(query: str, rows: list[dict]) -> list[dict]:
+    """Reject Nexus' default browse list when the search form ignored a query."""
+    broad = {
+        "latest", "popular", "trending", "new", "hot", "best", "recommended",
+        "mods", "mod", "最近", "最新", "热门", "推荐",
+    }
+    cleaned = str(query or "").casefold()
+    for word in broad:
+        cleaned = cleaned.replace(word, " ")
+    wanted = {
+        token for token in re.findall(r"[a-z0-9\u3400-\u9fff]+", cleaned)
+        if len(token) >= 2
+    }
+    if not wanted:
+        return rows[:10]
+    filtered = []
+    for row in rows or []:
+        name = re.sub(
+            r"[^a-z0-9\u3400-\u9fff]+", "",
+            str(row.get("name") or "").casefold(),
+        )
+        if any(token in name for token in wanted):
+            filtered.append(row)
+    return filtered[:10]

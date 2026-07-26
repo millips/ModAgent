@@ -16,6 +16,20 @@ from .recommendation_ui import (
 # 工具看门狗:任何工具超过此秒数未返回,视为卡死,返回错误让对话继续
 # (被卡住的线程无法强杀,会残留在后台,但 SSE 流不再被拖死)
 TOOL_TIMEOUT_S = 300
+TOOL_TIMEOUTS = {
+    "mod_recommend": 55,
+    "nexus_search": 45,
+    "workshop_search": 35,
+    "thunderstore_search": 35,
+    "github_search": 35,
+    "gamebanana_search": 35,
+}
+SEARCH_DISCOVERY_TOOLS = {
+    "mod_recommend", "nexus_search", "workshop_search",
+    "thunderstore_search", "github_search", "gamebanana_search",
+}
+SEARCH_TURN_BUDGET_S = 180
+SEARCH_TURN_MAX_CALLS = 6
 _TOOL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool")
 
 # P2.4:汇报事实校验(把 report_validator.py 放到 modagent/ 下)
@@ -168,6 +182,8 @@ class Agent:
         self._turn_result_cache: dict[str, str] = {}
         self._destructive_preview_turns: dict[str, str | None] = {}
         self._status_only_turn = False
+        self._turn_started_monotonic = time.monotonic()
+        self._turn_search_calls = 0
 
     @property
     def client(self):
@@ -189,6 +205,22 @@ class Agent:
         self.history = []
 
     def _exec(self, name: str, args: dict) -> str:
+        if name in SEARCH_DISCOVERY_TOOLS:
+            elapsed = time.monotonic() - self._turn_started_monotonic
+            if (
+                self._turn_search_calls >= SEARCH_TURN_MAX_CALLS
+                or elapsed >= SEARCH_TURN_BUDGET_S
+            ):
+                return json.dumps({
+                    "error": "search_budget_exhausted",
+                    "message": (
+                        "本轮搜索已达到时间或调用预算，已停止继续重试。"
+                        "请用现有已核验结果回答，并明确说明未解决部分。"
+                    ),
+                    "elapsed_seconds": round(elapsed, 1),
+                    "search_calls": self._turn_search_calls,
+                }, ensure_ascii=False)
+            self._turn_search_calls += 1
         if self._status_only_turn and name in STATUS_QUESTION_BLOCKED_TOOLS:
             return json.dumps({
                 "error": "status_question_side_effect_blocked",
@@ -232,11 +264,13 @@ class Agent:
         t0 = time.time()
         try:
             fut = _TOOL_POOL.submit(execute, name, args, self.cfg)
-            result = fut.result(timeout=TOOL_TIMEOUT_S)
+            timeout_seconds = TOOL_TIMEOUTS.get(name, TOOL_TIMEOUT_S)
+            result = fut.result(timeout=timeout_seconds)
             ok = not self._is_error(result)
         except _ToolTimeout:
+            timeout_seconds = TOOL_TIMEOUTS.get(name, TOOL_TIMEOUT_S)
             result = json.dumps({
-                "error": f"{name} 执行超时(>{TOOL_TIMEOUT_S}s),已跳过。",
+                "error": f"{name} 执行超时(>{timeout_seconds}s),已跳过。",
                 "hint": "该工具可能在遍历超大目录或等待外部资源。请换用其他方式完成当前目标,并向用户如实说明此工具超时。",
             }, ensure_ascii=False)
             ok = False
@@ -490,6 +524,8 @@ class Agent:
 
     def chat(self, user_msg: str) -> str:
         self._current_user_msg = user_msg
+        self._turn_started_monotonic = time.monotonic()
+        self._turn_search_calls = 0
         self._status_only_turn = is_status_only_question(user_msg)
         self._prior_assistant_text = next((str(m.get("content") or "") for m in reversed(self.history)
                                            if m.get("role") == "assistant" and m.get("content")), "")
@@ -590,6 +626,9 @@ class Agent:
         selection_action: str = "",
     ):
         self._current_user_msg = user_msg
+        self._turn_started_monotonic = time.monotonic()
+        self._turn_search_calls = 0
+        self._status_only_turn = is_status_only_question(user_msg)
         self._prior_assistant_text = next((str(m.get("content") or "") for m in reversed(self.history)
                                            if m.get("role") == "assistant" and m.get("content")), "")
         self._turn_result_cache = {}

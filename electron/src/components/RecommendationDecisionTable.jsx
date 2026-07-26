@@ -253,6 +253,11 @@ export function RecommendationDecisionTable({
                         前置依赖 · 已置顶
                       </span>
                     )}
+                    {item.installed_match_kind === 'functional_alternative' && (
+                      <span className="mb-1.5 inline-flex rounded border border-cyber-yellow/25 bg-cyber-yellow/10 px-1.5 py-0.5 text-[9px] text-cyber-yellow">
+                        已安装同类替代方案
+                      </span>
+                    )}
                     <p className="font-medium leading-snug text-white">
                       {index + 1}. {item.localized_name || item.name}
                     </p>

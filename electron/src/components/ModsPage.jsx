@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput, Link2 } from 'lucide-react'
+import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput, Link2, Sparkles } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
 
 const MOCK_MODS = [
@@ -36,6 +36,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const [dlBusy, setDlBusy] = useState(false)
   const [checking, setChecking] = useState(false)
   const [binding, setBinding] = useState(false)
+  const [enriching, setEnriching] = useState(false)
 
   useEffect(() => { loadFromApi() }, [refreshKey, status?.game_slug, status?.game_instance_id])
 
@@ -46,12 +47,54 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       if (!r.ok) throw new Error(`mods request failed: ${r.status}`)
       const apiMods = await r.json()
       if (!Array.isArray(apiMods)) throw new Error('mods response is not an array')
-      setMods(apiMods.map(m => ({
-        id: m.id || '', name: m.name || m.id, name_cn: m.name || '', version: m.version || '?',
-        latest: null, category: '', desc: `ID: ${m.id}`, size: '',
+      const mapped = apiMods.map(m => ({
+        id: m.id || '', name: m.name || m.id, name_cn: m.localized_name || '', version: m.version || '?',
+        latest: null, category: m.source || '本地', desc: m.summary || '功能简介尚未生成',
+        summaryEvidence: m.summary_evidence || '',
+        summaryConfidence: m.summary_confidence || '',
+        sourceUrl: m.source_url || '',
+        size: '',
         hasConflict: false, disabled: !!m.disabled,
-      })))
+      }))
+      setMods(mapped)
+      if (mapped.some(mod => !mod.name_cn || !mod.summaryEvidence)) {
+        void enrichCatalog(scope)
+      }
     } catch (_) { toast('加载 Mod 列表失败', 'error') }
+  }
+
+  const enrichCatalog = async (scope = '', force = false) => {
+    if (enriching) return
+    setEnriching(true)
+    try {
+      const query = new URLSearchParams()
+      if (scope) query.set('game_slug', scope)
+      if (force) query.set('force', 'true')
+      const response = await fetch(`${api}/mods/enrich?${query.toString()}`, { method: 'POST' })
+      if (!response.ok) throw new Error(`enrichment request failed: ${response.status}`)
+      const result = await response.json()
+      const notes = result.notes || {}
+      setMods(previous => previous.map(mod => {
+        const note = notes[String(mod.id)]
+        if (!note) return mod
+        return {
+          ...mod,
+          name_cn: note.localized_name || mod.name_cn,
+          desc: note.summary || mod.desc,
+          summaryEvidence: note.evidence_kind || mod.summaryEvidence,
+          summaryConfidence: note.confidence || mod.summaryConfidence,
+        }
+      }))
+      if (force) {
+        if (result.status === 'llm_required') toast('请先在设置中配置大模型 API', 'error')
+        else if (result.status === 'generation_failed') toast('AI 功能简介生成失败，可稍后重试', 'error')
+        else toast(result.updated ? `已更新 ${result.updated} 个 Mod 的中文简介` : '中文简介缓存已是最新')
+      }
+    } catch (_) {
+      if (force) toast('AI 功能简介生成失败，可稍后重试', 'error')
+    } finally {
+      setEnriching(false)
+    }
   }
 
   const reconcileMods = async () => {
@@ -169,7 +212,12 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   }
 
   const filtered = mods.filter(m => {
-    if (search && !m.name.toLowerCase().includes(search.toLowerCase()) && !m.name_cn.includes(search)) return false
+    if (
+      search
+      && !m.name.toLowerCase().includes(search.toLowerCase())
+      && !m.name_cn.includes(search)
+      && !m.desc.toLowerCase().includes(search.toLowerCase())
+    ) return false
     if (catFilter !== '全部' && m.category !== catFilter) return false
     if (statusFilter === '可更新' && !m.latest) return false
     if (statusFilter === '有冲突' && !m.hasConflict) return false
@@ -378,6 +426,15 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               title="将扫描到的本地 Mod 自动绑定到可信的 Nexus、Thunderstore 或 Steam 维护页，之后可统一检查和更新">
               <Link2 size={14} className={binding ? 'animate-pulse' : ''} /> {binding ? '绑定中' : '一键绑定'}
             </button>
+            <button
+              className="btn-ghost flex items-center gap-1"
+              onClick={() => enrichCatalog(status?.game_instance_id || status?.game_slug || '', true)}
+              disabled={enriching}
+              title="依据本地清单和已绑定来源生成中文名称与一句话功能简介；证据不足时会明确标记为 AI 推测"
+            >
+              <Sparkles size={14} className={enriching ? 'animate-pulse' : ''} />
+              {enriching ? '生成简介中' : 'AI 补全简介'}
+            </button>
             <button className="btn-ghost flex items-center gap-1" onClick={loadFromApi}>
               刷新
             </button>
@@ -456,7 +513,9 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                 <span className={`text-sm font-medium truncate ${mod.disabled ? 'line-through text-surface-500' : 'text-white'}`}>
                   {mod.name_cn || mod.name}
                 </span>
-                {!mod.disabled && <span className="text-xs text-surface-500 truncate">{mod.name}</span>}
+                {mod.name_cn && mod.name_cn !== mod.name && (
+                  <span className="text-xs text-surface-500 truncate">{mod.name}</span>
+                )}
                 <span className={`text-xs ${mod.disabled ? 'text-surface-500' : 'text-cyber-cyan/70'} font-mono`}>v{mod.version}</span>
                 {mod.latest && !mod.disabled && (
                   <span className="relative flex items-center gap-1 text-xs text-cyber-orange">
@@ -466,7 +525,20 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                 )}
               </div>
               <div className="flex items-center gap-2 mt-0.5">
-                <span className="text-[11px] text-surface-500">{mod.desc}</span>
+                <span className="text-[11px] text-surface-400">{mod.desc}</span>
+                {mod.summaryEvidence && (
+                  <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[9px] ${
+                    mod.summaryConfidence === 'low'
+                      ? 'border-cyber-yellow/30 text-cyber-yellow'
+                      : 'border-cyber-cyan/25 text-cyber-cyan'
+                  }`}>
+                    {mod.summaryEvidence === 'local_manifest'
+                      ? '本地清单'
+                      : mod.summaryEvidence === 'source_metadata'
+                        ? '来源资料'
+                        : 'AI 推测 · 待核验'}
+                  </span>
+                )}
               </div>
             </div>
 
@@ -581,10 +653,14 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               </div>
               <div>
                 <h3 className="text-sm font-semibold text-white">确认卸载</h3>
-                <p className="text-xs text-surface-500">{showDeleteConfirm.name}</p>
+                <p className="text-xs text-surface-300">{showDeleteConfirm.name_cn || showDeleteConfirm.name}</p>
+                {showDeleteConfirm.name_cn && showDeleteConfirm.name_cn !== showDeleteConfirm.name && (
+                  <p className="text-[10px] text-surface-500">{showDeleteConfirm.name}</p>
+                )}
               </div>
             </div>
             <div className="bg-surface-900 rounded-md p-3 mb-4 text-xs text-surface-400 space-y-1.5">
+              <p><span className="text-white/80">功能：</span>{showDeleteConfirm.desc}</p>
               {showDeleteConfirm.preview?.will_unsubscribe ? (
                 <p>工坊 Mod：将从 Steam <span className="text-cyber-yellow">退订</span>（Steam 托管文件不删除，退订后自动移除）。</p>
               ) : (
@@ -615,10 +691,11 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                 <h3 className="text-sm font-semibold text-white">
                   {dependencyGate.data.blocked ? '缺少前置依赖' : dependencyGate.enabling ? '确认启用依赖链' : '确认级联禁用'}
                 </h3>
-                <p className="text-xs text-surface-500">{dependencyGate.mod.name}</p>
+                <p className="text-xs text-surface-300">{dependencyGate.mod.name_cn || dependencyGate.mod.name}</p>
               </div>
             </div>
             <div className="bg-surface-900 rounded-md p-3 mb-4 text-xs text-surface-400 space-y-2">
+              <p><span className="text-white/80">功能：</span>{dependencyGate.mod.desc}</p>
               <p>{dependencyGate.data.note}</p>
               {!!dependencyGate.data.decision_support && (
                 <div className="space-y-2 border-l-2 border-cyber-yellow/60 pl-3">

@@ -339,6 +339,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   })
   const [devOpen, setDevOpen] = useState(false)
   const bottomRef = useRef(null)
+  const autoScrollSignatureRef = useRef('')
   const abortRef = useRef(null)
   const recoveryTimerRef = useRef(null)
   const recoveryCursorRef = useRef(0)
@@ -391,7 +392,22 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   // 让流式回复只写入"发送时所属的会话"，切走后不串味
   useEffect(() => { activeSessionRef.current = activeSession }, [activeSession])
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  useEffect(() => {
+    const last = messages[messages.length - 1]
+    const signature = [
+      messages.length,
+      last?.id || '',
+      last?.role || '',
+      last?.kind || '',
+      String(last?.content || '').length,
+    ].join(':')
+    // Recommendation checkbox changes only mutate an existing message payload.
+    // They must not steal the user's reading position by scrolling the whole
+    // transcript to the bottom.
+    if (signature === autoScrollSignatureRef.current) return
+    autoScrollSignatureRef.current = signature
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
 
   useEffect(() => {
     if (!loading) return undefined

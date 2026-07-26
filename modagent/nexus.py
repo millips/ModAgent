@@ -471,33 +471,58 @@ def _search_api(query: str, game_slug: str, api_key: str, game_id: int) -> list[
 
 def _match_and_detail(query: str, mods: list, game_slug: str, api_key: str) -> list[dict]:
     """从缓存的 mod_id 列表中按名称匹配，补全详情。"""
-    if not query.strip():
-        return mods[:10]
+    import concurrent.futures as cf
 
-    q = query.lower().replace(" ", "").replace("_", "").replace("-", "")
-    candidates = mods[:20]
+    broad_words = {
+        "latest", "popular", "trending", "new", "hot", "best", "recommended",
+        "mods", "mod", "最近", "最新", "热门", "推荐",
+    }
+    cleaned_query = query.casefold()
+    for word in broad_words:
+        cleaned_query = cleaned_query.replace(word, " ")
+    wanted = {
+        token for token in re.findall(r"[a-z0-9\u3400-\u9fff]+", cleaned_query)
+        if len(token) >= 2
+    }
+    candidates = mods[:16]
 
-    matched = []
-    for m in candidates:
+    def fetch(m):
         try:
             detail = get_mod(m["mod_id"], game_slug, api_key)
-            name = detail.get("name", "")
-            name_clean = name.lower().replace(" ", "").replace("_", "").replace("-", "")
-            if q in name_clean:
-                matched.append({
-                    "mod_id": m["mod_id"],
-                    "name": name,
-                    "summary": detail.get("summary", ""),
-                    "endorsements": detail.get("endorsement_count", 0),
-                    "version": detail.get("version", ""),
-                    "updated": detail.get("updated_time", ""),
-                })
-                if len(matched) >= 10:
-                    break
+            haystack = " ".join([
+                str(detail.get("name") or ""),
+                str(detail.get("summary") or ""),
+            ]).casefold()
+            compact = re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", haystack)
+            score = sum(1 for token in wanted if token in haystack or token in compact)
+            return score, {
+                "mod_id": m["mod_id"],
+                "name": detail.get("name", ""),
+                "summary": detail.get("summary", ""),
+                "endorsements": detail.get("endorsement_count", 0),
+                "version": detail.get("version", ""),
+                "updated": detail.get("updated_time", ""),
+            }
         except Exception:
-            continue
+            return -1, None
 
-    return matched
+    pool = cf.ThreadPoolExecutor(max_workers=min(8, len(candidates) or 1))
+    futures = [pool.submit(fetch, candidate) for candidate in candidates]
+    done, not_done = cf.wait(futures, timeout=22)
+    rows = []
+    for future in done:
+        score, item = future.result()
+        if item and (not wanted or score > 0):
+            rows.append((score, item))
+    for future in not_done:
+        future.cancel()
+    pool.shutdown(wait=False)
+    rows.sort(key=lambda pair: (
+        pair[0],
+        pair[1].get("endorsements") or 0,
+        pair[1].get("updated") or "",
+    ), reverse=True)
+    return [item for _, item in rows[:10]]
 
 
 def _search_cdp(query: str, game_slug: str, api_key: str, cdp_port: int, game_id: int) -> list[dict]:

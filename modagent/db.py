@@ -26,7 +26,7 @@ def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
     try:
         for table in (
             "installed_mods", "snapshots", "sessions",
-            "custom_domains", "mod_source_bindings",
+            "custom_domains", "mod_source_bindings", "mod_catalog_notes",
         ):
             conn.execute(
                 f"UPDATE OR IGNORE {table} SET game_slug=? WHERE game_slug=?",
@@ -132,6 +132,17 @@ def init_db():
             last_checked_at REAL DEFAULT 0,
             PRIMARY KEY (game_slug, mod_id)
         );
+        CREATE TABLE IF NOT EXISTS mod_catalog_notes (
+            game_slug TEXT NOT NULL,
+            mod_id TEXT NOT NULL,
+            localized_name TEXT DEFAULT '',
+            summary TEXT DEFAULT '',
+            evidence_kind TEXT DEFAULT '',
+            confidence TEXT DEFAULT 'low',
+            source_fingerprint TEXT DEFAULT '',
+            updated_at REAL DEFAULT 0,
+            PRIMARY KEY (game_slug, mod_id)
+        );
     """)
     try:
         conn.execute("ALTER TABLE installed_mods ADD COLUMN files_installed TEXT DEFAULT '[]'")
@@ -200,9 +211,11 @@ def remove_mod(mod_id: str, game_slug: str = ""):
     if game_slug:
         conn.execute("DELETE FROM installed_mods WHERE id=? AND game_slug=?", (mod_id, game_slug))
         conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
+        conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
     else:
         conn.execute("DELETE FROM installed_mods WHERE id=?", (mod_id,))
         conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=?", (mod_id,))
+        conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=?", (mod_id,))
     _log(conn, "uninstall", json.dumps({"mod_id": mod_id, "game_slug": game_slug}))
     conn.commit()
     conn.close()
@@ -353,6 +366,68 @@ def get_mod_source_bindings(game_slug: str = "") -> list[dict]:
         ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def get_mod_catalog_notes(game_slug: str = "") -> dict[str, dict]:
+    """Return cached Chinese names and functional summaries keyed by mod id."""
+    game_slug = _scope_game(game_slug)
+    conn = get_conn()
+    if game_slug:
+        rows = conn.execute(
+            "SELECT * FROM mod_catalog_notes WHERE game_slug=? ORDER BY mod_id",
+            (game_slug,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM mod_catalog_notes ORDER BY game_slug,mod_id"
+        ).fetchall()
+    conn.close()
+    return {str(row["mod_id"]): dict(row) for row in rows}
+
+
+def upsert_mod_catalog_notes(game_slug: str, notes: list[dict]) -> int:
+    """Persist AI/local-evidence descriptions without changing inventory rows."""
+    game_slug = _scope_game(game_slug)
+    if not game_slug or not notes:
+        return 0
+    now = time.time()
+    rows = []
+    for note in notes:
+        mod_id = str(note.get("mod_id") or "").strip()
+        if not mod_id:
+            continue
+        rows.append((
+            game_slug,
+            mod_id,
+            str(note.get("localized_name") or "").strip(),
+            str(note.get("summary") or "").strip(),
+            str(note.get("evidence_kind") or "").strip(),
+            str(note.get("confidence") or "low").strip(),
+            str(note.get("source_fingerprint") or "").strip(),
+            now,
+        ))
+    if not rows:
+        return 0
+    conn = get_conn()
+    conn.executemany(
+        """
+        INSERT INTO mod_catalog_notes
+        (game_slug,mod_id,localized_name,summary,evidence_kind,confidence,
+         source_fingerprint,updated_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(game_slug,mod_id) DO UPDATE SET
+          localized_name=excluded.localized_name,
+          summary=excluded.summary,
+          evidence_kind=excluded.evidence_kind,
+          confidence=excluded.confidence,
+          source_fingerprint=excluded.source_fingerprint,
+          updated_at=excluded.updated_at
+        """,
+        rows,
+    )
+    conn.commit()
+    conn.close()
+    return len(rows)
 
 
 def get_mod_by_source(game_slug: str, source: str, source_key: str) -> Optional[InstalledMod]:

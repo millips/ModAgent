@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import db
-from .inventory_match import find_installed_duplicate
+from .inventory_match import (
+    find_installed_duplicate,
+    find_installed_functional_equivalent,
+)
 
 
 SOURCE_LABELS = {
@@ -680,6 +683,29 @@ def normalize_recommendations(
                     "installed_version": installed.version,
                 })
                 continue
+            alternative = find_installed_functional_equivalent(
+                item.get("name") or "", installed_mods,
+            ) if game_slug else None
+            if alternative:
+                item.update({
+                    "installable": False,
+                    "default_selected": False,
+                    "installed_match_kind": "functional_alternative",
+                    "installed_id": alternative.id,
+                    "installed_name": alternative.name,
+                    "installed_version": alternative.version,
+                    "conflict_status": "warning",
+                    "conflict": (
+                        f"已安装同类实现 {alternative.name} "
+                        f"{alternative.version}；这是替代方案，不是版本更新，不建议同时安装"
+                    ),
+                    "resolution_kind": "alternative_installed",
+                    "resolution_title": (
+                        f"已安装功能重叠的 {alternative.name}。若要改用此候选，"
+                        "请先核验差异并禁用或卸载现有实现"
+                    ),
+                    "resolution_actions": ["keep", "open_source"],
+                })
             normalized_groups[source].append(item)
 
     # Round-robin sources so Nexus' first five rows cannot hide every other

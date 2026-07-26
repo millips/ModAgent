@@ -36,6 +36,7 @@ _chat_tasks: dict[str, dict] = {}
 _chat_tasks_lock = threading.RLock()
 _inventory_scan_jobs: dict[str, dict] = {}
 _inventory_scan_jobs_lock = threading.RLock()
+_catalog_enrichment_lock = threading.Lock()
 
 PROMPT_REFERENCED_TOOLS = {
     # 与 I 盘真身 tools.py 的 build_tools_definitions 保持一致(32 个)
@@ -533,7 +534,13 @@ def update_config(body: ConfigUpdate):
 
 @app.get("/mods")
 def list_mods(game_slug: str = ""):
-    mods = db.get_installed_mods(game_slug if game_slug else cfg.game_slug)
+    scope = game_slug if game_slug else game_storage_id(cfg)
+    mods = db.get_installed_mods(scope)
+    notes = db.get_mod_catalog_notes(scope)
+    bindings = {
+        str(item.get("mod_id")): item
+        for item in db.get_mod_source_bindings(scope)
+    }
 
     return [{
         "id": m.id, "name": m.name, "version": m.version,
@@ -541,7 +548,64 @@ def list_mods(game_slug: str = ""):
         "installed_at": m.installed_at, "installed_by": m.installed_by,
         "game_slug": m.game_slug,
         "disabled": installer.is_mod_disabled(_mod_files(m)),
+        "localized_name": (notes.get(str(m.id)) or {}).get("localized_name", ""),
+        "summary": (notes.get(str(m.id)) or {}).get("summary", ""),
+        "summary_evidence": (notes.get(str(m.id)) or {}).get("evidence_kind", ""),
+        "summary_confidence": (notes.get(str(m.id)) or {}).get("confidence", ""),
+        "source": (bindings.get(str(m.id)) or {}).get("source", ""),
+        "source_url": (bindings.get(str(m.id)) or {}).get("source_url", ""),
     } for m in mods]
+
+
+@app.post("/mods/enrich")
+def enrich_mod_catalog(game_slug: str = "", force: bool = False):
+    """Generate cached Chinese names and decision-grade functional summaries."""
+    from modagent.catalog_enrichment import (
+        build_enrichment_inputs, generate_catalog_notes,
+    )
+
+    scope = game_slug or game_storage_id(cfg)
+    if not scope:
+        raise HTTPException(status_code=400, detail="请先选择游戏")
+    if not getattr(cfg, "llm_api_key", ""):
+        return {
+            "status": "llm_required",
+            "updated": 0,
+            "notes": db.get_mod_catalog_notes(scope),
+        }
+    with _catalog_enrichment_lock:
+        mods = db.get_installed_mods(scope)
+        cached = db.get_mod_catalog_notes(scope)
+        bindings = {
+            str(item.get("mod_id")): item
+            for item in db.get_mod_source_bindings(scope)
+        }
+        manual = (getattr(cfg, "manual_mod_dirs", {}) or {}).get(scope, [])
+        allowed_roots = [cfg.game_root, *manual]
+        pending = build_enrichment_inputs(
+            mods, bindings, cached, allowed_roots, force=force,
+        )
+        if not pending:
+            return {"status": "cached", "updated": 0, "notes": cached}
+        try:
+            agent = _get_agent("__catalog_enrichment__")
+            generated = generate_catalog_notes(
+                agent.client, cfg.llm_model, pending,
+            )
+        except Exception as exc:
+            return {
+                "status": "generation_failed",
+                "updated": 0,
+                "error": str(exc)[:240],
+                "notes": cached,
+            }
+        updated = db.upsert_mod_catalog_notes(scope, generated)
+        return {
+            "status": "ok",
+            "updated": updated,
+            "attempted": len(pending),
+            "notes": db.get_mod_catalog_notes(scope),
+        }
 
 
 def _mod_files(mod) -> list:
