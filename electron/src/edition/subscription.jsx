@@ -373,6 +373,7 @@ export function SettingsEditionPanel({ toast }) {
   const stateLabel = {
     trial: `三天试用中 · 剩余 ${license.days_remaining || 0} 天`,
     active: `P 会员有效 · 剩余 ${license.days_remaining || 0} 天`,
+    permanent: 'P 永久授权',
     expired: 'P 会员已到期',
     trial_expired: '三天试用已结束',
     clock_error: '系统时间异常',
@@ -393,7 +394,7 @@ export function SettingsEditionPanel({ toast }) {
           }`}>{stateLabel}</span>
         </div>
         <p className="text-xs leading-relaxed text-surface-500">
-          P 包首次启动提供三天试用；首发兑换码激活后有效 60 天。到期只关闭 P 专属主题、音效与视觉反馈，不影响 Mod 管理和用户数据。
+          P 包首次启动提供三天试用；兑换码可签发为限时或永久授权。到期只关闭 P 专属主题、音效、视觉反馈与 Windows 通知，不影响 Mod 管理和用户数据。
         </p>
         {license.expires_at && (
           <div className="flex items-center gap-2 text-[11px] text-surface-400">

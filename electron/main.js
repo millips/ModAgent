@@ -10,7 +10,7 @@ const os = require('os');
 const fs = require('fs');
 const { getAppIdentity } = require('./appIdentity');
 const { createSecurityStore } = require('./securityStore');
-const { createLicenseStore } = require('./licenseStore');
+const { createLicenseStore, canUsePBenefits } = require('./licenseStore');
 const { createRuntimeDiagnostics, buildDiagnosticReport } = require('./runtimeDiagnostics');
 const { setupAutoUpdater } = require('./updater');
 const { findInstalledBrowser, profileDirectory } = require('./browserLauncher');
@@ -480,6 +480,10 @@ ipcMain.handle('activate-p-license', (_, code) => {
 });
 ipcMain.handle('open-external', (_, url) => openTrustedExternal(url));
 ipcMain.handle('notify-reply-complete', () => {
+  const licenseStatus = pLicenseStore.status();
+  if (!canUsePBenefits(licenseStatus)) {
+    return { ok: false, shown: false, reason: 'p_license_required' };
+  }
   if (!mainWindow || mainWindow.isFocused()) return { ok: true, shown: false };
   if (!replyAttentionPending) {
     replyAttentionPending = true;
