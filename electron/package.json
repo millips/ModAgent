@@ -16,6 +16,7 @@
     "test:updater": "node scripts/test-updater-config.js",
     "test:uninstaller": "node scripts/test-uninstaller-config.js",
     "test:license": "node scripts/test-p-license.js",
+    "test:quick-replies": "node scripts/test-chat-quick-replies.mjs",
     "test:packaged-smoke": "node scripts/test-packaged-smoke.js",
     "build": "npm run verify:audio && npm run verify:text && node scripts/clean-dist.js && vite build",
     "start": "electron .",

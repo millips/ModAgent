@@ -114,6 +114,8 @@ def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str
             status = {
                 "ready": "已匹配可安装候选",
                 "needs_resolution": "已匹配，但需要先处理",
+                "satisfied_installed": "本机已安装",
+                "satisfied_local": "当前环境已满足",
                 "unresolved": "尚未匹配明确来源",
             }.get(requirement.get("status"), "待核验")
             lines.append(
@@ -326,10 +328,29 @@ def _recommendation_reason(
     return "来自本轮搜索候选，建议结合功能与风险信息判断"
 
 
-def _normalize_item(source: str, item: dict) -> dict:
-    dependencies = _dependencies(
-        item.get("dependencies") or item.get("requirements") or item.get("deps")
-    )
+def _loader_name(value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "", _text(value).casefold())
+    if normalized in {"melonloader", "melon"}:
+        return "MelonLoader"
+    if normalized in {"bepinex", "bepinexpack"}:
+        return "BepInEx"
+    if normalized in {"smapi"}:
+        return "SMAPI"
+    return _text(value)
+
+
+def _normalize_item(source: str, item: dict, mod_loader: str = "") -> dict:
+    dependencies = []
+    for raw_dependencies in (
+        item.get("dependencies"),
+        item.get("dependency_labels"),
+        item.get("requirements"),
+        item.get("deps"),
+    ):
+        for dependency in _dependencies(raw_dependencies):
+            if dependency not in dependencies:
+                dependencies.append(dependency)
+    dependencies = dependencies[:12]
     archived = bool(item.get("archived"))
     has_files = item.get("has_files")
     detail_verified = bool(item.get("_detail_verified"))
@@ -342,12 +363,29 @@ def _normalize_item(source: str, item: dict) -> dict:
     )
     has_function_summary = bool(_text(content))
     staleness = item.get("staleness") if isinstance(item.get("staleness"), dict) else {}
+    required_loader = _loader_name(item.get("required_loader"))
+    active_loader = _loader_name(mod_loader)
+    loader_mismatch = bool(
+        required_loader
+        and active_loader
+        and required_loader.casefold() != active_loader.casefold()
+    )
+    loader_unverified = bool(required_loader and not active_loader)
     if archived:
         conflict_status = "danger"
         conflict = "项目已归档"
     elif has_files is False:
         conflict_status = "warning"
         conflict = "未提供下载文件"
+    elif loader_mismatch:
+        conflict_status = "danger"
+        conflict = (
+            f"该 Mod 明确要求 {required_loader}，当前游戏配置为 "
+            f"{active_loader}；加载器不兼容，禁止加入安装计划"
+        )
+    elif loader_unverified:
+        conflict_status = "warning"
+        conflict = f"该 Mod 明确要求 {required_loader}，但当前加载器尚未核实"
     elif staleness.get("stale"):
         conflict_status = "warning"
         conflict = staleness.get("note") or "较长时间未更新，需核对兼容性"
@@ -380,6 +418,8 @@ def _normalize_item(source: str, item: dict) -> dict:
         and not archived
         and has_files is not False
         and bool(source_id)
+        and not loader_mismatch
+        and not loader_unverified
     )
     if installable:
         resolution_kind = "ready"
@@ -393,6 +433,17 @@ def _normalize_item(source: str, item: dict) -> dict:
         resolution_kind = "manual_download"
         resolution_title = "来源未提供可自动取得的文件；可打开页面后手动下载并导入"
         resolution_actions = ["keep", "open_source", "manual_import"]
+    elif loader_mismatch:
+        resolution_kind = "incompatible_loader"
+        resolution_title = (
+            f"需要 {required_loader}，当前为 {active_loader}；"
+            "不可直接安装到现有加载器目录"
+        )
+        resolution_actions = ["keep", "open_source"]
+    elif loader_unverified:
+        resolution_kind = "loader_unverified"
+        resolution_title = f"需要先确认当前游戏已安装 {required_loader}"
+        resolution_actions = ["keep", "verify_detail", "open_source"]
     elif verification_status == "blocked":
         resolution_kind = "verification_blocked"
         resolution_title = "详情核验受阻；完成站点验证或重新核验后可继续"
@@ -424,6 +475,11 @@ def _normalize_item(source: str, item: dict) -> dict:
         "conflict": conflict,
         "conflict_status": conflict_status,
         "dependencies": dependencies,
+        "required_loader": required_loader,
+        "active_loader": active_loader,
+        "loader_compatible": (
+            False if loader_mismatch else None if loader_unverified else True
+        ),
         "dependency_status": (
             "known" if dependencies else "none_verified" if detail_verified else "unknown"
         ),
@@ -447,7 +503,9 @@ def _normalize_item(source: str, item: dict) -> dict:
     }
 
 
-def _dependency_requirements(items: list[dict]) -> list[dict]:
+def _dependency_requirements(
+    items: list[dict], installed_mods: list[Any] | None = None,
+) -> list[dict]:
     """Resolve declared dependency labels against visible candidates.
 
     Requirements remain visible even when no candidate can be matched. This
@@ -472,6 +530,33 @@ def _dependency_requirements(items: list[dict]) -> list[dict]:
             )
             if target_name not in entry["required_by"]:
                 entry["required_by"].append(target_name)
+            loader = _loader_name(label)
+            if (
+                loader in {"BepInEx", "MelonLoader", "SMAPI"}
+                and target.get("loader_compatible") is True
+                and _loader_name(target.get("active_loader")) == loader
+            ):
+                entry["status"] = "satisfied_local"
+
+    installed_aliases = []
+    for installed in installed_mods or []:
+        installed_aliases.extend((
+            _text(getattr(installed, "id", "")).casefold(),
+            _text(getattr(installed, "name", "")).casefold(),
+        ))
+    installed_aliases = [alias for alias in installed_aliases if alias]
+    for key, entry in requirements.items():
+        if entry["status"] != "unresolved":
+            continue
+        if any(
+            key == alias
+            or (
+                len(key) >= 5
+                and (key in alias or alias in key)
+            )
+            for alias in installed_aliases
+        ):
+            entry["status"] = "satisfied_installed"
 
     for item in items:
         aliases = {
@@ -490,6 +575,8 @@ def _dependency_requirements(items: list[dict]) -> list[dict]:
             None,
         )
         if not match:
+            continue
+        if match["status"] in {"satisfied_installed", "satisfied_local"}:
             continue
         match["matched_selection_key"] = item["selection_key"]
         match["status"] = (
@@ -586,6 +673,7 @@ def _merge_evidence(broad: list[dict], verified: list[dict]) -> list[dict]:
 
 def recommendations_from_tool_evidence(
     evidence: list[tuple[str, Any]], limit: int = 10, game_slug: str = "",
+    mod_loader: str = "",
 ) -> dict:
     """Build the final Pro table from all search evidence in this turn."""
     broad = {source: [] for source in SOURCE_LABELS}
@@ -628,11 +716,11 @@ def recommendations_from_tool_evidence(
         "thunderstore": combined["thunderstore"],
         "gamebanana": combined["gamebanana"],
         "github": combined["github"],
-    }, limit=limit, game_slug=game_slug)
+    }, limit=limit, game_slug=game_slug, mod_loader=mod_loader)
 
 
 def normalize_recommendations(
-    payload: Any, limit: int = 10, game_slug: str = "",
+    payload: Any, limit: int = 10, game_slug: str = "", mod_loader: str = "",
 ) -> dict:
     """Return a stable six-row payload for the Pro recommendation table."""
     if isinstance(payload, str):
@@ -664,7 +752,7 @@ def normalize_recommendations(
         for raw in rows:
             if not isinstance(raw, dict):
                 continue
-            item = _normalize_item(source, raw)
+            item = _normalize_item(source, raw, mod_loader=mod_loader)
             installed = find_installed_duplicate(
                 game_slug,
                 source,
@@ -727,7 +815,32 @@ def normalize_recommendations(
             break
         index += 1
 
-    dependency_requirements = _dependency_requirements(items)
+    dependency_requirements = _dependency_requirements(items, installed_mods)
+    blocking_dependencies = {
+        requirement["name"]: requirement
+        for requirement in dependency_requirements
+        if requirement.get("status") in {"unresolved", "needs_resolution"}
+    }
+    for item in items:
+        target_name = _text(item.get("localized_name") or item.get("name"))
+        blocked = [
+            requirement for requirement in blocking_dependencies.values()
+            if target_name in (requirement.get("required_by") or [])
+        ]
+        if not blocked or item.get("resolution_kind") in {
+            "incompatible_loader", "archived", "manual_download",
+        }:
+            continue
+        names = "、".join(requirement["name"] for requirement in blocked)
+        item.update({
+            "installable": False,
+            "default_selected": False,
+            "conflict_status": "warning",
+            "conflict": f"必要依赖尚未满足：{names}",
+            "resolution_kind": "dependencies_blocked",
+            "resolution_title": f"请先核验并安装必要依赖：{names}",
+            "resolution_actions": ["keep", "verify_detail", "open_source"],
+        })
     # Prerequisites are always rendered before target candidates.
     items.sort(key=lambda item: 0 if item.get("is_prerequisite") else 1)
 
@@ -776,3 +889,138 @@ def normalize_recommendations(
             ) if items else 1.0,
         },
     }
+
+
+def promote_verified_recommendation(
+    payload: Any,
+    source: str,
+    verified_detail: Any,
+    *,
+    mod_loader: str = "",
+    game_slug: str = "",
+) -> dict:
+    """Upgrade one unresolved row in-place after authoritative detail lookup.
+
+    The stable selection key and table position are preserved.  A prior
+    "wanted" choice becomes selected only when the verified row is actually
+    installable; blocked rows remain wanted and expose the verified reason.
+    """
+    payload = _decode_payload(payload)
+    verified_detail = _decode_payload(verified_detail)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("kind") != "recommendation_set"
+        or not isinstance(verified_detail, dict)
+    ):
+        return {}
+
+    detail_identity = _identity(verified_detail)
+    if not detail_identity:
+        return {}
+    items = [
+        dict(item) for item in (payload.get("items") or [])
+        if isinstance(item, dict)
+    ]
+    matched_index = next((
+        index for index, item in enumerate(items)
+        if _text(item.get("source")).casefold() == _text(source).casefold()
+        and (
+            _text(item.get("mod_id")).casefold() == detail_identity
+            or _text(item.get("source_id")).casefold() == detail_identity
+        )
+    ), -1)
+    if matched_index < 0:
+        return {}
+
+    previous = items[matched_index]
+    merged = dict(previous)
+    for key, value in verified_detail.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    merged["_detail_verified"] = True
+    promoted = _normalize_item(source, merged, mod_loader=mod_loader)
+    promoted["selection_key"] = previous["selection_key"]
+    if _text(previous.get("localized_name")):
+        promoted["localized_name"] = previous["localized_name"]
+    if (
+        _CHINESE_RE.search(_text(previous.get("content")))
+        and not _CHINESE_RE.search(_text(promoted.get("content")))
+    ):
+        promoted["content"] = previous["content"]
+    items[matched_index] = promoted
+
+    for item in items:
+        item["is_prerequisite"] = False
+        item["required_by"] = []
+    try:
+        installed_mods = db.get_installed_mods(game_slug) if game_slug else []
+    except Exception:
+        installed_mods = []
+    dependency_requirements = _dependency_requirements(items, installed_mods)
+    blocking_dependencies = {
+        requirement["name"]: requirement
+        for requirement in dependency_requirements
+        if requirement.get("status") in {"unresolved", "needs_resolution"}
+    }
+    for item in items:
+        target_name = _text(item.get("localized_name") or item.get("name"))
+        blocked = [
+            requirement for requirement in blocking_dependencies.values()
+            if target_name in (requirement.get("required_by") or [])
+        ]
+        if not blocked or item.get("resolution_kind") in {
+            "incompatible_loader", "archived", "manual_download",
+        }:
+            continue
+        names = "、".join(requirement["name"] for requirement in blocked)
+        item.update({
+            "installable": False,
+            "default_selected": False,
+            "conflict_status": "warning",
+            "conflict": f"必要依赖尚未满足：{names}",
+            "resolution_kind": "dependencies_blocked",
+            "resolution_title": f"请先核验并安装必要依赖：{names}",
+            "resolution_actions": ["keep", "verify_detail", "open_source"],
+        })
+    items.sort(key=lambda item: 0 if item.get("is_prerequisite") else 1)
+
+    selected_keys = [
+        str(key) for key in (payload.get("selected_keys") or []) if key
+    ]
+    wanted_keys = [
+        str(key) for key in (payload.get("wanted_keys") or []) if key
+    ]
+    promoted_key = promoted["selection_key"]
+    if promoted.get("installable") and promoted_key in wanted_keys:
+        wanted_keys = [key for key in wanted_keys if key != promoted_key]
+        if promoted_key not in selected_keys:
+            selected_keys.append(promoted_key)
+    elif not promoted.get("installable"):
+        selected_keys = [key for key in selected_keys if key != promoted_key]
+        if promoted_key not in wanted_keys:
+            wanted_keys.append(promoted_key)
+
+    valid_keys = {item.get("selection_key") for item in items}
+    result = {
+        **payload,
+        "items": items,
+        "selected_keys": [key for key in selected_keys if key in valid_keys],
+        "wanted_keys": [key for key in wanted_keys if key in valid_keys],
+        "dependency_requirements": dependency_requirements,
+    }
+    result["verification"] = {
+        **(payload.get("verification") or {}),
+        "target_ratio": 0.95,
+        "total": len(items),
+        "verified": sum(1 for item in items if item.get("detail_verified")),
+        "coverage_ratio": round(
+            sum(1 for item in items if item.get("detail_verified")) / len(items),
+            4,
+        ) if items else 1.0,
+    }
+    result["promotion"] = {
+        "selection_key": promoted_key,
+        "installable": bool(promoted.get("installable")),
+        "resolution_kind": promoted.get("resolution_kind"),
+    }
+    return result

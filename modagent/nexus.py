@@ -601,6 +601,10 @@ def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888)
     except Exception:
         main = None
     deps = [d.get("mod_id") for d in mod.get("dependencies", []) if d.get("mod_id")]
+    dependency_labels = _extract_dependency_labels(mod.get("description", ""))
+    required_loader = _extract_required_loader(
+        mod.get("description", ""), dependency_labels
+    )
 
     return {
         "mod_id": mod.get("mod_id", mod_id),
@@ -618,6 +622,8 @@ def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888)
         "updated_at": mod.get("updated_time", ""),
         "staleness": _staleness(mod.get("updated_time", "")),
         "dependencies": deps,
+        "dependency_labels": dependency_labels,
+        "required_loader": required_loader,
         "install_notes": _extract_install_notes(mod.get("description", "")),
     }
 
@@ -653,6 +659,87 @@ def _extract_install_notes(desc: str) -> str:
         if in_install and line.strip():
             notes.append(line.strip())
     return "\n".join(notes[:10]) if notes else ""
+
+
+def _source_plain_text(value: str) -> str:
+    """Convert the small HTML/BBCode subset used by Nexus descriptions."""
+    text = str(value or "")
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</?(?:p|div|li|ul|ol|h[1-6])\b[^>]*>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\[\*\]", "\n* ", text, flags=re.I)
+    text = re.sub(r"\[url=[^\]]+\](.*?)\[/url\]", r"\1", text, flags=re.I | re.S)
+    text = re.sub(r"\[/?(?:b|i|u|size|color|font|list)(?:=[^\]]+)?\]", "", text, flags=re.I)
+    text = re.sub(r"\[[^\]]+\]", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
+def _extract_dependency_labels(desc: str) -> list[str]:
+    """Extract explicitly required dependency names from source prose.
+
+    Nexus' structured dependency array is frequently empty even when the
+    description contains a clear "required dependencies" section.  Only that
+    explicit section is accepted here; incidental framework mentions do not
+    become hard requirements.
+    """
+    plain = _source_plain_text(desc)
+    if not plain:
+        return []
+    marker = re.search(
+        r"(?:required\s+dependencies|requirements?|必需(?:依赖|前置)|前置依赖)"
+        r"(?:\s+(?:installed|安装))?\s*:?",
+        plain,
+        flags=re.I,
+    )
+    if not marker:
+        return []
+    section = plain[marker.end():marker.end() + 900]
+    stop = re.search(
+        r"\n\s*\*?\s*(?:launch|usage|configuration|optional|credits?|"
+        r"how\s+to\s+use|启动|使用|配置)\b",
+        section,
+        flags=re.I,
+    )
+    if stop:
+        section = section[:stop.start()]
+
+    labels = []
+    for raw in re.findall(r"(?:^|\n)\s*\*\s*([^\n]+)", section):
+        label = raw.strip(" :-–—\t")
+        label = re.split(r"\s{2,}|[（(](?:optional|可选)", label, maxsplit=1, flags=re.I)[0]
+        if (
+            label
+            and len(label) <= 80
+            and label.casefold() not in {"download", "extract", "install"}
+            and label not in labels
+        ):
+            labels.append(label)
+    return labels[:12]
+
+
+def _extract_required_loader(desc: str, dependency_labels: list[str] | None = None) -> str:
+    labels = {
+        re.sub(r"[^a-z0-9]+", "", str(label).casefold())
+        for label in (dependency_labels or [])
+    }
+    if "melonloader" in labels:
+        return "MelonLoader"
+    if "bepinex" in labels or "bepinexpack" in labels:
+        return "BepInEx"
+
+    plain = _source_plain_text(desc)
+    strong_patterns = (
+        (r"\bport(?:ed)?\b.{0,100}\bto\s+MelonLoader\b", "MelonLoader"),
+        (r"\b(?:requires?|built\s+for|made\s+for)\s+MelonLoader\b", "MelonLoader"),
+        (r"\bport(?:ed)?\b.{0,100}\bto\s+BepInEx\b", "BepInEx"),
+        (r"\b(?:requires?|built\s+for|made\s+for)\s+BepInEx(?:Pack)?\b", "BepInEx"),
+    )
+    for pattern, loader in strong_patterns:
+        if re.search(pattern, plain, flags=re.I | re.S):
+            return loader
+    return ""
 
 
 def _parse_readme(desc: str) -> dict:

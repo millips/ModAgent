@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { Send, RotateCcw, Search, RefreshCw, Zap, Shield, AlertTriangle, Plus, Trash2, PenLine, MessageSquare, PanelLeftClose, PanelLeft, Copy, Undo2, Square, Reply, Check, X, Bug, FolderPlus, FolderOpen, FileType2, Clock3 } from 'lucide-react'
 import PlanCard from './PlanCard'
 import DebugPanel from './DebugPanel'
+import { getManualActionQuickReply } from './chatQuickReplies.mjs'
 import { emitFeedback, emitToolFeedback, emitToolStartFeedback } from '../feedback/feedbackBus'
 import { ChatEditionMessage } from '@edition'
 
@@ -93,6 +94,29 @@ function insertRecommendationAtAnchor(messages, payload, createId) {
   const result = [...messages]
   result.splice(insertAt, 0, card)
   return result
+}
+
+function mergeRecommendationUpdate(messages, payload, createId) {
+  const updatedKeys = new Set(
+    (payload?.items || []).map(item => item?.selection_key).filter(Boolean)
+  )
+  let matchIndex = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message.role !== 'edition') continue
+    if ((message.payload?.items || []).some(
+      item => updatedKeys.has(item?.selection_key)
+    )) {
+      matchIndex = index
+      break
+    }
+  }
+  if (matchIndex < 0) {
+    return insertRecommendationAtAnchor(messages, payload, createId)
+  }
+  return messages.map((message, index) => (
+    index === matchIndex ? { ...message, payload } : message
+  ))
 }
 
 function formatProgressTime(value) {
@@ -568,6 +592,13 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         })
         continue
       }
+      if (data.recommendations_update?.kind === 'recommendation_set') {
+        recoveryAgentRef.current = { id: null, text: '' }
+        setMessages(prev => mergeRecommendationUpdate(
+          prev, data.recommendations_update, mkId
+        ))
+        continue
+      }
       if (Array.isArray(data.update_report?.items)) {
         recoveryAgentRef.current = { id: null, text: '' }
         setMessages(prev => [...prev, { id: mkId(), role: 'update-report', payload: data.update_report }])
@@ -873,6 +904,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     let transcriptTextCount = textMessageCount(baseMessages || messages) + 1
     let streamCompleted = false
     let streamFailed = false
+    let executionFailed = false
+    let planBlocked = false
+    let latestRecommendationUpdate = null
 
     try {
       const r = await fetch(api + '/chat/stream', {
@@ -937,6 +971,13 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             if (data.tool_result) {
               curAgentId = null
               const tr = data.tool_result
+              if (
+                options.selectionAction === 'confirm'
+                && ['mod_download', 'batch_download', 'mod_install', 'mod_install_batch', 'mod_install_custom'].includes(tr.name)
+                && !tr.ok
+              ) {
+                executionFailed = true
+              }
               if (QUIET_TOOLS.has(tr.name)) continue
               setTaskProgress(previous => ({
                 ...(previous || { startedAt: taskStartedAt }),
@@ -962,6 +1003,20 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
               }
               guardedSet(prev => [...prev, { id: mkId(), role: 'edition', payload }])
               persistEditionState(sendSid, payload)
+              continue
+            }
+            if (data.plan_blocked) {
+              planBlocked = true
+              continue
+            }
+            if (data.recommendations_update?.kind === 'recommendation_set') {
+              curAgentId = null
+              latestRecommendationUpdate = data.recommendations_update
+              planBlocked = planBlocked || !!data.plan_blocked
+              guardedSet(prev => mergeRecommendationUpdate(
+                prev, data.recommendations_update, mkId
+              ))
+              persistEditionState(sendSid, data.recommendations_update)
               continue
             }
             if (Array.isArray(data.update_report?.items)) {
@@ -1017,8 +1072,11 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       setMessages(prev => [...prev, { id: mkId(), role: 'error', content: '连接失败: ' + e.message }])
     }
 
-    if (streamCompleted && options.confirmationPayload) {
-      const payload = options.confirmationPayload
+    if (streamCompleted && options.confirmationPayload && !planBlocked) {
+      const payload = {
+        ...(latestRecommendationUpdate || options.confirmationPayload),
+        phase: 'confirm',
+      }
       guardedSet(prev => [...prev, { id: mkId(), role: 'edition', payload }])
       // A completed card already had its chronological position in the live
       // transcript. Do not persist it as floating UI state: on reload that
@@ -1026,9 +1084,12 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       // unsolicited installation request.
       persistEditionState(sendSid, payload.phase === 'completed' ? {} : payload)
     }
+    if (streamCompleted && options.confirmationPayload && planBlocked) {
+      toast('该候选未通过依赖或加载器核验，已保留为目标但不会进入安装确认', 'warn')
+    }
     if (options.editionCompletion) {
       const completion = options.editionCompletion
-      const payload = streamCompleted && !streamFailed
+      const payload = streamCompleted && !streamFailed && !executionFailed
         ? completion.completed : completion.failed
       guardedSet(prev => prev.map(item => item.id === completion.messageId
         ? { ...item, payload } : item))
@@ -1080,6 +1141,11 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     const isSys = msg.role === 'sys'
     const isLast = i === messages.length - 1
     const editing = editingMsgId === msg.id
+    const manualActionReply = (
+      isAgent && isLast && !editing
+        ? getManualActionQuickReply(msg.content)
+        : null
+    )
 
     return (
       <div key={msg.id} className="group relative">
@@ -1116,6 +1182,21 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             </div>
           ) : (
             isSys ? (msg.kind === 'tool' ? renderToolResult(msg) : msg.content) : isAgent ? renderContent(msg) : msg.content
+          )}
+
+          {manualActionReply && !(loading && isLast) && (
+            <div className="mt-3 pt-3 border-t border-cyber-cyan/20">
+              <button
+                type="button"
+                onClick={() => sendMsg(manualActionReply.message)}
+                disabled={loading || !status.online}
+                title="完成页面验证后，继续刚才被中断的同一任务"
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-md border border-cyber-cyan/50 bg-cyber-cyan/15 text-cyber-cyan font-medium hover:bg-cyber-cyan/25 hover:border-cyber-cyan disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                <Check size={15} />
+                {manualActionReply.label}
+              </button>
+            </div>
           )}
 
           {/* 用户消息操作条 */}

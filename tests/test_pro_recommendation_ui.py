@@ -4,6 +4,7 @@ import json
 from modagent.recommendation_ui import (
     apply_chinese_descriptions,
     normalize_recommendations,
+    promote_verified_recommendation,
     recommendation_analysis_text,
     recommendations_from_tool_evidence,
 )
@@ -63,7 +64,7 @@ assert len(result["items"]) == 6
 assert [item["source"] for item in result["items"][:5]] == [
     "nexus", "workshop", "thunderstore", "gamebanana", "github",
 ]
-assert len(result["selected_keys"]) == 3
+assert len(result["selected_keys"]) == 2
 assert result["verification"]["verified"] == 3
 assert result["verification"]["coverage_ratio"] == 0.5
 assert len(set(item["selection_key"] for item in result["items"])) == 6
@@ -92,6 +93,9 @@ framework = result["items"][0]
 assert framework["version"] == "1.2.0"
 assert framework["dependencies"] == ["9"]
 assert framework["content"] == "Loads costume mods"
+assert framework["installable"] is False
+assert framework["resolution_kind"] == "dependencies_blocked"
+assert "9" in framework["conflict"]
 
 workshop_item = next(item for item in result["items"] if item["name"] == "Workshop item")
 assert "功能与适配性尚未核验" in workshop_item["content"]
@@ -181,15 +185,61 @@ assert evidence_result["items"][0]["version"] == "1.2"
 assert evidence_result["items"][0]["dependencies"] == ["Dresscode"]
 assert evidence_result["items"][0]["detail_verified"] is True
 assert evidence_result["items"][0]["dependency_status"] == "known"
-assert evidence_result["items"][0]["conflict_status"] == "clear"
+assert evidence_result["items"][0]["conflict_status"] == "warning"
+assert "Dresscode" in evidence_result["items"][0]["conflict"]
 assert "详情已核验" in evidence_result["items"][0]["recommendation_reason"]
 assert evidence_result["items"][1]["version"] == "待详情核验"
-assert len(evidence_result["selected_keys"]) == 2
+assert len(evidence_result["selected_keys"]) == 1
+assert evidence_result["items"][0]["installable"] is False
+assert evidence_result["items"][0]["resolution_kind"] == "dependencies_blocked"
 
 detail_only = recommendations_from_tool_evidence([
     ("nexus_get_detail", json.dumps({"mod_id": 810, "name": "Physics"})),
 ])
 assert detail_only["items"] == []
+
+loader_blocked = normalize_recommendations({
+    "recommendations": [{
+        "mod_id": 39,
+        "name": "MoneyValueTracker",
+        "summary": "Tracks valuables on the map.",
+        "dependency_labels": ["RepoLib", "MelonLoader"],
+        "required_loader": "MelonLoader",
+        "_detail_verified": True,
+    }],
+}, mod_loader="BepInEx")
+blocked_item = loader_blocked["items"][0]
+assert blocked_item["installable"] is False
+assert blocked_item["resolution_kind"] == "incompatible_loader"
+assert blocked_item["required_loader"] == "MelonLoader"
+assert blocked_item["active_loader"] == "BepInEx"
+assert loader_blocked["selected_keys"] == []
+
+pending = normalize_recommendations({
+    "recommendations": [{
+        "mod_id": 233,
+        "name": "Admin Menu",
+        "summary": "Host administration menu.",
+    }],
+}, mod_loader="BepInEx")
+pending_key = pending["items"][0]["selection_key"]
+pending["wanted_keys"] = [pending_key]
+promoted = promote_verified_recommendation(
+    pending,
+    "nexus",
+    {
+        "mod_id": 233,
+        "name": "Admin Menu",
+        "summary": "Host administration menu with player controls.",
+        "version": "1.1.7",
+    },
+    mod_loader="BepInEx",
+)
+assert promoted["items"][0]["detail_verified"] is True
+assert promoted["items"][0]["installable"] is True
+assert promoted["wanted_keys"] == []
+assert promoted["selected_keys"] == [pending_key]
+assert promoted["promotion"]["selection_key"] == pending_key
 
 analysis = recommendation_analysis_text("""
 ## 推荐与分析

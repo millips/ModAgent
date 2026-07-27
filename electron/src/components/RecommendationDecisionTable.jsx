@@ -55,7 +55,7 @@ export function RecommendationDecisionTable({
   const verifiedCount = items.filter(item => item.detail_verified).length
   const unavailableCount = items.filter(item => item.installable === false).length
   const unresolvedRequirements = requirements.filter(
-    requirement => requirement.status !== 'ready'
+    requirement => ['unresolved', 'needs_resolution'].includes(requirement.status)
   )
   const verificationCoverage = items.length
     ? Math.round((verifiedCount / items.length) * 100)
@@ -166,7 +166,7 @@ export function RecommendationDecisionTable({
               <div
                 key={`${requirement.name}:${(requirement.required_by || []).join('|')}`}
                 className={`rounded border px-3 py-2 text-[10px] ${
-                  requirement.status === 'ready'
+                  ['ready', 'satisfied_installed', 'satisfied_local'].includes(requirement.status)
                     ? 'border-cyber-green/25 bg-cyber-green/[0.06]'
                     : 'border-cyber-yellow/25 bg-cyber-yellow/[0.06]'
                 }`}
@@ -180,12 +180,19 @@ export function RecommendationDecisionTable({
                 <p className="mt-1 text-surface-400">
                   被 {(requirement.required_by || []).join('、') || '目标 Mod'} 需要
                 </p>
-                <p className={requirement.status === 'ready' ? 'text-cyber-green' : 'text-cyber-yellow'}>
+                <p className={
+                  ['ready', 'satisfied_installed', 'satisfied_local'].includes(requirement.status)
+                    ? 'text-cyber-green' : 'text-cyber-yellow'
+                }>
                   {requirement.status === 'ready'
                     ? '已匹配可安装候选，将排在目标 Mod 之前'
+                    : requirement.status === 'satisfied_installed'
+                      ? '本机已经安装，安装计划不会重复下载'
+                      : requirement.status === 'satisfied_local'
+                        ? '当前加载器环境已经满足'
                     : requirement.status === 'needs_resolution'
                       ? '已匹配候选，但需要先完成核验或下载处理'
-                      : '尚未匹配明确来源；计划阶段必须继续核验'}
+                      : '尚未匹配明确来源；该目标不能进入安装确认'}
                 </p>
               </div>
             ))}
@@ -320,6 +327,18 @@ export function RecommendationDecisionTable({
                     <span className={`inline-flex max-w-full rounded border px-2 py-1 text-[10px] leading-relaxed ${conflictTone[item.conflict_status] || conflictTone.unknown}`}>
                       {item.conflict}
                     </span>
+                    {item.required_loader && (
+                      <div className={`mt-2 rounded border px-2 py-1.5 text-[10px] ${
+                        item.loader_compatible === true
+                          ? 'border-cyber-green/25 bg-cyber-green/[0.06] text-cyber-green'
+                          : 'border-cyber-red/25 bg-cyber-red/[0.06] text-cyber-red'
+                      }`}>
+                        必需加载器：{item.required_loader}
+                        {item.active_loader
+                          ? ` · 当前：${item.active_loader}`
+                          : ' · 当前加载器待核验'}
+                      </div>
+                    )}
                     <div className="mt-2">
                       {item.dependencies?.length
                         ? (

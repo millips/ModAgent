@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
+import json
+import os
 import re
 
 from . import db
@@ -61,17 +63,43 @@ def find_installed_duplicate(
     best = None
     best_score = 0.0
     for mod in installed_mods:
-        candidate = normalize_name(getattr(mod, "name", ""))
-        if not candidate:
-            continue
-        score = (
-            1.0 if candidate == target
-            else SequenceMatcher(None, candidate, target).ratio()
-        )
-        if min(len(candidate), len(target)) >= 8 and (
-            candidate in target or target in candidate
-        ):
-            score = max(score, .97)
+        raw_aliases = {str(getattr(mod, "name", "") or "")}
+        try:
+            files = getattr(mod, "files_installed", "[]")
+            files = json.loads(files) if isinstance(files, str) else (files or [])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            files = []
+        for path in files[:200]:
+            value = str(path or "").rstrip("\\/")
+            if not value:
+                continue
+            raw_aliases.add(os.path.splitext(os.path.basename(value))[0])
+            raw_aliases.add(os.path.basename(os.path.dirname(value)))
+
+        aliases = {normalize_name(value) for value in raw_aliases}
+        aliases.discard("")
+        # ModAgent/Nexus archives are commonly installed below a namespace
+        # such as ``39_MoneyValueTracker``.  The leading stable Nexus ID is
+        # packaging metadata, not part of the Mod name.
+        if source == "nexus" and str(source_key).isdigit():
+            prefix = str(source_key)
+            aliases.update(
+                alias[len(prefix):]
+                for alias in tuple(aliases)
+                if alias.startswith(prefix) and len(alias) > len(prefix) + 3
+            )
+
+        score = 0.0
+        for candidate in aliases:
+            candidate_score = (
+                1.0 if candidate == target
+                else SequenceMatcher(None, candidate, target).ratio()
+            )
+            if min(len(candidate), len(target)) >= 8 and (
+                candidate in target or target in candidate
+            ):
+                candidate_score = max(candidate_score, .97)
+            score = max(score, candidate_score)
         if score > best_score:
             best, best_score = mod, score
     return best if best_score >= .96 else None

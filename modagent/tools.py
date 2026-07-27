@@ -2,6 +2,7 @@ import asyncio
 import glob
 import json
 import os
+import re
 import time
 from typing import Optional
 
@@ -89,9 +90,16 @@ def refresh_local_inventory(cfg: Config) -> dict:
     slug = str(getattr(cfg, "game_slug", "") or "")
     if not root or not slug or not os.path.isdir(root):
         return {"detected": 0, "imported": 0}
-    extra = (getattr(cfg, "manual_mod_dirs", {}) or {}).get(slug, [])
-    result = scanner.scan_existing_mods(root, slug, "", extra)
+    storage_id = str(getattr(cfg, "game_instance_id", "") or slug)
+    aliases_merged = db.merge_duplicate_inventory_rows(storage_id)
+    manual_roots = getattr(cfg, "manual_mod_dirs", {}) or {}
+    extra = manual_roots.get(storage_id, manual_roots.get(slug, []))
+    result = scanner.scan_existing_mods(
+        root, slug, "", extra, game_instance_id=storage_id,
+    )
     result["imported"] = scanner.import_mods(result.get("identified", []))
+    result["aliases_merged"] = aliases_merged
+    result["aliases_merged_count"] = len(aliases_merged)
     return result
 
 
@@ -532,6 +540,127 @@ def execute(name: str, args: dict, cfg: Config) -> str:
 
     def find_download(mid, file_id=None) -> str:
         return downloader.find_cached_nexus_download(download_buckets(), mid, file_id)
+
+    def canonical_loader(value: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+        if normalized in {"melonloader", "melon"}:
+            return "MelonLoader"
+        if normalized in {"bepinex", "bepinexpack"}:
+            return "BepInEx"
+        if normalized == "smapi":
+            return "SMAPI"
+        return str(value or "").strip()
+
+    def active_loaders() -> list[str]:
+        detected = []
+        configured = canonical_loader(getattr(cfg, "mod_loader", ""))
+        if configured:
+            detected.append(configured)
+        checks = (
+            ("BepInEx", os.path.join(root, "BepInEx")),
+            ("MelonLoader", os.path.join(root, "MelonLoader")),
+            ("SMAPI", os.path.join(root, "StardewModdingAPI.exe")),
+        )
+        for loader, path in checks:
+            if os.path.exists(path) and loader not in detected:
+                detected.append(loader)
+        return detected
+
+    def dependency_key(value) -> str:
+        text = str(value or "").casefold()
+        text = re.sub(r"\bv?\d+(?:\.\d+)*\b", "", text)
+        return re.sub(r"[^a-z0-9]+", "", text)
+
+    def nexus_install_preflight(mid) -> dict:
+        """Authoritative dependency/loader gate before snapshots or writes."""
+        remote_slug, _, discovery = current_nexus_identity()
+        if not remote_slug:
+            return {
+                "status": "detail_verification_required",
+                "install_blocked": True,
+                "mod_id": str(mid),
+                "message": "无法确认 Nexus 游戏专区，安装前详情核验未完成。",
+                "discovery": discovery,
+            }
+        try:
+            detail = nexus.get_detail(
+                int(mid), remote_slug, api_key, cdp_port=cfg.chrome_cdp_port
+            )
+        except Exception as exc:
+            return {
+                "status": "detail_verification_required",
+                "install_blocked": True,
+                "mod_id": str(mid),
+                "message": f"安装前无法重新核验 Nexus 详情：{exc}",
+            }
+
+        loaders = active_loaders()
+        required_loader = canonical_loader(detail.get("required_loader"))
+        incompatible_loader = bool(
+            required_loader and required_loader not in loaders
+        )
+        installed = db.get_installed_mods(slug)
+        installed_aliases = []
+        for item in installed:
+            installed_aliases.extend((
+                dependency_key(item.id),
+                dependency_key(item.name),
+            ))
+        installed_aliases = [alias for alias in installed_aliases if alias]
+
+        dependency_labels = []
+        for dependency in (
+            list(detail.get("dependencies") or [])
+            + list(detail.get("dependency_labels") or [])
+        ):
+            label = str(dependency or "").strip()
+            if label and label not in dependency_labels:
+                dependency_labels.append(label)
+
+        satisfied, missing = [], []
+        for label in dependency_labels:
+            loader = canonical_loader(label)
+            if loader in {"BepInEx", "MelonLoader", "SMAPI"}:
+                (satisfied if loader in loaders else missing).append(label)
+                continue
+            if label.isdigit():
+                found = (
+                    db.get_mod_by_source(slug, "nexus", label)
+                    or db.get_mod(label, slug)
+                )
+            else:
+                wanted = dependency_key(label)
+                found = any(
+                    wanted == alias
+                    or (
+                        len(wanted) >= 5
+                        and (wanted in alias or alias in wanted)
+                    )
+                    for alias in installed_aliases
+                )
+            (satisfied if found else missing).append(label)
+
+        return {
+            "status": (
+                "dependency_blocked"
+                if incompatible_loader or missing else "ready"
+            ),
+            "install_blocked": bool(incompatible_loader or missing),
+            "detail_verified": True,
+            "mod_id": str(mid),
+            "name": detail.get("name") or "",
+            "required_loader": required_loader,
+            "active_loaders": loaders,
+            "incompatible_loader": incompatible_loader,
+            "required_dependencies": dependency_labels,
+            "satisfied_dependencies": satisfied,
+            "missing_dependencies": missing,
+            "message": (
+                "安装前依赖/加载器核验未通过，尚未创建快照，也未写入游戏目录。"
+                if incompatible_loader or missing
+                else "安装前详情、必要依赖与加载器核验通过。"
+            ),
+        }
 
     # T00 - scan existing mods in game directory
     if name == "browser_pages":
@@ -1273,6 +1402,14 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if len(ids) > 30:
             return json.dumps({"error": f"单批最多 30 个(收到 {len(ids)}),请分批"}, ensure_ascii=False)
         dependency_blocks = []
+        if args.get("require_verified_preflight"):
+            for mid in ids:
+                local_path = find_download(mid)
+                if not local_path or not str(mid).isdigit():
+                    continue
+                checked = nexus_install_preflight(mid)
+                if checked.get("install_blocked"):
+                    dependency_blocks.append({"mod_id": str(mid), **checked})
         if stardew.is_stardew(getattr(cfg, "game_name", ""), slug, root):
             for mid in ids:
                 local_path = find_download(mid)
@@ -1294,7 +1431,10 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "status": "missing_dependencies",
                 "install_blocked": True,
                 "items": dependency_blocks,
-                "message": "批量安装前发现必需前置未满足；尚未创建快照，也未写入游戏目录。",
+                "message": (
+                    "批量安装前发现详情、加载器或必需前置未满足；"
+                    "尚未创建快照，也未写入游戏目录。"
+                ),
             }, ensure_ascii=False, indent=2)
         # 整批共享一张安装前快照(治 22 连发时每装一个拍一张的浪费)
         try:
@@ -1373,6 +1513,31 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "hint": "该目录可能是游戏卸载后的残骸,或路径已失效。请在设置中把游戏根目录"
                         "更正为真实安装位置(可用游戏体检/重新检测),确认能找到游戏本体 exe 后再安装。",
             }, ensure_ascii=False)
+
+        if str(mid).isdigit() and args.get("require_verified_preflight"):
+            nexus_preflight = nexus_install_preflight(mid)
+            if nexus_preflight.get("install_blocked"):
+                return json.dumps(nexus_preflight, ensure_ascii=False, indent=2)
+            installed = find_installed_duplicate(
+                slug, "nexus", str(mid),
+                target_name=str(nexus_preflight.get("name") or ""),
+            )
+            if installed:
+                cache_cleanup = downloader.cleanup_installed_archive(local_path)
+                return json.dumps({
+                    "status": "already_installed",
+                    "already_installed": True,
+                    "install_skipped": True,
+                    "mod_id": str(mid),
+                    "installed_id": str(installed.id),
+                    "name": installed.name,
+                    "version": installed.version,
+                    "cache_cleanup": cache_cleanup,
+                    "message": (
+                        "安装前文件身份核验发现当前游戏已经存在同一 Mod；"
+                        "未创建快照，也未写入第二份文件。"
+                    ),
+                }, ensure_ascii=False)
 
         try:
             dependency_preflight = stardew.archive_dependency_preflight(
