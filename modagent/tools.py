@@ -741,10 +741,12 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not comm:
             return json.dumps({"error": f"《{cfg.game_name}》似乎不在 Thunderstore 上（社区名未匹配）。"}, ensure_ascii=False)
         attempts = 1
+        catalog_refreshed = False
         try:
             results = thunderstore.search(comm, q)
             if not results:
                 attempts = 2
+                catalog_refreshed = True
                 results = thunderstore.search(comm, q, force_refresh=True)
         except Exception as e:
             return json.dumps({
@@ -753,6 +755,8 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "source": "thunderstore",
                 "community": comm,
                 "attempts": attempts,
+                "query_attempts": [q] if q else [],
+                "catalog_refreshed": catalog_refreshed,
                 "results": [],
                 "error": f"Thunderstore 搜索失败: {e}",
                 "note": "本次来源不可用，不能解释为没有相关 Mod。",
@@ -764,10 +768,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "source": "thunderstore",
                 "community": comm,
                 "attempts": attempts,
+                "query_attempts": [q] if q else [],
+                "catalog_refreshed": catalog_refreshed,
                 "results": [],
                 "note": (
-                    f"Thunderstore「{comm}」社区两次查询均未命中「{q}」；"
-                    "这不代表该社区或相关 Mod 不存在，可更换关键词重试。"
+                    f"Thunderstore「{comm}」社区目录中未匹配到「{q}」；"
+                    "已刷新一次目录缓存，但没有更换查询词。"
+                    "这不代表该社区或相关 Mod 不存在，可尝试更具体的功能词。"
                 ),
             }, ensure_ascii=False)
         return json.dumps({
@@ -776,6 +783,8 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "source": "thunderstore",
             "community": comm,
             "attempts": attempts,
+            "query_attempts": [q] if q else [],
+            "catalog_refreshed": catalog_refreshed,
             "results": results,
         }, ensure_ascii=False, indent=2)
 

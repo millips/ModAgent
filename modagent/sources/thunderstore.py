@@ -2,6 +2,7 @@
 包格式标准化、API 全公开、无需认证/登录/浏览器。"""
 import re
 import time
+from math import log10
 
 from . import _http_json, _safe, _dest
 from .. import downloader
@@ -9,6 +10,242 @@ from .. import downloader
 _COMMUNITIES = None              # 缓存社区列表
 _PKG_CACHE = {}                  # community -> (ts, packages)
 _PKG_TTL = 600                   # 包列表缓存 10 分钟
+
+
+_SEARCH_ALIASES = {
+    "map": {
+        "map", "maps", "radar", "navigation", "navigator",
+        "地图", "雷达", "导航",
+    },
+    "minimap": {
+        "minimap", "mini map", "小地图",
+    },
+    "player": {
+        "player", "players", "teammate", "teammates", "team", "teams",
+        "spectator", "spectators", "multiplayer", "coop", "co op",
+        "玩家", "队友", "队伍", "多人", "联机",
+    },
+    "enemy": {
+        "enemy", "enemies", "monster", "monsters", "creature", "creatures",
+        "敌人", "敌怪", "怪物",
+    },
+    "item": {
+        "item", "items", "valuable", "valuables", "loot",
+        "物品", "道具", "战利品", "贵重物",
+    },
+    "inventory": {
+        "inventory", "inventories", "slot", "slots", "backpack",
+        "背包", "物品栏", "格子", "槽位",
+    },
+    "upgrade": {
+        "upgrade", "upgrades", "level", "levels",
+        "升级", "强化", "等级",
+    },
+    "revive": {
+        "revive", "revival", "resurrect", "respawn",
+        "复活", "救援", "重生",
+    },
+    "health": {
+        "health", "heal", "healing", "hp", "life",
+        "生命", "血量", "治疗", "回血",
+    },
+    "stamina": {
+        "stamina", "sprint", "running", "run",
+        "体力", "耐力", "冲刺", "奔跑",
+    },
+    "cosmetic": {
+        "cosmetic", "cosmetics", "skin", "skins", "appearance",
+        "外观", "皮肤", "装饰",
+    },
+}
+_SEARCH_STOPWORDS = {
+    "a", "an", "and", "the", "for", "from", "in", "of", "on", "or", "to",
+    "with", "mod", "mods", "repo", "r", "e", "p", "o", "find", "search",
+    "show", "display", "add", "adds", "please", "want", "need",
+}
+_SEARCH_NEGATIONS = {
+    "no", "not", "never", "without", "disable", "disables", "remove",
+    "removes", "不", "不会", "没有", "无", "禁用", "移除",
+}
+
+
+def _search_text(value: str) -> str:
+    """Normalize package/query text while preserving CJK search terms."""
+    text = str(value or "")
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = text.replace("_", " ").replace("-", " ")
+    text = re.sub(r"[^0-9A-Za-z\u3400-\u9fff]+", " ", text).lower()
+    return " ".join(text.split())
+
+
+def _query_concepts(query: str) -> list[tuple[str, set[str]]]:
+    """Turn natural search text into de-duplicated semantic search groups."""
+    normalized = _search_text(query)
+    raw_lower = str(query or "").lower()
+    token_to_concept = {}
+    for concept, aliases in _SEARCH_ALIASES.items():
+        for alias in aliases:
+            token_to_concept[_search_text(alias)] = concept
+
+    concepts = []
+    seen = set()
+    for concept, aliases in _SEARCH_ALIASES.items():
+        if (
+            concept == "map"
+            and "小地图" in raw_lower
+            and raw_lower.count("地图") == raw_lower.count("小地图")
+        ):
+            continue
+        if any(
+            any("\u3400" <= char <= "\u9fff" for char in alias)
+            and alias in raw_lower
+            for alias in aliases
+        ):
+            concepts.append((concept, aliases))
+            seen.add(concept)
+
+    for token in normalized.split():
+        if token in _SEARCH_STOPWORDS or len(token) < 2:
+            continue
+        concept = token_to_concept.get(token, token)
+        if (
+            concept == token
+            and any("\u3400" <= char <= "\u9fff" for char in token)
+            and seen
+        ):
+            # A continuous Chinese sentence is context for the known concepts
+            # found above, not an additional literal term to require.
+            continue
+        if concept in seen:
+            continue
+        aliases = _SEARCH_ALIASES.get(concept, {token})
+        concepts.append((concept, aliases))
+        seen.add(concept)
+    return concepts
+
+
+def _contains_alias(normalized: str, aliases: set[str]) -> bool:
+    tokens = normalized.split()
+    for alias in aliases:
+        alias_tokens = _search_text(alias).split()
+        if not alias_tokens:
+            continue
+        width = len(alias_tokens)
+        for index in range(0, len(tokens) - width + 1):
+            if tokens[index:index + width] != alias_tokens:
+                continue
+            context = tokens[max(0, index - 3):index]
+            if any(token in _SEARCH_NEGATIONS for token in context):
+                continue
+            return True
+    return False
+
+
+def _package_search_score(package: dict, query: str) -> dict | None:
+    """Score a package by concept coverage, field quality and popularity."""
+    versions = package.get("versions") or [{}]
+    description = versions[0].get("description", "") if versions else ""
+    name = _search_text(package.get("name", ""))
+    owner = _search_text(package.get("owner", ""))
+    desc = _search_text(description)
+    concepts = _query_concepts(query)
+    literal_query_tokens = {
+        token for token in _search_text(query).split()
+        if token not in _SEARCH_STOPWORDS and len(token) >= 2
+    }
+    literal_name_hits = len(literal_query_tokens.intersection(name.split()))
+    downloads = package.get("total_downloads") or sum(
+        version.get("downloads", 0) for version in versions
+    )
+
+    if not concepts:
+        return {
+            "score": log10(max(0, downloads) + 1),
+            "coverage": 1.0,
+            "matched": [],
+            "missing": [],
+            "weak_matches": [],
+            "intent_penalties": [],
+            "name_hits": 0,
+            "literal_name_hits": 0,
+            "mode": "browse",
+        }
+
+    matched = []
+    missing = []
+    weak_matches = []
+    name_hits = 0
+    score = 0.0
+    matched_weight = 0.0
+    for concept, aliases in concepts:
+        field_score = 0
+        if _contains_alias(name, aliases):
+            field_score = 20
+            name_hits += 1
+        elif _contains_alias(desc, aliases):
+            field_score = 8
+        elif _contains_alias(owner, aliases):
+            field_score = 3
+        weak = False
+        if not field_score and concept in {"map", "minimap"}:
+            sibling = "map" if concept == "minimap" else "minimap"
+            weak_aliases = _SEARCH_ALIASES[sibling]
+            if _contains_alias(name, weak_aliases):
+                field_score = 10
+                name_hits += 1
+                weak = True
+            elif _contains_alias(desc, weak_aliases):
+                field_score = 4
+                weak = True
+        if field_score:
+            matched.append(concept)
+            score += field_score
+            matched_weight += 0.5 if weak else 1.0
+            if weak:
+                weak_matches.append(concept)
+        else:
+            missing.append(concept)
+
+    if not matched:
+        return None
+
+    coverage = matched_weight / len(concepts)
+    concept_names = {concept for concept, _aliases in concepts}
+    intent_penalties = []
+    package_text = f"{name} {desc}"
+    if (
+        "minimap" in concept_names
+        and "upgrade" not in concept_names
+        and "count" not in concept_names
+        and (
+            " upgrade " in f" {package_text} "
+            or " upgrades " in f" {package_text} "
+            or " player count " in f" {package_text} "
+        )
+    ):
+        intent_penalties.append("unsolicited_upgrade_or_player_count")
+        coverage = max(0.0, coverage - 0.34)
+        score -= 20
+    score += (
+        coverage * 30
+        + literal_name_hits * 6
+        + min(7.0, log10(max(0, downloads) + 1))
+    )
+    return {
+        "score": round(score, 3),
+        "coverage": round(coverage, 3),
+        "matched": matched,
+        "missing": missing,
+        "weak_matches": weak_matches,
+        "intent_penalties": intent_penalties,
+        "name_hits": name_hits,
+        "literal_name_hits": literal_name_hits,
+        "mode": (
+            "strict"
+            if not missing and not weak_matches and not intent_penalties
+            else "relaxed"
+        ),
+    }
 
 
 def list_communities() -> list:
@@ -97,13 +334,12 @@ def search(community: str, query: str, limit: int = 12,
            force_refresh: bool = False) -> list:
     """在某社区(=游戏)的包列表里按名称/作者/简介搜，按下载量排序。"""
     pkgs = _packages(community, force_refresh=force_refresh)
-    q = (query or "").strip().lower()
     out = []
     for p in pkgs:
         versions = p.get("versions") or [{}]
         desc = versions[0].get("description", "") if versions else ""
-        hay = f"{p.get('name','')} {p.get('owner','')} {desc}".lower()
-        if not q or q in hay:
+        match = _package_search_score(p, query)
+        if match:
             # v1 接口下载量在各版本里，累加得总量
             dl = p.get("total_downloads") or sum(v.get("downloads", 0) for v in versions)
             out.append({
@@ -124,6 +360,16 @@ def search(community: str, query: str, limit: int = 12,
                 ),
                 "_detail_verified": bool(versions),
                 "verification_source": "thunderstore_catalog",
+                "search_match": match,
             })
-    out.sort(key=lambda x: x["downloads"], reverse=True)
+    out.sort(
+        key=lambda item: (
+            item["search_match"]["coverage"],
+            item["search_match"]["literal_name_hits"],
+            item["search_match"]["name_hits"],
+            item["search_match"]["score"],
+            item["downloads"],
+        ),
+        reverse=True,
+    )
     return out[:limit]
