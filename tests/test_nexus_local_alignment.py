@@ -38,6 +38,19 @@ try:
     assert aligned["summary"]["bound"] == 1, aligned
     binding = db.get_mod_source_binding("local_cet", "cyberpunk2077")
     assert binding["source"] == "nexus" and binding["source_key"] == "107", binding
+
+    # A second bulk/single-item alignment reuses the durable binding and never
+    # spends another search request on the same Mod.
+    nexus.search = lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("already-bound Mod must not be searched again"))
+    repeated = source_alignment.align_installed_mods(
+        cfg, mod_ids=["local_cet"],
+    )
+    assert repeated["attempted"] == 0, repeated
+    assert repeated["summary"]["bound"] == 0, repeated
+    assert repeated["summary"]["already_bound"] == 1, repeated
+
     checked = json.loads(tools.execute("mod_update_check", {}, cfg))
     row = next(item for item in checked["items"] if item["mod_id"] == "local_cet")
     assert row["status"] == "update_available" and row["can_update"] is True, row

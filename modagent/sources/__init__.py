@@ -1,22 +1,51 @@
 """多来源 Mod 适配器。每个来源实现 download(url, game_slug, progress_callback) -> dict。
 下载下来的压缩包统一进 downloads/<game_slug>/，之后复用现有的解压/安装/快照流水线。"""
 import json
+import gzip
 import os
 import re
 import ssl
+import time
 import urllib.request
 
 from .. import downloader
 
 
-def _http_json(url: str, headers: dict = None) -> dict:
+class RequestCancelled(RuntimeError):
+    pass
+
+
+def _http_json(
+    url: str, headers: dict = None, *, timeout: int = 12,
+    total_timeout: int = 60, cancel_check=None,
+) -> dict:
     ctx = ssl._create_unverified_context()
-    h = {"User-Agent": "ModAgent/1.0", "Accept": "application/json"}
+    h = {
+        "User-Agent": "ModAgent/1.3",
+        "Accept": "application/json",
+        # Thunderstore's community catalogue is tens of megabytes without
+        # compression. Browsers request gzip automatically; urllib does not.
+        "Accept-Encoding": "gzip",
+    }
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, headers=h)
-    with urllib.request.urlopen(req, context=ctx, timeout=20) as r:
-        return json.loads(r.read())
+    started = time.monotonic()
+    chunks = []
+    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+        while True:
+            if cancel_check and cancel_check():
+                raise RequestCancelled("用户已取消当前网络任务")
+            if total_timeout and time.monotonic() - started > total_timeout:
+                raise TimeoutError(f"请求总耗时超过 {total_timeout} 秒")
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        if str(r.headers.get("Content-Encoding") or "").casefold() == "gzip":
+            raw = gzip.decompress(raw)
+        return json.loads(raw)
 
 
 def _safe(name: str) -> str:

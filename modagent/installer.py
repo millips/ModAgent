@@ -886,6 +886,96 @@ def plan_custom_targets(game_root: str, mapping: dict) -> dict:
     return {"valid": valid, "rejected": rejected}
 
 
+def preview_custom_install(
+    archive_path: str,
+    game_root: str,
+    game_slug: str,
+    mapping: dict,
+) -> dict:
+    """Inspect explicit archive mappings without writing to the game."""
+    plan = plan_custom_targets(game_root, mapping)
+    real_root = os.path.realpath(game_root)
+    installed_files = {
+        os.path.normcase(os.path.realpath(path)): owner
+        for path, owner in _get_installed_files_map(game_slug).items()
+    }
+    archive_files = set()
+    with tempfile.TemporaryDirectory() as tmp:
+        extract_archive(archive_path, tmp)
+        walk_root = _strip_wrapper_dirs(tmp)
+        for current, _, files in os.walk(walk_root):
+            for filename in files:
+                archive_files.add(
+                    os.path.relpath(
+                        os.path.join(current, filename), walk_root,
+                    ).replace("\\", "/")
+                )
+
+    rejected_by_source = {
+        str(item.get("src") or ""): str(item.get("reason") or "")
+        for item in plan.get("rejected", [])
+    }
+    checked = []
+    missing_sources = []
+    target_conflicts = []
+    for src_rel, dst_rel in (mapping or {}).items():
+        source = str(src_rel).replace("\\", "/").lstrip("/")
+        if source not in archive_files:
+            missing_sources.append(source)
+            continue
+        rel, reason = _validate_custom_target(game_root, real_root, dst_rel)
+        if not rel:
+            rejected_by_source[source] = reason
+            continue
+        destination = os.path.normpath(
+            os.path.join(game_root, rel.replace("/", os.sep))
+        )
+        destination_key = os.path.normcase(os.path.realpath(destination))
+        owner = installed_files.get(destination_key, "")
+        exists = os.path.exists(destination)
+        disabled_exists = os.path.exists(destination + ".disabled")
+        conflict = None
+        if owner:
+            conflict = {
+                "source": source,
+                "target": rel,
+                "path": destination,
+                "kind": "installed_mod_file",
+                "owned_by": owner,
+            }
+        elif exists or disabled_exists:
+            conflict = {
+                "source": source,
+                "target": rel,
+                "path": destination,
+                "kind": "unmanaged_existing_file",
+                "owned_by": "",
+                "disabled_copy": bool(disabled_exists and not exists),
+            }
+        if conflict:
+            target_conflicts.append(conflict)
+        checked.append({
+            "source": source,
+            "target": rel,
+            "exists": bool(exists or disabled_exists),
+        })
+
+    return {
+        "archive_file_count": len(archive_files),
+        "mapping_count": len(mapping or {}),
+        "checked_mappings": checked,
+        "missing_archive_sources": missing_sources,
+        "rejected_targets": [
+            {"src": source, "reason": reason}
+            for source, reason in rejected_by_source.items()
+        ],
+        "target_conflicts": target_conflicts,
+        "safe_to_install": not (
+            missing_sources or rejected_by_source or target_conflicts
+        ),
+    }
+
+
 def install_mod_custom(archive_path: str, game_root: str, game_slug: str,
                        mapping: dict) -> dict:
     """T2 通用安装:按 agent 产出的显式 mapping(包内相对路径 → 游戏内相对路径)落位。
@@ -1134,7 +1224,7 @@ def conflict_check(archive_path: str, game_root: str, game_slug: str) -> dict:
                        f"但已列出包内 {len(archive_contents)} 个文件供参考(见 archive_contents)。",
         }
 
-    installed_mods = _get_installed_files_map()
+    installed_mods = _get_installed_files_map(game_slug)
     conflicts = [{"file": f, "owned_by": installed_mods[f]}
                  for f in incoming_files if f in installed_mods]
 
@@ -1149,11 +1239,11 @@ def conflict_check(archive_path: str, game_root: str, game_slug: str) -> dict:
     }
 
 
-def _get_installed_files_map() -> dict[str, str]:
+def _get_installed_files_map(game_slug: str = "") -> dict[str, str]:
     result = {}
     try:
         from . import db
-        mods = db.get_installed_mods()
+        mods = db.get_installed_mods(game_slug)
         for m in mods:
             files = json.loads(m.files_installed) if isinstance(m.files_installed, str) else (m.files_installed or [])
             for f in files:

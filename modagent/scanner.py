@@ -235,6 +235,12 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
                        extra_roots: list[str] | None = None,
                        game_instance_id: str = "") -> dict:
     storage_id = game_instance_id or game_slug
+    # Heal historical aliases before comparing a fresh disk scan with the
+    # inventory.  Some older flows recorded the upstream row and then imported
+    # the package-directory name (for example MoneyValueTracker and
+    # 39_MoneyValueTracker) as a second row even though both owned the exact
+    # same DLL.  This is metadata-only: game files are never removed here.
+    db.merge_duplicate_inventory_rows(storage_id)
     identified = []
     unidentified = []
     detected = 0
@@ -247,6 +253,14 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
             _stored_files(mod.files_installed)
         ))
     }
+    existing_owned_file_sets = [frozenset(item) for item in existing_file_signatures]
+
+    def already_owned_by_package(signature) -> bool:
+        """True when every scanned file already belongs to one package row."""
+        candidate = frozenset(signature or ())
+        return bool(candidate) and any(
+            candidate <= owned for owned in existing_owned_file_sets
+        )
     scanned_roots = [os.path.abspath(game_root)] if game_root else []
     missing_roots = []
     manifest_roots: set[str] = set()
@@ -308,7 +322,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
             continue
         detected += 1
         signature = _file_signature(g.get("files"))
-        if signature and signature in existing_file_signatures:
+        if already_owned_by_package(signature):
             continue
         if g["name"].lower() in existing_names:
             continue
@@ -319,12 +333,13 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
         })
         existing_names.add(g["name"].lower())
         existing_file_signatures.add(signature)
+        existing_owned_file_sets.append(frozenset(signature))
 
     # 0.5) Steam 创意工坊探测（文件在 game_root 之外的 workshop 目录，已订阅的 mod）
     for w in _scan_steam_workshop(game_root):
         detected += 1
         signature = _file_signature(w.get("files"))
-        if signature and signature in existing_file_signatures:
+        if already_owned_by_package(signature):
             continue
         if w["name"].lower() in existing_names:
             continue
@@ -335,6 +350,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
         })
         existing_names.add(w["name"].lower())
         existing_file_signatures.add(signature)
+        existing_owned_file_sets.append(frozenset(signature))
 
     # 0.75) Explicit manager/custom directories. MO2 virtual mods, purged
     # Vortex staging and Fluffy libraries are not necessarily visible below
@@ -348,7 +364,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
         for item in _scan_external_mod_root(normalized):
             detected += 1
             signature = _file_signature(item.get("files"))
-            if signature and signature in existing_file_signatures:
+            if already_owned_by_package(signature):
                 continue
             key = item["name"].lower()
             if key in existing_names:
@@ -361,6 +377,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
             })
             existing_names.add(key)
             existing_file_signatures.add(signature)
+            existing_owned_file_sets.append(frozenset(signature))
 
     # 没有该游戏的 Nexus 文件规则就到此为止（BepInEx 类游戏走通用探测即可）
     if game_slug not in GAME_MOD_PATHS:
@@ -390,7 +407,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
             continue
         full_paths = [os.path.join(game_root, f[0]) for f in files]
         signature = _file_signature(full_paths)
-        if signature and signature in existing_file_signatures:
+        if already_owned_by_package(signature):
             continue
         filenames = [f[1] for f in files]
         confidence = files[0][2] or "unknown"
@@ -403,6 +420,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
             })
             existing_names.add(wk["name"].lower())
             existing_file_signatures.add(signature)
+            existing_owned_file_sets.append(frozenset(signature))
             continue
 
         # Inventory is deliberately offline. Network matching here multiplied
@@ -418,6 +436,7 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
         })
         existing_names.add(name.lower())
         existing_file_signatures.add(signature)
+        existing_owned_file_sets.append(frozenset(signature))
 
     return {"detected": detected, "identified": identified, "unidentified": unidentified,
             "scanned_roots": scanned_roots, "missing_roots": missing_roots}
@@ -446,7 +465,13 @@ def import_mods(mods_to_import: list[dict]) -> int:
         existing_names = existing_names_by_game[game_slug]
         existing_files = existing_files_by_game[game_slug]
         signature = _file_signature(m.get("files"))
-        if signature and signature in existing_files:
+        # Import is a second safety boundary.  Even if a caller bypasses the
+        # normal scanner, never turn files already owned by one installed
+        # package into separate variant Mods.
+        if signature and any(
+            set(signature) <= set(owner_signature)
+            for owner_signature in existing_files
+        ):
             continue
         if m["name"].lower() in existing_names:
             continue

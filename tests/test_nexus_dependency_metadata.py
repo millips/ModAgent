@@ -26,4 +26,17 @@ bepinex = "Requirements:\n* BepInExPack\n* MenuLib\n\nUsage:\nPress F8."
 assert _extract_dependency_labels(bepinex) == ["BepInExPack", "MenuLib"]
 assert _extract_required_loader(bepinex, ["BepInExPack", "MenuLib"]) == "BepInEx"
 
+install_path_only = (
+    "Installation: place YAPYAP_MorePlayers.dll into "
+    "YAPYAP/BepInEx/plugins."
+)
+assert _extract_required_loader(
+    install_path_only, [], "MorePlayers(BepInEx)"
+) == "BepInEx"
+
+title_only = "No dependency list was published."
+assert _extract_required_loader(
+    title_only, [], "MorePlayers(BepInEx)"
+) == "BepInEx"
+
 print("ALL PASS")

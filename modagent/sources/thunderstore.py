@@ -1,15 +1,27 @@
 """Thunderstore 适配器：Unity/BepInEx 游戏（雨中冒险2、Lethal Company、Valheim、REPO 等）。
 包格式标准化、API 全公开、无需认证/登录/浏览器。"""
+import gzip
+import json
+import os
 import re
 import time
+from datetime import datetime, timezone
 from math import log10
 
 from . import _http_json, _safe, _dest
 from .. import downloader
+from ..config import CONFIG_DIR
 
 _COMMUNITIES = None              # 缓存社区列表
 _PKG_CACHE = {}                  # community -> (ts, packages)
 _PKG_TTL = 600                   # 包列表缓存 10 分钟
+_DISK_PKG_TTL = 24 * 3600        # 初次全量目录较大，跨进程复用一天
+_COMMUNITY_HINTS = {
+    "repo": "repo",
+    "lethalcompany": "lethal-company",
+    "riskofrain2": "riskofrain2",
+    "valheim": "valheim",
+}
 
 
 _SEARCH_ALIASES = {
@@ -58,6 +70,38 @@ _SEARCH_ALIASES = {
         "外观", "皮肤", "装饰",
     },
 }
+
+
+def _staleness(updated_at: str, threshold_days: int = 365) -> dict:
+    """Return an honest compatibility-risk hint, never a compatibility claim."""
+    text = str(updated_at or "").strip()
+    if not text:
+        return {
+            "stale": None,
+            "age_days": None,
+            "note": "来源未提供更新时间，无法据此核验当前游戏版本兼容性",
+        }
+    try:
+        value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        age_days = max(0, (datetime.now(timezone.utc) - value).days)
+    except (TypeError, ValueError):
+        return {
+            "stale": None,
+            "age_days": None,
+            "note": "来源更新时间无法解析，当前游戏版本兼容性待核验",
+        }
+    stale = age_days > threshold_days
+    return {
+        "stale": stale,
+        "age_days": age_days,
+        "note": (
+            f"约 {max(1, age_days // 30)} 个月未更新，未找到适配当前游戏版本的机器可读证据"
+            if stale else
+            "近期仍有更新，但 Thunderstore 未声明支持的具体游戏构建版本"
+        ),
+    }
 _SEARCH_STOPWORDS = {
     "a", "an", "and", "the", "for", "from", "in", "of", "on", "or", "to",
     "with", "mod", "mods", "repo", "r", "e", "p", "o", "find", "search",
@@ -76,6 +120,20 @@ def _search_text(value: str) -> str:
     text = text.replace("_", " ").replace("-", " ")
     text = re.sub(r"[^0-9A-Za-z\u3400-\u9fff]+", " ", text).lower()
     return " ".join(text.split())
+
+
+def _public_summary(value: str, limit: int = 140) -> str:
+    """Keep feature prose while excluding contact/group promotion."""
+    text = str(value or "")
+    patterns = (
+        r"(?:\b[A-Z0-9_.-]+\s*)?游戏(?:交流|讨论)?\s*QQ\s*群"
+        r"(?:群号|号码|号|：|:|\s)*\d{5,14}\s*[。.!！；;]?",
+        r"加入\s*QQ\s*群(?:群号|号码|号|：|:|\s)*\d{5,14}\s*[。.!！；;]?",
+        r"QQ\s*群(?:群号|号码|号|：|:|\s)*\d{5,14}\s*[。.!！；;]?",
+    )
+    for pattern in patterns:
+        text = re.sub(pattern, " ", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
 def _query_concepts(query: str) -> list[tuple[str, set[str]]]:
@@ -289,21 +347,102 @@ def find_community(game_name: str):
     return None
 
 
-def _packages(community: str, force_refresh: bool = False) -> list:
+def community_hint(game_name: str = "", game_slug: str = "") -> str:
+    """Resolve well-known community identifiers without a network round trip."""
+    for value in (game_slug, game_name):
+        normalized = re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+        if normalized in _COMMUNITY_HINTS:
+            return _COMMUNITY_HINTS[normalized]
+    return ""
+
+
+def _catalog_cache_path(community: str) -> str:
+    safe = re.sub(r"[^a-z0-9_-]+", "-", str(community or "").casefold()).strip("-")
+    return os.path.join(CONFIG_DIR, "cache", f"thunderstore-{safe or 'unknown'}.json.gz")
+
+
+def _load_disk_catalog(community: str) -> list | None:
+    path = _catalog_cache_path(community)
+    try:
+        if time.time() - os.path.getmtime(path) > _DISK_PKG_TTL:
+            return None
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            data = json.load(stream)
+        return data if isinstance(data, list) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _save_disk_catalog(community: str, packages: list) -> None:
+    path = _catalog_cache_path(community)
+    temp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with gzip.open(temp, "wt", encoding="utf-8", compresslevel=6) as stream:
+            json.dump(packages, stream, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temp, path)
+    except OSError:
+        try:
+            if os.path.exists(temp):
+                os.remove(temp)
+        except OSError:
+            pass
+
+
+def _packages(
+    community: str, force_refresh: bool = False, cancel_check=None,
+) -> list:
     now = time.time()
     cached = _PKG_CACHE.get(community)
     if not force_refresh and cached and now - cached[0] < _PKG_TTL:
         return cached[1]
-    pkgs = _http_json(f"https://thunderstore.io/c/{community}/api/v1/package/")
+    if not force_refresh:
+        disk_cached = _load_disk_catalog(community)
+        if disk_cached is not None:
+            _PKG_CACHE[community] = (now, disk_cached)
+            return disk_cached
+    url = f"https://thunderstore.io/c/{community}/api/v1/package/"
+    try:
+        pkgs = _http_json(
+            url, total_timeout=75, cancel_check=cancel_check,
+        )
+    except TypeError as exc:
+        # A few integrations/tests replace the transport with a minimal
+        # one-argument callable. Keep that extension point compatible.
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        pkgs = _http_json(url)
     if not isinstance(pkgs, list):
         raise RuntimeError("Thunderstore package API returned an invalid response")
     _PKG_CACHE[community] = (now, pkgs)
+    _save_disk_catalog(community, pkgs)
     return pkgs
 
 
-def list_packages(community: str, force_refresh: bool = False) -> list:
+def list_packages(
+    community: str, force_refresh: bool = False, cancel_check=None,
+) -> list:
     """Return the complete community package ledger for identity matching."""
-    return list(_packages(community, force_refresh=force_refresh))
+    return list(_packages(
+        community, force_refresh=force_refresh, cancel_check=cancel_check,
+    ))
+
+
+def get_package(namespace: str, name: str, *, cancel_check=None) -> dict:
+    """Fetch one known package directly; this avoids the full community ledger."""
+    namespace = str(namespace or "").strip()
+    name = str(name or "").strip()
+    if not namespace or not name:
+        raise ValueError("Thunderstore package identity is incomplete")
+    url = f"https://thunderstore.io/api/experimental/package/{namespace}/{name}/"
+    try:
+        return _http_json(
+            url, total_timeout=30, cancel_check=cancel_check,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return _http_json(url)
 
 
 def _parse(url: str):
@@ -325,9 +464,26 @@ def download(url: str, game_slug: str, progress_callback=None) -> dict:
     if not dlurl:
         raise RuntimeError("Thunderstore 包没有可下载版本")
     ver = latest.get("version_number", "")
+    updated_at = (
+        latest.get("date_created")
+        or latest.get("datetime_created")
+        or latest.get("created_at")
+        or ""
+    )
     dest = _dest(game_slug, f"ts_{_safe(ns)}_{_safe(name)}_{_safe(ver)}.zip")
     downloader.download_file(dlurl, dest, progress_callback)
-    return {"local_path": dest, "name": f"{ns}-{name}", "source": "thunderstore", "version": ver}
+    return {
+        "local_path": dest,
+        "name": f"{ns}-{name}",
+        "source": "thunderstore",
+        "version": ver,
+        "dependencies": latest.get("dependencies") or [],
+        "updated_at": updated_at,
+        "detail_verified": True,
+        "verification_source": "thunderstore_package_api",
+        "deprecated": bool(data.get("is_deprecated")),
+        "staleness": _staleness(updated_at),
+    }
 
 
 def search(community: str, query: str, limit: int = 12,
@@ -346,11 +502,27 @@ def search(community: str, query: str, limit: int = 12,
                 "name": p.get("name", ""),
                 "full_name": p.get("full_name", ""),
                 "url": p.get("package_url", ""),
-                "summary": desc[:140],
+                "summary": _public_summary(desc),
                 "downloads": dl,
                 "pinned": p.get("is_pinned", False),
                 "owner": p.get("owner", ""),
                 "latest_version": str(versions[0].get("version_number", "")) if versions else "",
+                "updated_at": (
+                    versions[0].get("date_created")
+                    or versions[0].get("datetime_created")
+                    or versions[0].get("created_at")
+                    or ""
+                    if versions else ""
+                ),
+                "staleness": _staleness(
+                    (
+                        versions[0].get("date_created")
+                        or versions[0].get("datetime_created")
+                        or versions[0].get("created_at")
+                        or ""
+                    ) if versions else ""
+                ),
+                "deprecated": bool(p.get("is_deprecated")),
                 "dependencies": (
                     versions[0].get("dependencies") or []
                     if versions else []

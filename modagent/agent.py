@@ -1,13 +1,17 @@
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _ToolTimeout
 from .config import Config, Tier
 from .prompts import build_prompt
 from .tools import build_tools_definitions, execute, refresh_local_inventory
 from . import db
+from . import task_control
 from .recommendation_ui import (
     apply_chinese_descriptions,
+    has_exact_target_candidate,
+    merge_recommendation_resolution,
     needs_chinese_name,
     needs_chinese_localization,
     promote_verified_recommendation,
@@ -18,25 +22,18 @@ from .recommendation_ui import (
 # 工具看门狗:任何工具超过此秒数未返回,视为卡死,返回错误让对话继续
 # (被卡住的线程无法强杀,会残留在后台,但 SSE 流不再被拖死)
 TOOL_TIMEOUT_S = 300
-TOOL_TIMEOUTS = {
-    "mod_recommend": 55,
-    "nexus_search": 45,
-    "workshop_search": 35,
-    "thunderstore_search": 35,
-    "github_search": 35,
-    "gamebanana_search": 35,
-}
 SEARCH_DISCOVERY_TOOLS = {
     "mod_recommend", "nexus_search", "workshop_search",
     "thunderstore_search", "github_search", "gamebanana_search",
 }
-SEARCH_TURN_BUDGET_S = 180
-SEARCH_TURN_MAX_CALLS = 6
 _TOOL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool")
 RECOMMENDATION_TARGET_TOOLS = {
     "nexus_get_detail", "mod_download", "mod_install",
     "batch_download", "mod_install_batch", "mod_install_custom",
     "download_from_url",
+}
+DOWNLOAD_EXECUTION_TOOLS = {
+    "mod_download", "download_from_url", "batch_download",
 }
 
 # P2.4:汇报事实校验(把 report_validator.py 放到 modagent/ 下)
@@ -150,6 +147,52 @@ STATUS_QUESTION_BLOCKED_TOOLS = REGENERATE_BLOCKED_TOOLS | {
     "mod_update_check",
 }
 
+# A diagnostic question authorizes inspection, not a configuration change.
+# Discovery is excluded too: missing local evidence must be reported instead
+# of silently turning diagnosis into a new-Mod recommendation flow.
+DIAGNOSTIC_SCOPE_BLOCKED_TOOLS = SEARCH_DISCOVERY_TOOLS | {
+    "browser_click", "browser_input",
+    "import_existing_mods",
+    "download_from_url", "workshop_install", "workshop_uninstall",
+    "mod_download", "batch_download",
+    "mod_install_batch", "mod_install", "mod_install_custom", "tool_extract",
+    "mod_uninstall",
+    "snapshot_create", "snapshot_restore", "snapshot_delete",
+    "mod_patch", "game_config_write", "mod_update", "mod_disable", "mod_enable",
+    "mod_dependency_set", "mod_source_align", "mod_source_bind",
+}
+
+
+def is_diagnostic_read_only_request(value: str) -> bool:
+    """Detect diagnosis/why questions that do not authorize a state change."""
+    text = str(value or "").strip().casefold().replace(" ", "")
+    if not text:
+        return False
+    diagnostic_terms = (
+        "为什么", "怎么回事", "什么原因", "诊断", "排查", "检查一下",
+        "不生效", "没生效", "没有生效", "报错", "异常", "崩溃", "黑屏",
+        "打不开", "进不去", "没有怪", "没怪", "怪不见", "怪都没有",
+        "一个怪都没有", "缺少依赖",
+        "没有依赖", "依赖缺失", "没有反应", "没反应", "没有效果",
+        "没效果", "不起作用", "不显示", "没显示", "没有显示",
+        "missingdependency", "notworking",
+    )
+    explicit_changes = (
+        "帮我禁用", "直接禁用", "确认禁用", "帮我卸载", "直接卸载",
+        "帮我删除", "直接删除", "帮我安装", "直接安装", "帮我更新",
+        "直接更新", "帮我修复", "直接修复", "帮我启用", "直接启用",
+        "帮我回滚", "直接回滚",
+        "disableit", "uninstallit", "removeit", "installit", "fixit",
+    )
+    symptom_after_action = (
+        any(term in text for term in ("按了之后", "启动后", "进游戏后", "安装后"))
+        and any(term in text for term in ("没有", "没", "只有", "仅有", "无"))
+    )
+    return (
+        (any(term in text for term in diagnostic_terms) or symptom_after_action)
+        and not any(term in text for term in explicit_changes)
+    )
+
 
 def is_status_only_question(value: str) -> bool:
     text = str(value or "").strip().casefold().replace(" ", "")
@@ -176,6 +219,79 @@ def is_status_only_question(value: str) -> bool:
     )
 
 
+def is_update_request(value: str) -> bool:
+    """Identify installed-Mod update work without confusing it with new recommendations."""
+    text = str(value or "").strip().casefold().replace(" ", "")
+    if not text:
+        return False
+    update_terms = (
+        "检查更新", "检测更新", "看看更新", "有没有更新", "可用更新",
+        "更新已有", "更新已装", "更新模组", "更新mod", "升级模组", "升级mod",
+        "帮我更新", "给我更新", "直接更新", "开始更新", "继续更新",
+        "同步最新版", "同步最新版本", "批量更新", "全部更新", "都更新",
+        "一键更新", "更新吧",
+        "checkupdates", "checkforupdates", "updatemods", "updatemymods",
+    )
+    if any(term in text for term in update_terms):
+        return True
+    recommendation_terms = ("推荐", "搜索", "搜一下", "找几个", "最火", "热门")
+    installed_scope = ("mod", "模组", "已安装", "现有", "这些", "它们", "所有")
+    update_action = ("更新", "升级", "同步")
+    return (
+        any(term in text for term in installed_scope)
+        and any(term in text for term in update_action)
+        and not any(term in text for term in recommendation_terms)
+    )
+
+
+def is_broad_recommendation_request(value: str) -> bool:
+    """Use the source-ledger aggregator for broad discovery requests."""
+    text = str(value or "").strip().casefold().replace(" ", "")
+    if not text:
+        return False
+    discovery = (
+        "推荐", "搜索", "搜一下", "找一下", "找找", "找几个", "有没有mod",
+        "有没有模组", "扩展mod", "扩展模组", "热门mod", "好玩的mod",
+    )
+    explicit_source = (
+        "nexus", "thunderstore", "github", "gamebanana",
+        "创意工坊", "steamworkshop",
+    )
+    return (
+        any(term in text for term in discovery)
+        and not any(term in text for term in explicit_source)
+        and not explicit_install_target(value)
+    )
+
+
+_ENTITY_ALIASES = {
+    "benplex": "BepInEx",
+    "beniplex": "BepInEx",
+    "bepin ex": "BepInEx",
+    "bepinex": "BepInEx",
+}
+
+
+def normalize_contextual_install_target(
+    target: dict[str, str], prior_reply: str = "",
+) -> tuple[dict[str, str], str]:
+    """Resolve common loader misspellings before any multi-source search."""
+    if not target:
+        return {}, ""
+    raw_name = str(target.get("name") or "").strip()
+    folded = re.sub(r"\s+", " ", raw_name.casefold())
+    canonical = _ENTITY_ALIASES.get(folded)
+    prior = str(prior_reply or "").casefold()
+    if canonical and (
+        canonical.casefold() in prior
+        or folded in _ENTITY_ALIASES
+    ):
+        normalized = dict(target)
+        normalized["name"] = canonical
+        return normalized, raw_name
+    return target, ""
+
+
 def is_short_install_confirmation(value: str, prior_reply: str = "") -> bool:
     text = str(value or "").strip().casefold().replace(" ", "")
     confirmations = {
@@ -185,6 +301,54 @@ def is_short_install_confirmation(value: str, prior_reply: str = "") -> bool:
     return text in confirmations and any(
         marker in prior for marker in ("安装计划", "确认安装", "确认？", "确认?")
     )
+
+
+def explicit_install_target(value: str) -> dict[str, str]:
+    """Extract one named/versioned Mod from a direct installation request."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return {}
+    deictic = re.search(
+        r"(.+?)(?:请|麻烦)?(?:帮我|给我)?(?:下载并安装|下载安装|安装|装上|装)"
+        r"\s*(?:一下)?\s*(?:这个|它)(?:\s*(?:mod|模组))?",
+        text,
+        flags=re.I,
+    )
+    raw_target = ""
+    if deictic:
+        candidates = re.findall(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{4,}", deictic.group(1),
+        )
+        if candidates:
+            raw_target = candidates[-1]
+    match = re.search(
+        r"(?:请|麻烦)?(?:帮我|给我)?(?:下载并安装|下载安装|安装|装上|装)"
+        r"\s*(?:一下|一个)?\s*[“\"']?(.+?)[”\"']?\s*(?:吧|试试|看看)?[。！!？?]?$",
+        text,
+        flags=re.I,
+    )
+    if not raw_target and not match:
+        return {}
+    if not raw_target:
+        raw_target = match.group(1).strip(" ：:，,。.!！?？\"'“”")
+    if not raw_target or raw_target.casefold() in {
+        "mod", "mods", "模组", "一个mod", "一个模组", "几个mod", "几个模组",
+        "这个", "它", "这个mod", "这个模组",
+    }:
+        return {}
+    raw_target = re.sub(
+        r"^(?:custom_)?(?:ts_)?", "", raw_target, flags=re.I,
+    )
+    version_match = re.search(
+        r"(?:^|[_\-\s])v?(\d+(?:\.\d+){1,4})$",
+        raw_target,
+        flags=re.I,
+    )
+    version = version_match.group(1) if version_match else ""
+    name = re.sub(
+        r"(?:[_\-\s])v?\d+(?:\.\d+){1,4}$", "", raw_target, flags=re.I,
+    ).strip(" _-")
+    return {"name": name or raw_target, "version": version}
 
 
 class Agent:
@@ -198,15 +362,23 @@ class Agent:
         self._current_user_msg = ""
         self._prior_assistant_text = ""
         self._turn_result_cache: dict[str, str] = {}
+        self._turn_terminal_download_failures: dict[str, str] = {}
+        self._turn_explicit_download_failure = ""
         self._destructive_preview_turns: dict[str, str | None] = {}
         self._status_only_turn = False
+        self._diagnostic_read_only_turn = False
         self._turn_started_monotonic = time.monotonic()
         self._turn_search_calls = 0
+        self._update_intent = False
+        self._update_completed_this_turn = False
         self._selection_action = ""
         self._selection_allowed_nexus_ids: set[str] = set()
+        self._selection_nexus_alias_ids: dict[str, str] = {}
         self._selection_allowed_source_urls: set[str] = set()
         self._selection_download_paths: set[str] = set()
         self._install_completed_this_turn = False
+        self._explicit_install_target: dict[str, str] = {}
+        self._explicit_target_found = False
 
     @property
     def client(self):
@@ -242,7 +414,65 @@ class Agent:
             "",
         )
 
+    @staticmethod
+    def _selection_alias(value: object) -> str:
+        """Normalize an exact selected-row label without enabling fuzzy matching."""
+        return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+    def _canonicalize_selected_nexus_args(self, name: str, args: dict) -> dict:
+        """Map an exact selected row label back to its verified Nexus ID."""
+        if self._selection_action != "confirm":
+            return args
+
+        def canonical(value: object) -> object:
+            raw = str(value or "").strip()
+            if not raw or raw in self._selection_allowed_nexus_ids:
+                return value
+            return self._selection_nexus_alias_ids.get(
+                self._selection_alias(raw), value
+            )
+
+        normalized = dict(args)
+        if name in {"nexus_get_detail", "mod_download", "mod_install"}:
+            normalized["mod_id"] = canonical(normalized.get("mod_id"))
+        elif name == "mod_install_batch":
+            normalized["mod_ids"] = [
+                canonical(item) for item in (normalized.get("mod_ids") or [])
+            ]
+        elif name == "batch_download":
+            normalized["mods"] = [
+                {**item, "mod_id": canonical(item.get("mod_id"))}
+                if isinstance(item, dict) else item
+                for item in (normalized.get("mods") or [])
+            ]
+        return normalized
+
     def _exec(self, name: str, args: dict) -> str:
+        if self._is_cancelled():
+            return self._cancelled_tool_result(name)
+        args = self._canonicalize_selected_nexus_args(name, args)
+        if (
+            self._diagnostic_read_only_turn
+            and name in DIAGNOSTIC_SCOPE_BLOCKED_TOOLS
+        ):
+            return json.dumps({
+                "error": "diagnostic_scope_change_blocked",
+                "tool": name,
+                "message": (
+                    "本轮用户只要求诊断原因，未授权修改游戏或 Mod 状态。"
+                    "请仅汇报本轮日志证据、已证实/未证实结论与建议；"
+                    "如需禁用、安装、更新或其他变更，必须另行征得明确同意。"
+                ),
+            }, ensure_ascii=False)
+        if self._update_intent and name in SEARCH_DISCOVERY_TOOLS:
+            return json.dumps({
+                "error": "update_search_scope_blocked",
+                "tool": name,
+                "message": (
+                    "本轮目标是检查或更新本机已安装 Mod；不得转入新 Mod 推荐。"
+                    "请使用 mod_update_check 的已安装清单继续，并在更新后直接汇报。"
+                ),
+            }, ensure_ascii=False)
         if self._install_completed_this_turn and name in SEARCH_DISCOVERY_TOOLS:
             return json.dumps({
                 "error": "post_install_search_blocked",
@@ -252,11 +482,26 @@ class Agent:
                     "请先向用户汇报本次安装结果，其他搜索必须等待新的明确请求。"
                 ),
             }, ensure_ascii=False)
+        if (
+            name in SEARCH_DISCOVERY_TOOLS
+            and self._explicit_install_target
+            and self._explicit_target_found
+        ):
+            return json.dumps({
+                "status": "exact_target_already_found",
+                "searched": False,
+                "target": self._explicit_install_target,
+                "message": (
+                    "本轮明确指定的 Mod 已找到精确来源；已停止继续扩展其他来源"
+                    "和无关候选，请直接整理该目标的详情、依赖与安装计划。"
+                ),
+            }, ensure_ascii=False)
         if self._selection_action in {"plan", "confirm"}:
             if self._selection_action == "confirm" and name == "snapshot_create":
                 return json.dumps({
-                    "error": "premature_snapshot_blocked",
+                    "status": "snapshot_deferred_to_verified_install",
                     "tool": name,
+                    "snapshot_created": False,
                     "message": (
                         "推荐确认阶段不得先单独创建快照。请直接调用安装工具；"
                         "它会先完成详情、加载器和依赖门禁，通过后才自动创建快照。"
@@ -321,7 +566,7 @@ class Agent:
                         ),
                     }, ensure_ascii=False)
         if (
-            name in {"mod_install", "mod_install_batch"}
+            name in {"mod_install", "mod_install_custom", "mod_install_batch"}
             and (
                 self._selection_action == "confirm"
                 or is_short_install_confirmation(
@@ -330,21 +575,22 @@ class Agent:
             )
         ):
             args = {**args, "require_verified_preflight": True}
+        if (
+            self._selection_action == "confirm"
+            and name in {"mod_download", "batch_download"}
+        ):
+            # Re-read source requirements before caching selected targets.
+            # This also protects confirmation state saved by older builds.
+            args = {**args, "require_verified_preflight": True}
+        if (
+            name in {"mod_install", "mod_install_custom"}
+            and self._explicit_install_target
+        ):
+            args = {**args, "require_verified_preflight": True}
         if name in SEARCH_DISCOVERY_TOOLS:
-            elapsed = time.monotonic() - self._turn_started_monotonic
-            if (
-                self._turn_search_calls >= SEARCH_TURN_MAX_CALLS
-                or elapsed >= SEARCH_TURN_BUDGET_S
-            ):
-                return json.dumps({
-                    "error": "search_budget_exhausted",
-                    "message": (
-                        "本轮搜索已达到时间或调用预算，已停止继续重试。"
-                        "请用现有已核验结果回答，并明确说明未解决部分。"
-                    ),
-                    "elapsed_seconds": round(elapsed, 1),
-                    "search_calls": self._turn_search_calls,
-                }, ensure_ascii=False)
+            # ModAgent no longer imposes a whole-turn time/call budget. Each
+            # source keeps its own finite network timeout, and the UI retains
+            # an explicit user-controlled stop action.
             self._turn_search_calls += 1
         if self._status_only_turn and name in STATUS_QUESTION_BLOCKED_TOOLS:
             return json.dumps({
@@ -381,6 +627,35 @@ class Agent:
                     "message": "当前用户确认的不是这项破坏性操作，已拒绝执行。请明确说明要卸载/回滚/删除快照后再确认。",
                 }, ensure_ascii=False)
         signature = name + ":" + json.dumps(args, ensure_ascii=False, sort_keys=True)
+        if (
+            name in DOWNLOAD_EXECUTION_TOOLS
+            and self._explicit_install_target
+            and self._turn_explicit_download_failure
+        ):
+            return json.dumps({
+                "error": "explicit_target_download_already_failed",
+                "status": "download_failed_terminal",
+                "tool": name,
+                "message": (
+                    "当前明确目标的下载已经在本轮终止；未换用其他来源、Mod ID "
+                    "或下载方式继续尝试。请先向用户报告失败并等待新的重试指令。"
+                ),
+                "automatic_retry_allowed": False,
+                "stop_further_downloads": True,
+                "continue_other_items": False,
+                "previous_failure": self._turn_explicit_download_failure,
+            }, ensure_ascii=False)
+        if (
+            name in DOWNLOAD_EXECUTION_TOOLS
+            and signature in self._turn_terminal_download_failures
+        ):
+            prior = json.loads(self._turn_terminal_download_failures[signature])
+            prior["reused_result"] = True
+            prior["message"] = (
+                "同一下载已在本轮终止，未再次联网重试。"
+                + str(prior.get("message") or "")
+            )
+            return json.dumps(prior, ensure_ascii=False)
         if name in {"mod_download", "download_from_url"} and signature in self._turn_result_cache:
             prior = json.loads(self._turn_result_cache[signature])
             prior["reused_result"] = True
@@ -388,12 +663,41 @@ class Agent:
             return json.dumps(prior, ensure_ascii=False)
         t0 = time.time()
         try:
-            fut = _TOOL_POOL.submit(execute, name, args, self.cfg)
-            timeout_seconds = TOOL_TIMEOUTS.get(name, TOOL_TIMEOUT_S)
-            result = fut.result(timeout=timeout_seconds)
+            def run_tool():
+                with task_control.bind(getattr(self, "_cancel_check", None)):
+                    task_control.raise_if_cancelled()
+                    return execute(name, args, self.cfg)
+
+            fut = _TOOL_POOL.submit(run_tool)
+            timeout_seconds = None if name in SEARCH_DISCOVERY_TOOLS else TOOL_TIMEOUT_S
+            if timeout_seconds is None:
+                while True:
+                    if self._is_cancelled():
+                        fut.cancel()
+                        return self._cancelled_tool_result(name)
+                    try:
+                        result = fut.result(timeout=.2)
+                        break
+                    except _ToolTimeout:
+                        continue
+            else:
+                deadline = time.monotonic() + timeout_seconds
+                while True:
+                    if self._is_cancelled():
+                        fut.cancel()
+                        return self._cancelled_tool_result(name)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _ToolTimeout()
+                    try:
+                        result = fut.result(timeout=min(.2, remaining))
+                        break
+                    except _ToolTimeout:
+                        if time.monotonic() >= deadline:
+                            raise
             ok = not self._is_error(result)
         except _ToolTimeout:
-            timeout_seconds = TOOL_TIMEOUTS.get(name, TOOL_TIMEOUT_S)
+            timeout_seconds = TOOL_TIMEOUT_S
             result = json.dumps({
                 "error": f"{name} 执行超时(>{timeout_seconds}s),已跳过。",
                 "hint": "该工具可能在遍历超大目录或等待外部资源。请换用其他方式完成当前目标,并向用户如实说明此工具超时。",
@@ -402,6 +706,18 @@ class Agent:
         except Exception as e:
             result = json.dumps({"error": f"{name} 执行异常: {e}"}, ensure_ascii=False)
             ok = False
+        if (
+            ok
+            and name in SEARCH_DISCOVERY_TOOLS
+            and self._explicit_install_target
+            and has_exact_target_candidate(
+                name,
+                result,
+                self._explicit_install_target.get("name", ""),
+                self._explicit_install_target.get("version", ""),
+            )
+        ):
+            self._explicit_target_found = True
         if name in {"snapshot_restore", "snapshot_delete", "mod_disable"} and not args.get("confirmed"):
             try:
                 preview = json.loads(result)
@@ -422,6 +738,24 @@ class Agent:
                     )
             except (ValueError, TypeError):
                 pass
+        elif not ok and name in DOWNLOAD_EXECUTION_TOOLS:
+            try:
+                parsed = json.loads(result)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                parsed = {}
+            if (
+                parsed.get("stop_further_downloads")
+                or parsed.get("terminal")
+                or parsed.get("status") in {
+                    "download_failed_terminal",
+                    "download_retry_exhausted",
+                }
+            ):
+                self._turn_terminal_download_failures[signature] = result
+                if self._explicit_install_target:
+                    self._turn_explicit_download_failure = str(
+                        parsed.get("message") or parsed.get("error") or "下载失败"
+                    )
         if ok and name in {"mod_install", "mod_install_custom", "mod_install_batch"}:
             try:
                 parsed = json.loads(result)
@@ -437,6 +771,13 @@ class Agent:
                 )
             ):
                 self._install_completed_this_turn = True
+        if ok and name == "mod_update":
+            try:
+                parsed = json.loads(result)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                parsed = {}
+            if parsed.get("updated"):
+                self._update_completed_this_turn = True
         if _HAS_TRACE and getattr(self.cfg, "dev_mode", False):
             try:
                 debug_trace.record_tool(name, args, result, (time.time() - t0) * 1000.0, ok,
@@ -444,6 +785,26 @@ class Agent:
             except Exception:
                 pass
         return result
+
+    def _is_cancelled(self) -> bool:
+        check = getattr(self, "_cancel_check", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _cancelled_tool_result(name: str) -> str:
+        return json.dumps({
+            "error": "task_cancelled",
+            "status": "cancelled",
+            "tool": name,
+            "message": "用户已停止本轮任务；旧轮次不会继续执行或写回结果。",
+            "stop_further_downloads": True,
+            "automatic_retry_allowed": False,
+        }, ensure_ascii=False)
 
     def _emit(self, obj: dict) -> str:
         """统一出口:发 SSE 事件的同时(dev 模式下)记进 trace。"""
@@ -466,10 +827,31 @@ class Agent:
                     "detail_verification_required",
                     "missing_dependencies",
                     "incompatible_loader",
+                    "compatibility_confirmation_required",
+                    "preinstall_confirmation_required",
                 }
             )
         except (json.JSONDecodeError, ValueError):
             return result.strip().startswith(("错误", "Error", "[ERR]"))
+
+    @staticmethod
+    def _terminal_download_failure_message(result: str) -> str:
+        """Return a final user-facing reason when this turn must stop downloading."""
+        try:
+            data = json.loads(result)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        if not data.get("stop_further_downloads"):
+            return ""
+        if data.get("continue_other_items") is not False:
+            return ""
+        return str(
+            data.get("message")
+            or data.get("error")
+            or "下载未完成，已停止本轮后续下载。"
+        )
 
     @staticmethod
     def _tool_summary(name: str, result: str, ok: bool) -> str:
@@ -490,7 +872,14 @@ class Agent:
             data = {}
         if not ok:
             message = str(data.get("message") or data.get("error") or "操作未完成")
-            return "未完成：" + (message[:72] + ("…" if len(message) > 72 else ""))
+            if data.get("http_status"):
+                message = f"{message}（HTTP {data['http_status']}）"
+            return "未完成：" + (message[:120] + ("…" if len(message) > 120 else ""))
+        if (
+            name == "snapshot_create"
+            and data.get("status") == "snapshot_deferred_to_verified_install"
+        ):
+            return "安全快照已顺延：通过安装前核验后由安装器自动创建"
         if name == "snapshot_restore":
             if data.get("requires_confirmation"):
                 pv = data.get("preview") or {}
@@ -677,17 +1066,86 @@ class Agent:
 
     def chat(self, user_msg: str) -> str:
         self._current_user_msg = user_msg
-        self._turn_started_monotonic = time.monotonic()
-        self._turn_search_calls = 0
-        self._status_only_turn = is_status_only_question(user_msg)
         self._prior_assistant_text = next((str(m.get("content") or "") for m in reversed(self.history)
                                            if m.get("role") == "assistant" and m.get("content")), "")
+        self._explicit_install_target, normalized_from = (
+            normalize_contextual_install_target(
+                explicit_install_target(user_msg), self._prior_assistant_text,
+            )
+        )
+        self._explicit_target_found = False
+        self._turn_started_monotonic = time.monotonic()
+        self._turn_search_calls = 0
+        self._update_intent = is_update_request(user_msg)
+        self._update_completed_this_turn = False
+        self._status_only_turn = is_status_only_question(user_msg)
+        self._diagnostic_read_only_turn = is_diagnostic_read_only_request(user_msg)
         self._turn_result_cache = {}
+        self._turn_terminal_download_failures = {}
+        self._turn_explicit_download_failure = ""
         system = build_prompt(self.cfg)
         tools = build_tools_definitions(self.cfg.tier)
+        if self._update_intent:
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name") not in SEARCH_DISCOVERY_TOOLS
+            ]
+        if self._diagnostic_read_only_turn:
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name")
+                not in DIAGNOSTIC_SCOPE_BLOCKED_TOOLS
+            ]
+        if is_broad_recommendation_request(user_msg):
+            tools = [
+                tool for tool in tools
+                if (
+                    tool.get("function", {}).get("name")
+                    not in SEARCH_DISCOVERY_TOOLS
+                    or tool.get("function", {}).get("name") == "mod_recommend"
+                )
+            ]
         messages = [{"role": "system", "content": system}]
         self.history = sanitize_tool_history(self.history)
         messages.extend(self.history)
+        if self._update_intent:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "本轮是本机已安装 Mod 的检查更新/执行更新任务。"
+                    "只围绕 get_installed、mod_source_align、mod_update_check 和 mod_update 闭环；"
+                    "禁止搜索或推荐新的 Mod。若更新成功，立即汇报更新结果并结束本轮。"
+                ),
+            })
+        if self._diagnostic_read_only_turn:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "本轮是独立的只读故障诊断。不得复用其他问题的候选 Mod、"
+                    "待确认动作或处置结论，不得禁用、启用、卸载、安装、更新或修改配置。"
+                    "只使用本轮日志和本轮工具证据回答当前症状；"
+                    "调用栈中的全局日志处理器不是异常归属证据。"
+                ),
+            })
+        if self._explicit_install_target:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "本轮是安装一个明确指定的 Mod，不是开放式推荐。"
+                    "只能按精确名称和用户指定版本定位该目标；不得把相似、热门或"
+                    "顺带搜到的其他 Mod 当作候选。找到精确来源后立即停止继续搜索。"
+                    "依赖清单只能包含该目标实际声明的必要依赖；来源页里的 QQ 群、"
+                    "社群、捐赠和作者宣传文字不得作为功能简介。"
+                    "\n明确目标：" + json.dumps(
+                        self._explicit_install_target, ensure_ascii=False
+                    )
+                    + (
+                        f"\n实体归一：用户的“{normalized_from}”按 BepInEx 处理；"
+                        "不得再用错误拼写全源盲搜。"
+                        if normalized_from else ""
+                    )
+                ),
+            })
         messages.append({"role": "user", "content": user_msg})
 
         # persist:本轮要写回 history 的"干净"消息(不含系统纠偏)
@@ -715,6 +1173,7 @@ class Agent:
                         "arguments": tc.function.arguments}} for tc in msg.tool_calls]
                 a_msg = self._assistant_toolcall_msg(msg.content or "", tcd)
                 messages.append(a_msg); persist.append(a_msg)
+                terminal_download_message = ""
                 for tc in msg.tool_calls:
                     try:
                         args = json.loads(tc.function.arguments)
@@ -723,6 +1182,18 @@ class Agent:
                     result = self._exec(tc.function.name, args)
                     t_msg = {"role": "tool", "tool_call_id": tc.id, "content": result}
                     messages.append(t_msg); persist.append(t_msg)
+                    terminal_download_message = (
+                        terminal_download_message
+                        or self._terminal_download_failure_message(result)
+                    )
+                if terminal_download_message:
+                    reply = (
+                        f"下载未完成：{terminal_download_message}"
+                        " 本轮已结束，没有继续换源或重复下载。"
+                    )
+                    persist.append({"role": "assistant", "content": reply})
+                    self.history.extend(persist)
+                    return reply
                 empty_retries = 0
                 continue
 
@@ -777,12 +1248,27 @@ class Agent:
         completed_effects: list[str] | None = None,
         recommendation_selection: list[dict] | None = None,
         selection_action: str = "",
+        cancel_check=None,
     ):
+        self._cancel_check = cancel_check
         self._current_user_msg = user_msg
+        self._prior_assistant_text = next((str(m.get("content") or "") for m in reversed(self.history)
+                                           if m.get("role") == "assistant" and m.get("content")), "")
+        self._explicit_install_target, normalized_from = (
+            normalize_contextual_install_target(
+                explicit_install_target(user_msg), self._prior_assistant_text,
+            )
+        )
+        self._explicit_target_found = False
         self._turn_started_monotonic = time.monotonic()
         self._turn_search_calls = 0
+        self._update_intent = is_update_request(user_msg)
+        self._update_completed_this_turn = False
+        self._diagnostic_read_only_turn = is_diagnostic_read_only_request(user_msg)
         self._selection_action = (
-            selection_action if selection_action in {"plan", "confirm"} else ""
+            selection_action
+            if selection_action in {"resolve", "plan", "confirm"}
+            else ""
         )
         self._selection_allowed_nexus_ids = {
             str(item.get("mod_id") or item.get("source_id") or "")
@@ -793,6 +1279,33 @@ class Agent:
                 and str(item.get("mod_id") or item.get("source_id") or "")
             )
         }
+        nexus_alias_candidates: dict[str, set[str]] = {}
+        for item in recommendation_selection or []:
+            if (
+                not isinstance(item, dict)
+                or str(item.get("source") or "").casefold() != "nexus"
+            ):
+                continue
+            canonical_id = str(
+                item.get("mod_id") or item.get("source_id") or ""
+            ).strip()
+            if canonical_id not in self._selection_allowed_nexus_ids:
+                continue
+            for alias_value in (
+                item.get("name"),
+                item.get("localized_name"),
+                item.get("selection_key"),
+            ):
+                alias = self._selection_alias(alias_value)
+                if alias:
+                    nexus_alias_candidates.setdefault(alias, set()).add(
+                        canonical_id
+                    )
+        self._selection_nexus_alias_ids = {
+            alias: next(iter(ids))
+            for alias, ids in nexus_alias_candidates.items()
+            if len(ids) == 1
+        }
         self._selection_allowed_source_urls = {
             str(item.get("url") or "").strip()
             for item in (recommendation_selection or [])
@@ -801,11 +1314,22 @@ class Agent:
         self._selection_download_paths = set()
         self._install_completed_this_turn = False
         self._status_only_turn = is_status_only_question(user_msg)
-        self._prior_assistant_text = next((str(m.get("content") or "") for m in reversed(self.history)
-                                           if m.get("role") == "assistant" and m.get("content")), "")
         self._turn_result_cache = {}
+        self._turn_terminal_download_failures = {}
+        self._turn_explicit_download_failure = ""
         system = build_prompt(self.cfg)
         tools = build_tools_definitions(self.cfg.tier)
+        if self._update_intent:
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name") not in SEARCH_DISCOVERY_TOOLS
+            ]
+        if self._diagnostic_read_only_turn:
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name")
+                not in DIAGNOSTIC_SCOPE_BLOCKED_TOOLS
+            ]
         if regenerate:
             tools = [
                 tool for tool in tools
@@ -817,9 +1341,37 @@ class Agent:
                 if tool.get("function", {}).get("name")
                 not in STATUS_QUESTION_BLOCKED_TOOLS
             ]
+        if is_broad_recommendation_request(user_msg):
+            tools = [
+                tool for tool in tools
+                if (
+                    tool.get("function", {}).get("name")
+                    not in SEARCH_DISCOVERY_TOOLS
+                    or tool.get("function", {}).get("name") == "mod_recommend"
+                )
+            ]
         messages = [{"role": "system", "content": system}]
         self.history = sanitize_tool_history(self.history)
         messages.extend(self.history)
+        if self._update_intent:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "本轮是本机已安装 Mod 的检查更新/执行更新任务。"
+                    "只围绕 get_installed、mod_source_align、mod_update_check 和 mod_update 闭环；"
+                    "禁止搜索或推荐新的 Mod。若更新成功，立即汇报更新结果并结束本轮。"
+                ),
+            })
+        if self._diagnostic_read_only_turn:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "本轮是独立的只读故障诊断。不得复用其他问题的候选 Mod、"
+                    "待确认动作或处置结论，不得禁用、启用、卸载、安装、更新或修改配置。"
+                    "只使用本轮日志和本轮工具证据回答当前症状；"
+                    "调用栈中的全局日志处理器不是异常归属证据。"
+                ),
+            })
         if self._status_only_turn:
             recommendation_context = {}
             try:
@@ -847,6 +1399,25 @@ class Agent:
                     + json.dumps(context_items, ensure_ascii=False)
                 ),
             })
+        if self._explicit_install_target:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "本轮是安装一个明确指定的 Mod，不是开放式推荐。"
+                    "只能按精确名称和用户指定版本定位该目标；不得把相似、热门或"
+                    "顺带搜到的其他 Mod 当作候选。找到精确来源后立即停止继续搜索。"
+                    "依赖清单只能包含该目标实际声明的必要依赖；来源页里的 QQ 群、"
+                    "社群、捐赠和作者宣传文字不得作为功能简介。"
+                    "\n明确目标：" + json.dumps(
+                        self._explicit_install_target, ensure_ascii=False
+                    )
+                    + (
+                        f"\n实体归一：用户的“{normalized_from}”按 BepInEx 处理；"
+                        "不得再用错误拼写全源盲搜。"
+                        if normalized_from else ""
+                    )
+                ),
+            })
         if regenerate:
             effects = [str(item)[:240] for item in (completed_effects or [])[:20]]
             effect_text = "；".join(effects) if effects else "上一轮已经执行的操作"
@@ -863,7 +1434,7 @@ class Agent:
         if (
             Tier.can(getattr(self.cfg, "tier", Tier.FREE), "structured_recommendations")
             and recommendation_selection
-            and selection_action in {"plan", "confirm"}
+            and selection_action in {"resolve", "plan", "confirm"}
         ):
             selection = []
             for item in recommendation_selection[:20]:
@@ -874,6 +1445,11 @@ class Agent:
                     "source": str(item.get("source") or "")[:40],
                     "source_id": str(item.get("source_id") or "")[:500],
                     "mod_id": item.get("mod_id"),
+                    "canonical_tool_mod_id": (
+                        item.get("mod_id") or item.get("source_id")
+                        if str(item.get("source") or "").casefold() == "nexus"
+                        else None
+                    ),
                     "name": str(item.get("name") or "")[:120],
                     "version": str(item.get("version") or "")[:48],
                     "url": str(item.get("url") or "")[:500],
@@ -891,7 +1467,22 @@ class Agent:
                         str(name)[:120] for name in (item.get("required_by") or [])[:8]
                     ],
                 })
-            if selection_action == "plan":
+            if selection_action == "resolve":
+                instruction = (
+                    "用户已在智能推荐决策表中自由勾选一项或多项“我要这个”，"
+                    "并点击了批量补齐按钮。本轮只补齐这些明确目标及其实际声明的必要依赖："
+                    "逐项核验目标详情、可下载文件、当前游戏版本、已安装环境、冲突和依赖闭包；"
+                    "必要依赖要按来源坐标精确搜索并核验，不得扩展成相似 Mod 推荐。"
+                    "只形成拟安装计划，不得下载、安装、创建快照或修改游戏文件。"
+                    "完成后刷新原智能推荐决策表；共享同一已满足或拟安装依赖的其他候选"
+                    "可以解除相同阻塞，但不得自动勾选其他目标。"
+                )
+                tools = [
+                    tool for tool in tools
+                    if tool.get("function", {}).get("name")
+                    not in REGENERATE_BLOCKED_TOOLS
+                ]
+            elif selection_action == "plan":
                 instruction = (
                     "用户刚在推荐决策表中选择了以下候选。请以这些稳定来源 ID 为准，"
                     "核验详情、版本、依赖和已知风险。安装计划必须先列出前置/必要依赖，"
@@ -924,6 +1515,14 @@ class Agent:
                 if tool.get("function", {}).get("name")
                 not in SEARCH_DISCOVERY_TOOLS
             ]
+            if selection_action == "confirm":
+                instruction += (
+                    "\nFor Nexus tools, pass canonical_tool_mod_id exactly as "
+                    "mod_id. Never put a display name, localized name, or "
+                    "selection_key into a mod_id argument. Do not call "
+                    "snapshot_create separately; the verified install tool "
+                    "creates the snapshot after its preflight passes."
+                )
             messages.append({
                 "role": "system",
                 "content": instruction + "\n结构化选择："
@@ -940,6 +1539,7 @@ class Agent:
         recommendation_evidence: list[tuple[str, str]] = []
         recommendation_update: dict = {}
         completed_install_names: list[str] = []
+        completed_update_names: list[str] = []
 
         # 开发者模式:开一个轮次(记录 pre_history 供重放)
         dev = _HAS_TRACE and getattr(self.cfg, "dev_mode", False)
@@ -955,6 +1555,8 @@ class Agent:
 
         try:
             for _ in range(MAX_ROUNDS):
+                if self._is_cancelled():
+                    break
                 try:
                     resp = self._stream(messages, tools)
                 except Exception as e:
@@ -965,6 +1567,8 @@ class Agent:
                     break
 
                 collected, tool_calls_data = self._consume_stream(resp)
+                if self._is_cancelled():
+                    break
 
                 # ── 有工具调用:预告文本不外发(P2.3),执行工具并回报真实状态 ──
                 if tool_calls_data:
@@ -975,12 +1579,17 @@ class Agent:
                         yield self._emit({"chunk": collected})
 
                     yield self._emit({"tool": [t["function"]["name"] for t in tool_calls_data]})
+                    terminal_download_message = ""
                     for t in tool_calls_data:
+                        if self._is_cancelled():
+                            break
                         try:
                             args = json.loads(t["function"]["arguments"])
                         except json.JSONDecodeError:
                             args = {}
                         result = self._exec(t["function"]["name"], args)
+                        if self._is_cancelled():
+                            break
                         if (
                             t["function"]["name"] in {
                                 "mod_install", "mod_install_custom", "mod_install_batch"
@@ -1007,7 +1616,8 @@ class Agent:
                                 getattr(self.cfg, "tier", Tier.FREE),
                                 "structured_recommendations",
                             )
-                            and not selection_action
+                            and selection_action in {"", "resolve"}
+                            and not self._update_intent
                         ):
                             recommendation_evidence.append(
                                 (t["function"]["name"], result)
@@ -1047,6 +1657,10 @@ class Agent:
                                 )
                         t_msg = {"role": "tool", "tool_call_id": t["id"], "content": result}
                         messages.append(t_msg); persist.append(t_msg)
+                        terminal_download_message = (
+                            terminal_download_message
+                            or self._terminal_download_failure_message(result)
+                        )
                         yield self._emit({"tool_result": {
                             "name": t["function"]["name"], "ok": not self._is_error(result),
                             "summary": self._tool_summary(
@@ -1076,6 +1690,27 @@ class Agent:
                                 and isinstance(update_report.get("items"), list)
                             ):
                                 yield self._emit({"update_report": update_report})
+                        if (
+                            t["function"]["name"] == "mod_update"
+                            and not self._is_error(result)
+                        ):
+                            try:
+                                updated = json.loads(result)
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                updated = {}
+                            updated_name = str(updated.get("updated") or "").strip()
+                            if updated_name and updated_name not in completed_update_names:
+                                completed_update_names.append(updated_name)
+                    if terminal_download_message:
+                        final_text = (
+                            f"下载未完成：{terminal_download_message}"
+                            " 本轮已结束，没有继续换源或重复下载。"
+                        )
+                        yield self._emit({"chunk": final_text})
+                        persist.append({
+                            "role": "assistant", "content": final_text
+                        })
+                        break
                     if recommendation_update.get("items"):
                         promoted = recommendation_update.get("promotion") or {}
                         if promoted.get("installable"):
@@ -1112,6 +1747,17 @@ class Agent:
                         final_text = (
                             f"已完成本次明确确认的安装：{installed}。"
                             "本轮已在这里结束，没有继续搜索、替换候选或处理历史中的其他目标。"
+                        )
+                        yield self._emit({"chunk": final_text})
+                        persist.append({
+                            "role": "assistant", "content": final_text
+                        })
+                        break
+                    if self._update_intent and self._update_completed_this_turn:
+                        updated = "、".join(completed_update_names) or "已确认目标"
+                        final_text = (
+                            f"更新完成：{updated}。"
+                            "本轮已结束，没有转入新 Mod 搜索或推荐。"
                         )
                         yield self._emit({"chunk": final_text})
                         persist.append({
@@ -1191,7 +1837,8 @@ class Agent:
                         getattr(self.cfg, "tier", Tier.FREE),
                         "structured_recommendations",
                     )
-                    and not selection_action
+                    and selection_action in {"", "resolve"}
+                    and not self._update_intent
                 ):
                     try:
                         refresh_local_inventory(self.cfg)
@@ -1208,7 +1855,44 @@ class Agent:
                         ),
                         game_slug=str(getattr(self.cfg, "game_slug", "") or ""),
                         mod_loader=self._current_mod_loader(),
+                        target_name=(
+                            ""
+                            if selection_action == "resolve"
+                            else self._explicit_install_target.get("name", "")
+                        ),
+                        target_version=(
+                            ""
+                            if selection_action == "resolve"
+                            else self._explicit_install_target.get("version", "")
+                        ),
                     )
+                    if selection_action == "resolve" and recommendation_set.get("items"):
+                        try:
+                            current_session = db.get_session(
+                                getattr(self, "session_id", "")
+                            )
+                            current_state = json.loads(
+                                (current_session or {}).get("ui_state") or "{}"
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            current_state = {}
+                        for target in recommendation_selection or []:
+                            if not isinstance(target, dict):
+                                continue
+                            target_key = str(
+                                target.get("selection_key") or ""
+                            )
+                            if not target_key:
+                                continue
+                            current_state = merge_recommendation_resolution(
+                                current_state,
+                                recommendation_set,
+                                target_selection_key=target_key,
+                                game_slug=str(
+                                    getattr(self.cfg, "game_slug", "") or ""
+                                ),
+                            )
+                        recommendation_set = current_state
                 if recommendation_set.get("items"):
                     recommendation_set = self._localize_recommendation_set(
                         recommendation_set
@@ -1216,8 +1900,11 @@ class Agent:
                     final_text = recommendation_analysis_text(
                         final_text, recommendation_set
                     )
-                    yield self._emit({"chunk": final_text})
+                    # The structured decision table is the primary interaction.
+                    # Emit it before the potentially long narrative so the
+                    # renderer does not appear frozen while laying out both.
                     yield self._emit({"recommendations": recommendation_set})
+                    yield self._emit({"chunk": final_text})
                 else:
                     yield self._emit({"chunk": final_text})        # 缓冲后一次性发出
                 persist.append({"role": "assistant", "content": final_text})
@@ -1229,7 +1916,8 @@ class Agent:
         finally:
             # ✅ 真正的 history 保全:把本轮完整、未截断、角色正确的消息写回
             #   (含 assistant 的 tool_calls 与配对的 tool 结果;不含系统纠偏消息)
-            self.history.extend(persist)
+            if not self._is_cancelled():
+                self.history.extend(persist)
             if dev:
                 try:
                     debug_trace.finish_turn(history=list(self.history), final_text=final_text,
@@ -1241,10 +1929,17 @@ class Agent:
             self._regenerating = False
             self._current_user_msg = ""
             self._status_only_turn = False
+            self._diagnostic_read_only_turn = False
             self._prior_assistant_text = ""
             self._turn_result_cache = {}
+            self._turn_terminal_download_failures = {}
+            self._turn_explicit_download_failure = ""
             self._selection_action = ""
             self._selection_allowed_nexus_ids = set()
+            self._selection_nexus_alias_ids = {}
             self._selection_allowed_source_urls = set()
             self._selection_download_paths = set()
             self._install_completed_this_turn = False
+            self._update_intent = False
+            self._update_completed_this_turn = False
+            self._cancel_check = None

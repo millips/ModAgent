@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Optional, Callable
 
 from .config import CONFIG_DIR
+from . import task_control
+from . import progress
 
 DOWNLOADS_DIR = os.path.join(CONFIG_DIR, "downloads")
 USER_AGENT = "ModAgent/1.0"
@@ -49,6 +51,86 @@ class NexusDirectDownloadUnavailable(RuntimeError):
     def __init__(self, message: str, diagnostics: Optional[dict] = None):
         self.diagnostics = diagnostics or {}
         super().__init__(message)
+
+
+class DownloadFailure(RuntimeError):
+    """A classified download failure that callers can handle deterministically."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_kind: str,
+        retryable: bool,
+        attempts: int,
+        http_status: Optional[int] = None,
+    ):
+        self.failure_kind = failure_kind
+        self.retryable = retryable
+        self.attempts = attempts
+        self.http_status = http_status
+        self.terminal = not retryable
+        super().__init__(message)
+
+    def as_dict(self) -> dict:
+        return {
+            "failure_kind": self.failure_kind,
+            "retryable": self.retryable,
+            "terminal": self.terminal,
+            "attempts": self.attempts,
+            "http_status": self.http_status,
+        }
+
+
+_TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _raise_if_download_cancelled() -> None:
+    task_control.raise_if_cancelled()
+    if progress.is_cancel_requested():
+        raise task_control.TaskCancelled(
+            "用户已取消当前下载；不会继续重试或执行后续安装。"
+        )
+
+
+def _classify_download_error(exc: Exception) -> tuple[str, bool, Optional[int]]:
+    """Return (kind, retryable, HTTP status) without exposing signed URLs."""
+    if isinstance(exc, urllib.error.HTTPError):
+        status = int(exc.code)
+        if status in _TRANSIENT_HTTP_STATUS:
+            return "http_transient", True, status
+        if status in {401, 403}:
+            return "http_access_denied", False, status
+        if status in {404, 410}:
+            return "http_not_found", False, status
+        return "http_client_error" if 400 <= status < 500 else "http_error", False, status
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
+        return "network_transient", True, None
+    return "unknown", False, None
+
+
+def _download_failure_message(
+    kind: str,
+    attempts: int,
+    status: Optional[int] = None,
+) -> str:
+    if kind == "http_not_found":
+        return (
+            f"下载地址不存在或已失效（HTTP {status}），未继续重试。"
+            "请重新解析来源页面或选择仍然存在的 Release 资产。"
+        )
+    if kind == "http_access_denied":
+        return (
+            f"下载地址拒绝访问（HTTP {status}），未继续重试。"
+            "请检查登录、权限或重新生成下载链接。"
+        )
+    if kind == "http_client_error":
+        return f"下载请求无效（HTTP {status}），未继续重试。请重新核验下载来源。"
+    if kind == "http_transient":
+        return f"下载服务暂时不可用（HTTP {status}），连续尝试 {attempts} 次后已停止。"
+    if kind == "network_transient":
+        return f"网络连接连续失败 {attempts} 次，已停止本轮自动重试；稍后可手动重试。"
+    return "下载遇到不可识别的终止性错误，已停止自动重试。"
 
 
 _NEXUS_MANUAL_GATES: dict[str, dict] = {}
@@ -92,12 +174,53 @@ def _download_meta_path(path: str) -> str:
 
 def _remember_download(path: str, game_slug: str, mod_id: int, file_id) -> None:
     """持久记录 Nexus 文件身份，让指定 file_id 的重试也能准确命中缓存。"""
+    remember_download_provenance(path, {
+        "source": "nexus",
+        "game_slug": game_slug,
+        "source_key": str(mod_id),
+        "mod_id": str(mod_id),
+        "file_id": str(file_id or ""),
+    })
+
+
+def remember_download_provenance(path: str, metadata: dict) -> None:
+    """Persist verified source identity beside a ModAgent-owned archive."""
+    path = os.path.abspath(str(path or ""))
+    if (
+        not path
+        or not isinstance(metadata, dict)
+        or not any(_inside(path, root) for root in managed_cache_roots())
+    ):
+        return
+    payload = {
+        str(key): value
+        for key, value in metadata.items()
+        if key in {
+            "source", "game_slug", "source_key", "source_url",
+            "name", "version", "mod_id", "file_id", "dependencies",
+            "updated_at", "detail_verified", "verification_source",
+            "deprecated", "staleness",
+        }
+        and value not in (None, "")
+    }
     try:
         with open(_download_meta_path(path), "w", encoding="utf-8") as f:
-            json.dump({"source": "nexus", "game_slug": game_slug,
-                       "mod_id": str(mod_id), "file_id": str(file_id or "")}, f)
+            json.dump(payload, f, ensure_ascii=False)
     except OSError:
         pass
+
+
+def read_download_provenance(path: str) -> dict:
+    """Read provenance only from ModAgent-owned caches."""
+    path = os.path.abspath(str(path or ""))
+    if not path or not any(_inside(path, root) for root in managed_cache_roots()):
+        return {}
+    try:
+        with open(_download_meta_path(path), encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
 def find_cached_nexus_download(game_slugs, mod_id, file_id=None) -> str:
@@ -1272,8 +1395,14 @@ async def get_download_url_filepage(
 def download_file(url: str, local_path: str, progress_callback: Optional[Callable] = None):
     """下载 CDN 直链，支持断点续传 + 完整性校验。
     限速/断流导致中途中断时，用 HTTP Range 从断点续传，下完核对总大小，不完整不入库。"""
+    _raise_if_download_cancelled()
     if not url or url == 'None':
-        raise RuntimeError("下载链接无效，请重试")
+        raise DownloadFailure(
+            "下载链接为空或无效，已停止自动重试。",
+            failure_kind="invalid_url",
+            retryable=False,
+            attempts=0,
+        )
 
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     ctx = ssl._create_unverified_context()
@@ -1281,9 +1410,10 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
 
     downloaded = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
     total = None
-    stall = 0  # 连续无进展次数
+    stall = 0  # 连续无进展/临时网络失败次数
 
     for attempt in range(12):
+        _raise_if_download_cancelled()
         headers = {"User-Agent": USER_AGENT}
         if downloaded:
             headers["Range"] = f"bytes={downloaded}-"
@@ -1291,10 +1421,29 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
         try:
             resp = urllib.request.urlopen(req, context=ctx, timeout=120)
         except Exception as e:
-            stall += 1
+            _raise_if_download_cancelled()
+            kind, retryable, http_status = _classify_download_error(e)
+            attempt_count = stall + 1
+            if not retryable:
+                raise DownloadFailure(
+                    _download_failure_message(kind, attempt_count, http_status),
+                    failure_kind=kind,
+                    retryable=False,
+                    attempts=attempt_count,
+                    http_status=http_status,
+                ) from e
+            stall = attempt_count
             if stall >= 5:
-                raise RuntimeError(f"下载失败（已重试 {stall} 次）: {e}")
-            time.sleep(2)
+                raise DownloadFailure(
+                    _download_failure_message(kind, stall, http_status),
+                    failure_kind=kind,
+                    retryable=True,
+                    attempts=stall,
+                    http_status=http_status,
+                ) from e
+            for _ in range(20):
+                _raise_if_download_cancelled()
+                time.sleep(.1)
             continue
 
         status = getattr(resp, "status", 200)
@@ -1317,9 +1466,11 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
         got = 0
         with open(tmp_path, mode) as f:
             while True:
+                _raise_if_download_cancelled()
                 try:
                     chunk = resp.read(65536)
                 except Exception:
+                    _raise_if_download_cancelled()
                     break
                 if not chunk:
                     break
@@ -1341,21 +1492,44 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
         if got == 0:
             stall += 1
             if stall >= 5:
-                raise RuntimeError(f"下载停滞，不完整: {downloaded}/{total} 字节")
-            time.sleep(2)
+                raise DownloadFailure(
+                    f"下载连续 5 次没有进展，文件仍不完整：{downloaded}/{total} 字节。",
+                    failure_kind="download_stalled",
+                    retryable=True,
+                    attempts=stall,
+                )
+            for _ in range(20):
+                _raise_if_download_cancelled()
+                time.sleep(.1)
         else:
             stall = 0
     else:
-        raise RuntimeError(f"下载重试次数用尽，不完整: {downloaded}/{total}")
+        raise DownloadFailure(
+            f"下载尝试次数已用尽，文件仍不完整：{downloaded}/{total} 字节。",
+            failure_kind="retry_exhausted",
+            retryable=True,
+            attempts=12,
+        )
 
     size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
     if size == 0:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        raise RuntimeError("下载文件为空，请重试")
+        raise DownloadFailure(
+            "下载结果为空文件，已停止处理；请重新核验下载来源。",
+            failure_kind="empty_download",
+            retryable=False,
+            attempts=1,
+        )
     if total and size < total:
-        raise RuntimeError(f"下载不完整: {size}/{total} 字节，请重试")
+        raise DownloadFailure(
+            f"下载文件不完整：{size}/{total} 字节；稍后可手动重试。",
+            failure_kind="incomplete_download",
+            retryable=True,
+            attempts=1,
+        )
 
+    _raise_if_download_cancelled()
     os.replace(tmp_path, local_path)
     return local_path
 

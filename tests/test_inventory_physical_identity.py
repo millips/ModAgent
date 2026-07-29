@@ -52,6 +52,35 @@ assert scanned["identified"] == [], scanned
 assert scanner.import_mods(scanned["identified"]) == 0
 assert len(db.get_installed_mods("repo")) == 1
 
+# The direct scanner entry point must repair historical aliases too.  This path
+# must not rely on the download preflight wrapper.
+db.add_mod(db.InstalledMod(
+    id="local_alias_again", name="39_MoneyValueTracker", version="unknown",
+    snapshot_id="", files_installed=json.dumps([plugin]),
+    installed_by="imported", game_slug="repo",
+))
+direct_scan = scanner.scan_existing_mods(game, "repo", "")
+assert direct_scan["identified"] == [], direct_scan
+assert [(item.id, item.name) for item in db.get_installed_mods("repo")] == [
+    ("39", "MoneyValueTracker"),
+]
+
+# The visible "reconcile" action includes identity reconciliation, not only a
+# missing-file check.
+db.add_mod(db.InstalledMod(
+    id="local_reconcile_alias", name="39_MoneyValueTracker",
+    version="unknown", snapshot_id="",
+    files_installed=json.dumps([plugin]), installed_by="imported",
+    game_slug="repo",
+))
+from modagent import api
+reconciled = api.mods_reconcile("repo")
+assert reconciled["duplicates_merged"] == 1, reconciled
+assert reconciled["issues"] == [], reconciled
+assert [(item.id, item.name) for item in db.get_installed_mods("repo")] == [
+    ("39", "MoneyValueTracker"),
+]
+
 # Even a legacy-only alias is an exact match when its folder begins with the
 # stable Nexus ID.
 db.remove_mod("39", "repo")

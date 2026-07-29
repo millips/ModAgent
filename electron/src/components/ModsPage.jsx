@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput, Link2, Sparkles } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
 
@@ -35,8 +35,16 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const [dlUrl, setDlUrl] = useState('')
   const [dlBusy, setDlBusy] = useState(false)
   const [checking, setChecking] = useState(false)
+  const [updateProgress, setUpdateProgress] = useState(null)
+  const [updateReview, setUpdateReview] = useState(null)
+  const [updateSelected, setUpdateSelected] = useState(new Set())
+  const [updatingSelected, setUpdatingSelected] = useState(false)
   const [binding, setBinding] = useState(false)
+  const [bindingProgress, setBindingProgress] = useState(null)
+  const [alignmentReview, setAlignmentReview] = useState(null)
   const [enriching, setEnriching] = useState(false)
+  const bindingAbortRef = useRef(null)
+  const updateAbortRef = useRef(null)
 
   useEffect(() => { loadFromApi() }, [refreshKey, status?.game_slug, status?.game_instance_id])
 
@@ -53,6 +61,12 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
         summaryEvidence: m.summary_evidence || '',
         summaryConfidence: m.summary_confidence || '',
         sourceUrl: m.source_url || '',
+        sourceKey: m.source_key || '',
+        sourceMatchMethod: m.source_match_method || '',
+        sourceConfidence: Number(m.source_confidence) || 0,
+        fileCount: Number(m.file_count) || 0,
+        variantCount: Number(m.variant_count) || 0,
+        managementUnit: m.management_unit || 'package',
         size: '',
         hasConflict: false, disabled: !!m.disabled,
       }))
@@ -103,21 +117,66 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       const scope = status?.game_instance_id || status?.game_slug || ''
       const r = await fetch(`${api}/mods/reconcile?game_slug=${encodeURIComponent(scope)}`, { method: 'POST' })
       const d = await r.json()
+      const merged = Number(d.duplicates_merged) || 0
       if (d.issues?.length) {
         const names = d.issues.slice(0, 3).map(i => `${i.name}(${i.problem})`).join('、')
         emitFeedback('warning', { source: 'mod-reconcile', count: d.issues.length })
-        toast(`发现 ${d.issues.length}/${d.checked} 个 mod 账实不符: ${names}${d.issues.length > 3 ? ' 等' : ''}`, 'error')
-      } else { emitFeedback('notice', { source: 'mod-reconcile' }); toast(`对账完成: ${d.checked} 个 mod 账实一致`) }
+        toast(`${merged ? `已合并 ${merged} 条重复记录；` : ''}发现 ${d.issues.length}/${d.checked} 个 mod 账实不符: ${names}${d.issues.length > 3 ? ' 等' : ''}`, 'error')
+      } else {
+        emitFeedback('notice', { source: 'mod-reconcile', count: merged })
+        toast(merged
+          ? `对账完成：已安全合并 ${merged} 条重复记录，${d.checked} 个 Mod 账实一致`
+          : `对账完成：${d.checked} 个 Mod 账实一致`)
+      }
+      if (merged) await loadFromApi()
     } catch (_) { emitFeedback('error', { source: 'mod-reconcile' }); toast('对账失败', 'error') }
   }
 
-  // 检查更新：跑 mod_update_check，把"最新版本"标到对应 mod 上 → 可更新筛选/更新按钮变真
+  const cancelLongTask = async (taskKind) => {
+    try {
+      const response = await fetch(`${api}/tasks/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_kind: taskKind }),
+      })
+      const result = await response.json()
+      if (result.ok) {
+        toast('已请求取消；当前网络请求结束后会安全停止')
+        emitFeedback('cancel', { source: taskKind })
+      }
+      if (taskKind === 'source_align') bindingAbortRef.current?.abort()
+      if (taskKind === 'update_check') updateAbortRef.current?.abort()
+    } catch (_) {
+      toast('取消请求发送失败', 'error')
+    }
+  }
+
+  // 检查更新：显示逐项进度，完成后由用户勾选要更新的项目。
   const checkUpdates = async () => {
+    if (checking) {
+      await cancelLongTask('update_check')
+      return
+    }
     setChecking(true)
+    setUpdateProgress({ completed: 0, total: mods.length, current: '' })
     toast('检查更新中...')
     const controller = new AbortController()
-    const timeoutId = window.setTimeout(() => controller.abort(), 60000)
+    updateAbortRef.current = controller
+    let pollTimer = null
+    const pollProgress = async () => {
+      try {
+        const response = await fetch(`${api}/downloads/status`)
+        const state = await response.json()
+        if (state.task_kind !== 'update_check') return
+        setUpdateProgress({
+          completed: Number(state.completed_count) || 0,
+          total: Number(state.total_count) || mods.length,
+          current: state.current_item?.name || '',
+        })
+      } catch (_) {}
+    }
     try {
+      pollTimer = window.setInterval(pollProgress, 400)
       const r = await fetch(api + '/tool/mod_update_check', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
         signal: controller.signal,
@@ -125,48 +184,191 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
       if (data.error) throw new Error(data.error)
+      if (data.cancelled) {
+        toast('检查更新已取消；已完成的来源绑定会保留')
+        return
+      }
       const ups = data.updates_available || []
       const map = {}
       ups.forEach(u => { map[String(u.mod_id)] = u.latest })
       setMods(prev => prev.map(m => ({ ...m, latest: map[String(m.id)] || null })))
+      setUpdateProgress({
+        completed: Number(data.summary?.total) || mods.length,
+        total: Number(data.summary?.total) || mods.length,
+        current: '',
+      })
+      setUpdateReview(ups.length
+        ? { updates: ups, summary: data.summary || {}, items: data.items || [] }
+        : null)
+      setUpdateSelected(new Set(ups.map(item => String(item.mod_id))))
       emitFeedback('notice', { source: 'update-check', count: ups.length })
       const failed = data.failed_checks?.length || 0
-      const checked = data.checked_nexus || 0
+      const checked = (data.checked_nexus || 0) + (data.checked_thunderstore || 0)
       if (failed) toast(`检查完成：${checked} 个成功，${failed} 个暂时无法查询${ups.length ? `，发现 ${ups.length} 个更新` : ''}`, 'error')
-      else toast(ups.length ? `发现 ${ups.length} 个可更新` : `检查完成：${checked} 个 Nexus Mod 均为最新`)
+      else toast(ups.length ? `检测到 ${ups.length} 个可更新项目，请勾选后执行` : `检查完成：${checked} 个已绑定 Mod 均为最新`)
     } catch (error) {
+      if (error?.name === 'AbortError') {
+        toast('检查更新已取消')
+        return
+      }
       emitFeedback('error', { source: 'update-check' })
-      toast(error?.name === 'AbortError' ? '检查超时，已解除按钮锁定；请稍后重试' : '检查更新失败', 'error')
+      toast(error?.message || '检查更新失败', 'error')
     } finally {
-      window.clearTimeout(timeoutId)
+      if (pollTimer) window.clearInterval(pollTimer)
+      updateAbortRef.current = null
       setChecking(false)
+      window.setTimeout(() => setUpdateProgress(null), 1500)
     }
   }
 
-  const bindRecognized = async () => {
+  const runSelectedUpdates = async () => {
+    const targets = (updateReview?.updates || []).filter(
+      item => updateSelected.has(String(item.mod_id))
+    )
+    if (!targets.length || updatingSelected) return
+    setUpdatingSelected(true)
+    const succeeded = []
+    const failed = []
+    for (const item of targets) {
+      try {
+        const response = await fetch(api + '/tool/mod_update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mod_id: String(item.mod_id) }),
+        })
+        const envelope = await response.json()
+        const result = JSON.parse(envelope.result || '{}')
+        if (result.error) throw new Error(result.error)
+        succeeded.push(item.name)
+      } catch (error) {
+        failed.push({ name: item.name, error: error?.message || '更新失败' })
+      }
+    }
+    setUpdatingSelected(false)
+    setUpdateReview(null)
+    setUpdateSelected(new Set())
+    await loadFromApi()
+    onRefresh?.()
+    if (failed.length) {
+      toast(`更新完成：成功 ${succeeded.length}，失败 ${failed.length}（${failed.slice(0, 3).map(item => item.name).join('、')}）`, 'error')
+    } else {
+      toast(`已更新 ${succeeded.length} 个 Mod`)
+    }
+  }
+
+  const runAlignment = async (targetMods = null) => {
+    const targets = Array.isArray(targetMods)
+      ? targetMods
+      : mods.filter(mod => !mod.sourceKey)
+    if (!targets.length) {
+      toast('全部 Mod 都已有维护来源，无需重复绑定')
+      return
+    }
     setBinding(true)
-    toast('正在把本地 Mod 对齐到维护来源…')
+    setBindingProgress({ completed: 0, total: targets.length, current: '' })
     const controller = new AbortController()
-    const timeoutId = window.setTimeout(() => controller.abort(), 120000)
+    bindingAbortRef.current = controller
+    toast(targetMods
+      ? `正在单独对齐 ${targets[0]?.name || '该 Mod'}…`
+      : `正在对齐 ${targets.length} 个尚未绑定的 Mod…`)
+    let pollTimer = null
+    const pollProgress = async () => {
+      try {
+        const response = await fetch(`${api}/downloads/status`)
+        const state = await response.json()
+        if (state.task_kind !== 'source_align') return
+        setBindingProgress({
+          completed: Number(state.completed_count) || 0,
+          total: Number(state.total_count) || targets.length,
+          current: state.current_item?.name || '',
+        })
+      } catch (_) {}
+    }
     try {
+      pollTimer = window.setInterval(pollProgress, 400)
       const response = await fetch(api + '/tool/mod_source_align', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ force_refresh: true }), signal: controller.signal,
+        body: JSON.stringify({
+          force_refresh: false,
+          mod_ids: targetMods ? targets.map(mod => String(mod.id)) : [],
+        }),
+        signal: controller.signal,
       })
       const envelope = await response.json()
       const result = JSON.parse(envelope.result || '{}')
       if (result.error) throw new Error(result.error)
+      if (result.cancelled) {
+        toast('来源对齐已取消；此前成功绑定的项目已保留')
+        return
+      }
       const summary = result.summary || {}
+      const attempted = Number(result.attempted) || targets.length
+      setBindingProgress({ completed: attempted, total: attempted, current: '' })
       emitFeedback('notice', { source: 'source-align', count: summary.bound || 0 })
-      toast(`绑定完成：成功 ${summary.bound || 0}，歧义 ${summary.ambiguous || 0}，未匹配 ${summary.unmatched || 0}`)
-      loadFromApi()
+      const ambiguous = result.ambiguous || []
+      if (ambiguous.length) {
+        setAlignmentReview({
+          items: ambiguous,
+          unmatched: result.unmatched || [],
+        })
+      }
+      toast(`对齐完成：沿用已有 ${summary.already_bound || 0}，新增 ${summary.bound || 0}，待确认 ${summary.ambiguous || 0}，未匹配 ${summary.unmatched || 0}`)
+      await loadFromApi()
       onRefresh?.()
     } catch (error) {
+      if (error?.name === 'AbortError') {
+        toast('来源对齐已取消；此前成功绑定的项目已保留')
+        return
+      }
       emitFeedback('error', { source: 'source-align' })
-      toast(error?.name === 'AbortError' ? '绑定耗时过长，已保留现有结果，可稍后继续' : '来源绑定失败', 'error')
+      toast(error?.message || '来源绑定失败，已保留此前完成的绑定', 'error')
     } finally {
-      window.clearTimeout(timeoutId)
+      if (pollTimer) window.clearInterval(pollTimer)
+      bindingAbortRef.current = null
       setBinding(false)
+      window.setTimeout(() => setBindingProgress(null), 1500)
+    }
+  }
+
+  const bindRecognized = () => (
+    binding ? cancelLongTask('source_align') : runAlignment()
+  )
+
+  const confirmAlignmentCandidate = async (item, candidate) => {
+    const lockId = `align:${item.mod_id}`
+    if (actionLock) return
+    setActionLock(lockId)
+    try {
+      const body = {
+        local_mod_id: String(item.mod_id),
+        source: candidate.source,
+        source_key: String(candidate.source_key || ''),
+        source_url: candidate.url || '',
+        candidate_name: candidate.name || '',
+        latest_version: candidate.latest_version || candidate.version || '',
+        confirmed: true,
+      }
+      if (candidate.source === 'nexus') body.nexus_mod_id = Number(candidate.source_key)
+      const response = await fetch(api + '/tool/mod_source_bind', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const envelope = await response.json()
+      const result = JSON.parse(envelope.result || '{}')
+      if (result.error || !result.bound) throw new Error(result.error || '绑定失败')
+      const remaining = (alignmentReview?.items || []).filter(
+        row => String(row.mod_id) !== String(item.mod_id),
+      )
+      setAlignmentReview(remaining.length
+        ? { ...alignmentReview, items: remaining }
+        : null)
+      toast(`${item.name} 已确认绑定到 ${candidate.name || candidate.source_key}`)
+      await loadFromApi()
+      onRefresh?.()
+    } catch (error) {
+      toast(error?.message || '确认绑定失败', 'error')
+    } finally {
+      setActionLock(null)
     }
   }
 
@@ -388,6 +590,8 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     const unit = m.size.includes('GB') ? 1024 : m.size.includes('MB') ? 1 : 0.001
     return sum + num * unit
   }, 0)
+  const boundCount = mods.filter(mod => mod.sourceKey).length
+  const unboundCount = Math.max(0, mods.length - boundCount)
 
   return (
     <div className="flex flex-col flex-1 overflow-hidden">
@@ -419,12 +623,28 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               title="校验每个已装 mod 记录的文件是否还在磁盘上,揪出空账/缺文件">
               对账
             </button>
-            <button className="btn-ghost flex items-center gap-1" onClick={checkUpdates} disabled={checking}>
-              <RefreshCw size={14} className={checking ? 'animate-spin' : ''} /> 检查更新
+            <button
+              className={`btn-ghost flex items-center gap-1 ${checking ? 'text-cyber-red' : ''}`}
+              onClick={checkUpdates}
+              disabled={binding}
+              title={checking ? '取消本轮更新检查' : '逐项检查版本，完成后勾选需要更新的项目'}
+            >
+              {checking ? <XCircle size={14} /> : <RefreshCw size={14} />}
+              {checking
+                ? `取消检查 ${updateProgress?.completed || 0}/${updateProgress?.total || mods.length}`
+                : '检查更新'}
             </button>
-            <button className="btn-ghost flex items-center gap-1" onClick={bindRecognized} disabled={binding || checking}
-              title="将扫描到的本地 Mod 自动绑定到可信的 Nexus、Thunderstore 或 Steam 维护页，之后可统一检查和更新">
-              <Link2 size={14} className={binding ? 'animate-pulse' : ''} /> {binding ? '绑定中' : '一键绑定'}
+            <button
+              className={`btn-ghost flex items-center gap-1 ${binding ? 'text-cyber-red' : ''}`}
+              onClick={bindRecognized}
+              disabled={checking || (!binding && !unboundCount)}
+              title={unboundCount
+                ? `仅处理 ${unboundCount} 个尚未绑定项；已有 ${boundCount} 个不会重复查询`
+                : '全部 Mod 都已有维护来源'}>
+              {binding ? <XCircle size={14} /> : <Link2 size={14} />}
+              {binding
+                ? `取消对齐 ${bindingProgress?.completed || 0}/${bindingProgress?.total || mods.length}`
+                : `对齐 ${boundCount}/${mods.length}`}
             </button>
             <button
               className="btn-ghost flex items-center gap-1"
@@ -479,6 +699,30 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
             </button>
           </div>
         </div>
+        {bindingProgress && (
+          <div className="rounded-md border border-cyber-cyan/20 bg-surface-900/60 px-3 py-2">
+            <div className="mb-1 flex items-center justify-between gap-3 text-[11px]">
+              <span className="truncate text-surface-300">
+                {binding
+                  ? `正在绑定维护来源${bindingProgress.current ? `：${bindingProgress.current}` : ''}`
+                  : '来源绑定完成'}
+              </span>
+              <span className="shrink-0 font-mono text-cyber-cyan">
+                {bindingProgress.completed}/{bindingProgress.total}
+              </span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-surface-700">
+              <div
+                className="h-full rounded-full bg-cyber-cyan transition-all duration-300"
+                style={{
+                  width: `${bindingProgress.total
+                    ? Math.min(100, (bindingProgress.completed / bindingProgress.total) * 100)
+                    : 0}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Mod list */}
@@ -539,6 +783,14 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                         : 'AI 推测 · 待核验'}
                   </span>
                 )}
+                {mod.variantCount > 1 && (
+                  <span
+                    className="shrink-0 rounded border border-cyber-cyan/25 px-1.5 py-0.5 text-[9px] text-cyber-cyan"
+                    title={`该下载包包含 ${mod.variantCount} 个文件变体；更新、启用、禁用和卸载均按整包处理`}
+                  >
+                    包内 {mod.variantCount} 个变体
+                  </span>
+                )}
               </div>
             </div>
 
@@ -549,7 +801,18 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
             </div>
 
             {/* Actions - show on hover */}
-            <div className={`flex items-center gap-1 shrink-0 transition-opacity duration-75 ${hovered === mod.id || mod.disabled ? 'opacity-100' : 'opacity-0'}`}>
+            <div className={`flex items-center gap-1 shrink-0 transition-opacity duration-75 ${hovered === mod.id || mod.disabled || !mod.sourceKey ? 'opacity-100' : 'opacity-0'}`}>
+              {!mod.sourceKey && (
+                <button
+                  disabled={binding || actionLock === `align:${mod.id}`}
+                  onClick={() => runAlignment([mod])}
+                  className="btn-ghost px-2 py-1.5 flex items-center gap-1 text-cyber-yellow"
+                  title="单独对齐这个 Mod 的维护来源"
+                >
+                  <Link2 size={13} />
+                  <span className="text-xs">+ 对齐</span>
+                </button>
+              )}
               {mod.latest && (
                 <button disabled={actionLock === mod.id}
                   onClick={async () => {
@@ -607,6 +870,75 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
           </button>
         )}
       </div>
+
+      {/* 更新检测只给出候选；用户勾选后才进入更新流水线。 */}
+      {updateReview && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={() => !updatingSelected && setUpdateReview(null)}>
+          <div className="bg-surface-800 border border-cyber-cyan/35 rounded-lg p-5 max-w-2xl w-[min(92vw,680px)] max-h-[82vh] flex flex-col shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h3 className="text-base font-semibold text-white">检测到可更新项目</h3>
+                <p className="text-xs text-surface-400 mt-1">
+                  共检查 {updateReview.summary?.total || mods.length} 项，发现 {updateReview.updates.length} 项可更新。请确认后勾选，不会自动安装。
+                </p>
+              </div>
+              <button className="btn-ghost p-1.5" disabled={updatingSelected} onClick={() => setUpdateReview(null)} title="关闭">
+                <XCircle size={16} />
+              </button>
+            </div>
+            <div className="overflow-y-auto space-y-2 pr-1">
+              {updateReview.updates.map(item => {
+                const checked = updateSelected.has(String(item.mod_id))
+                return (
+                  <label key={item.mod_id} className="flex items-start gap-3 rounded-md border border-surface-600 bg-surface-900/65 px-3 py-3 cursor-pointer hover:border-cyber-cyan/35">
+                    <input
+                      type="checkbox"
+                      className="mt-1 accent-cyan-400"
+                      checked={checked}
+                      disabled={updatingSelected}
+                      onChange={() => setUpdateSelected(previous => {
+                        const next = new Set(previous)
+                        if (checked) next.delete(String(item.mod_id))
+                        else next.add(String(item.mod_id))
+                        return next
+                      })}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm text-white">{item.name}</div>
+                      <div className="mt-1 text-xs text-surface-400">
+                        {item.current || 'unknown'} → <span className="text-cyber-cyan">{item.latest || '最新版'}</span>
+                        <span className="ml-2 text-surface-500">{item.source}</span>
+                      </div>
+                      {item.status === 'version_unknown' && (
+                        <div className="mt-1 text-[11px] text-cyber-yellow">本地版本未知，将按已核验维护页同步最新版</div>
+                      )}
+                    </div>
+                  </label>
+                )
+              })}
+            </div>
+            <div className="mt-4 flex items-center justify-between gap-3 border-t border-surface-600 pt-4">
+              <button
+                className="btn-ghost text-xs"
+                disabled={updatingSelected}
+                onClick={() => setUpdateSelected(previous => (
+                  previous.size === updateReview.updates.length
+                    ? new Set()
+                    : new Set(updateReview.updates.map(item => String(item.mod_id)))
+                ))}
+              >
+                {updateSelected.size === updateReview.updates.length ? '取消全选' : '全选'}
+              </button>
+              <div className="flex gap-2">
+                <button className="btn-ghost" disabled={updatingSelected} onClick={() => setUpdateReview(null)}>稍后更新</button>
+                <button className="btn-cyber" disabled={updatingSelected || !updateSelected.size} onClick={runSelectedUpdates}>
+                  {updatingSelected ? '正在更新…' : `更新所选 ${updateSelected.size} 项`}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 批量卸载统一预览：确认一次，逐个走后端真实卸载门与快照。 */}
       {batchDelete && (() => {
@@ -742,6 +1074,77 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                   {dependencyGate.enabling ? '启用依赖并继续' : '全部禁用'}
                 </button>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 低置信名称不能自动决定身份；把真实候选交给用户确认。 */}
+      {alignmentReview && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={() => setAlignmentReview(null)}>
+          <div className="bg-surface-800 border border-cyber-yellow/35 rounded-lg p-5 max-w-3xl w-[min(92vw,760px)] max-h-[82vh] overflow-y-auto shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h3 className="text-base font-semibold text-white">需要确认的来源歧义</h3>
+                <p className="text-xs text-surface-400 mt-1">
+                  “歧义”表示找到了多个相似维护页，但名称相似不足以证明是同一个 Mod。请选择你实际安装的来源；不确定可以暂时跳过。
+                </p>
+              </div>
+              <button className="btn-ghost p-1.5" onClick={() => setAlignmentReview(null)} title="稍后处理">
+                <XCircle size={16} />
+              </button>
+            </div>
+            <div className="space-y-4">
+              {alignmentReview.items.map(item => (
+                <div key={item.mod_id} className="rounded-md border border-surface-600 bg-surface-900/70 p-3">
+                  <div className="mb-2">
+                    <div className="text-sm font-medium text-white">{item.name}</div>
+                    <div className="text-[11px] text-cyber-yellow">{item.reason || '候选相似，需要人工确认'}</div>
+                  </div>
+                  <div className="space-y-2">
+                    {(item.candidates || []).map(candidate => (
+                      <div key={`${candidate.source}:${candidate.source_key}`} className="flex items-start justify-between gap-3 rounded border border-surface-700 bg-surface-800 px-3 py-2">
+                        <div className="min-w-0">
+                          <div className="text-xs text-white">
+                            {candidate.name || candidate.source_key}
+                            <span className="ml-2 text-surface-500">{candidate.source}</span>
+                          </div>
+                          <div className="mt-1 text-[10px] text-surface-400">
+                            {candidate.owner ? `作者 ${candidate.owner} · ` : ''}
+                            {candidate.latest_version || candidate.version ? `版本 ${candidate.latest_version || candidate.version} · ` : ''}
+                            匹配度 {Math.round((Number(candidate.score) || 0) * 100)}%
+                          </div>
+                          {(candidate.description || candidate.summary) && (
+                            <div className="mt-1 text-[11px] text-surface-300 line-clamp-2">
+                              {candidate.description || candidate.summary}
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 flex-col gap-1">
+                          {candidate.url && (
+                            <button
+                              className="btn-ghost text-xs"
+                              onClick={() => window.modagent?.openExternal?.(candidate.url)}
+                            >
+                              查看维护页
+                            </button>
+                          )}
+                          <button
+                            className="btn-cyber text-xs"
+                            disabled={!!actionLock}
+                            onClick={() => confirmAlignmentCandidate(item, candidate)}
+                          >
+                            确认此来源
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-4 flex justify-end">
+              <button className="btn-ghost" onClick={() => setAlignmentReview(null)}>暂时跳过</button>
             </div>
           </div>
         </div>

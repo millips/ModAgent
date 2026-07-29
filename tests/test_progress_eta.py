@@ -38,3 +38,41 @@ def test_done_items_count_as_complete():
     assert state["items"][0]["pct"] == 100
     assert state["overall_pct"] == 50
     assert state["eta_seconds"] == 4
+
+
+def test_source_alignment_exposes_item_counter_and_current_name():
+    progress.start([
+        {"mod_id": "a", "name": "Alpha"},
+        {"mod_id": "b", "name": "Beta"},
+        {"mod_id": "c", "name": "Gamma"},
+    ], task_kind="source_align", label="绑定维护来源")
+    progress.set_status("a", "done")
+    progress.set_status("b", "processing")
+    state = progress.snapshot()
+    assert state["task_kind"] == "source_align"
+    assert state["completed_count"] == 1
+    assert state["total_count"] == 3
+    assert state["current_item"]["name"] == "Beta"
+    assert state["eta_seconds"] is None
+    progress.finish()
+
+
+def test_exclusive_task_can_be_cancelled_without_being_overwritten():
+    assert progress.start(
+        [{"mod_id": "a", "name": "Alpha"}],
+        task_kind="source_align",
+        label="正在对齐",
+        exclusive=True,
+    ) is True
+    assert progress.start(
+        [{"mod_id": "b", "name": "Beta"}],
+        task_kind="update_check",
+        exclusive=True,
+    ) is False
+    assert progress.request_cancel("update_check") is False
+    assert progress.request_cancel("source_align") is True
+    assert progress.is_cancel_requested("source_align") is True
+    progress.finish(cancelled=True)
+    state = progress.snapshot()
+    assert state["active"] is False
+    assert state["items"][0]["status"] == "cancelled"

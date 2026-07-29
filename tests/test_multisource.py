@@ -109,6 +109,9 @@ check("C6 consulted lists ok", set(r["sources_consulted"]) == {"nexus", "worksho
       f"got {r['sources_consulted']}")
 check("C6b source ledger present", set(r["sources_attempted"]) == {"nexus", "workshop", "gamebanana", "github"}
       and "thunderstore" in r["sources_skipped"])
+check("C6c source coverage visible", r["source_coverage"]["total"] == 5
+      and r["source_coverage"]["checked"] == 4
+      and "thunderstore" in r["source_coverage"]["skipped_sources"])
 
 # 单源失败 → sources_failed,其余不受阻
 async def _ws_boom(q, appid, port=18888):

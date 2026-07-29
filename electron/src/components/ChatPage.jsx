@@ -3,6 +3,7 @@ import { Send, RotateCcw, Search, RefreshCw, Zap, Shield, AlertTriangle, Plus, T
 import PlanCard from './PlanCard'
 import DebugPanel from './DebugPanel'
 import { getManualActionQuickReply } from './chatQuickReplies.mjs'
+import { hasSameRecommendation } from './recommendationRecovery.mjs'
 import { emitFeedback, emitToolFeedback, emitToolStartFeedback } from '../feedback/feedbackBus'
 import { ChatEditionMessage } from '@edition'
 
@@ -127,7 +128,13 @@ function formatProgressTime(value) {
   return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`
 }
 
-function ActiveTaskProgress({ task, now }) {
+function ActiveTaskProgress({ task }) {
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 500)
+    return () => window.clearInterval(timer)
+  }, [task?.startedAt])
   if (!task) return null
   const elapsed = Math.max(0, (now - task.startedAt) / 1000)
   const stageElapsed = Math.max(0, (now - task.stageStartedAt) / 1000)
@@ -348,7 +355,6 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   const [expandedRaw, setExpandedRaw] = useState({})
   const toggleRaw = (id) => setExpandedRaw(prev => ({ ...prev, [id]: !prev[id] }))
   const [taskProgress, setTaskProgress] = useState(null)
-  const [progressClock, setProgressClock] = useState(Date.now())
   const [skeleton, setSkeleton] = useState(false)
   const [gameSearch, setGameSearch] = useState('')
   const [gameOpen, setGameOpen] = useState(false)
@@ -430,14 +436,11 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     // transcript to the bottom.
     if (signature === autoScrollSignatureRef.current) return
     autoScrollSignatureRef.current = signature
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
-
-  useEffect(() => {
-    if (!loading) return undefined
-    const timer = setInterval(() => setProgressClock(Date.now()), 500)
-    return () => clearInterval(timer)
-  }, [loading])
+    // Streaming can add a long answer and a large decision table in quick
+    // succession. Queuing smooth-scroll animations for both makes Chromium
+    // spend seconds laying out the transcript and can look like a frozen UI.
+    bottomRef.current?.scrollIntoView({ behavior: loading ? 'auto' : 'smooth' })
+  }, [messages, loading])
 
   // Download callbacks carry real byte progress. While a chat task is active,
   // promote that signal into the main task bar instead of showing a synthetic
@@ -582,12 +585,15 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       if (data.recommendations?.kind === 'recommendation_set') {
         recoveryAgentRef.current = { id: null, text: '' }
         setMessages(prev => {
-          if (prev.some(message => message.role === 'edition')) return prev
           const payload = {
             ...data.recommendations,
             phase: 'recommendation',
             anchor_after_text_count: textMessageCount(prev),
           }
+          // Recovery can replay an already delivered SSE event, so suppress
+          // only that exact card. An older recommendation card elsewhere in
+          // the conversation must not hide the current search result.
+          if (hasSameRecommendation(prev, payload)) return prev
           return insertRecommendationAtAnchor(prev, payload, mkId)
         })
         continue
@@ -761,14 +767,29 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     toast('已撤回')
   }
 
-  const stopStream = () => {
+  const stopStream = async () => {
     if (abortRef.current) {
       abortRef.current.abort()
       abortRef.current = null
       setLoading(false)
       setTaskProgress(null)
       emitFeedback('cancel', { source: 'chat-stop' })
-      toast('已停止')
+      try {
+        const response = await fetch(`${api}/tasks/cancel`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: activeSessionRef.current || '' }),
+        })
+        const result = await response.json()
+        toast(
+          result?.ok
+            ? '已停止；旧任务不会继续执行'
+            : '界面已停止，但后端未找到匹配任务',
+          result?.ok ? 'success' : 'warn',
+        )
+      } catch (_) {
+        toast('界面已停止；后台取消请求发送失败', 'error')
+      }
     }
   }
 
@@ -817,6 +838,19 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         `我仍然想要 ${item.name}${identity ? `（${identity}）` : ''}。如果站点不能自动下载，请保留这个目标，并指导我下载后通过本地安装包导入；导入前仍要核验文件身份、必要依赖和安装落点。`
       )
     }
+  }
+
+  const resolveWantedItems = (message, items) => {
+    if (loading || !items?.length) return
+    const names = items.map(item => item.name).filter(Boolean)
+    sendMsg(
+      `请批量补齐我在当前智能推荐决策表中标记“我要这个”的 ${items.length} 个明确目标：${names.join('、')}。逐项核验权威详情、可下载文件、当前游戏版本适配、已安装状态、冲突和完整必要依赖；把兼容且缺少的必要依赖加入本轮拟安装计划，然后用“本机已安装 + 本轮拟安装依赖”重新检测并刷新原智能推荐决策表。共享依赖只解除其他候选的同类阻塞，不要自动选择未标记的 Mod，也不要在最终确认前下载或安装。`,
+      undefined,
+      {
+        recommendationSelection: items,
+        selectionAction: 'resolve',
+      },
+    )
   }
 
   const submitEditionSelection = (message, selectedItems) => {
@@ -885,7 +919,6 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     setMessages(prev => [...(baseMessages || prev), userMsg])
     setLoading(true)
     const taskStartedAt = Date.now()
-    setProgressClock(taskStartedAt)
     setTaskProgress({
       label: '正在理解请求并规划步骤', mode: 'indeterminate', pct: 0,
       startedAt: taskStartedAt, stageStartedAt: taskStartedAt,
@@ -927,7 +960,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       const decoder = new TextDecoder()
       let buffer = ''
 
-      while (true) {
+      let sawDoneEvent = false
+      while (!sawDoneEvent) {
         const { done, value } = await reader.read()
         if (done) break
 
@@ -1026,7 +1060,16 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
               }])
               continue
             }
-            if (data.done) continue
+            if (data.done) {
+              // "done" is the protocol boundary. Release interactive controls
+              // immediately instead of waiting for the HTTP body to close.
+              // Some proxies/antivirus products keep the body open briefly.
+              sawDoneEvent = true
+              streamCompleted = true
+              setLoading(false)
+              setTaskProgress(null)
+              break
+            }
             if (data.chunk) {
               setTaskProgress(previous => {
                 if (!previous || previous.label === '正在整理结果') return previous
@@ -1050,6 +1093,10 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
               }
             }
           } catch (_) {}
+        }
+        if (sawDoneEvent) {
+          try { await reader.cancel() } catch (_) {}
+          break
         }
       }
 
@@ -1131,6 +1178,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             onChange={(selectedKeys, wantedKeys) => updateEditionSelection(msg, selectedKeys, wantedKeys)}
             onSubmit={selectedItems => submitEditionSelection(msg, selectedItems)}
             onResolve={(item, action) => resolveEditionItem(msg, item, action)}
+            onResolveWanted={items => resolveWantedItems(msg, items)}
           />
         </div>
       )
@@ -1568,7 +1616,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             </div>
           )}
           {messages.map((msg, i) => renderMessage(msg, i))}
-          {loading && <ActiveTaskProgress task={taskProgress} now={progressClock} />}
+          {loading && <ActiveTaskProgress task={taskProgress} />}
           <div ref={bottomRef} />
         </div>
 
@@ -1601,7 +1649,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
 
       <div className="chat-quick-sidebar flex-[3] h-full min-h-0 overflow-x-hidden overflow-y-auto border-l border-surface-600 bg-surface-800 p-4 flex flex-col gap-4 min-w-[220px]">
         <h3 className="text-xs font-semibold text-surface-500 uppercase tracking-wider">状态</h3>
-        <div className="card-cyber"><div className="flex items-center justify-between"><span className="text-xs text-surface-500">已安装 Mod</span><span className="text-xl font-bold text-cyber-cyan">{status.mods == null ? '…' : status.mods}</span></div></div>
+        <div className="card-cyber"><div className="flex items-center justify-between"><span className="text-xs text-surface-500">已管理 Mod 包</span><span className="text-xl font-bold text-cyber-cyan">{status.mods == null ? '…' : status.mods}</span></div></div>
         <div className="card-cyber"><div className="flex items-center justify-between"><span className="text-xs text-surface-500">快照数量</span><span className="text-xl font-bold text-cyber-purple">{status.snaps == null ? '…' : status.snaps}</span></div></div>
         <div className="card-cyber">
           <span className="text-xs text-surface-500 block mb-1">游戏</span>

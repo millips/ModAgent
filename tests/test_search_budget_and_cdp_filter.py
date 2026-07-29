@@ -1,8 +1,8 @@
-"""Search fallback rejects default browse noise and stops runaway retries."""
+"""Search fallback rejects browse noise without a ModAgent-wide call budget."""
 import json
-import time
+from unittest.mock import patch
 
-from modagent.agent import Agent, SEARCH_TURN_MAX_CALLS
+from modagent.agent import Agent
 from modagent.config import Config
 from modagent.downloader import _filter_cdp_search_results
 
@@ -21,10 +21,10 @@ assert [
 assert len(_filter_cdp_search_results("latest popular trending mods", default_rows)) == 3
 
 agent = Agent(Config())
-agent._turn_started_monotonic = time.monotonic()
-agent._turn_search_calls = SEARCH_TURN_MAX_CALLS
-blocked = json.loads(agent._exec("nexus_search", {"query": "another retry"}))
-assert blocked["error"] == "search_budget_exhausted"
-assert blocked["search_calls"] == SEARCH_TURN_MAX_CALLS
+with patch("modagent.agent.execute", return_value=json.dumps({"results": []})):
+    for index in range(10):
+        result = json.loads(agent._exec("nexus_search", {"query": f"retry {index}"}))
+        assert "error" not in result
+assert agent._turn_search_calls == 10
 
 print("ALL PASS")

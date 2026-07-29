@@ -1861,6 +1861,19 @@ body.theme-technology-core .feedback-core-lanes i:nth-child(2) { top: 50%; }
 body.theme-technology-core .feedback-core-lanes i:nth-child(3) { top: 65%; }
 
 body.theme-technology-core .feedback-core-particles { position: absolute; inset: 0; z-index: 11; pointer-events: none; }
+
+/*
+ * Full-screen designed layouts can create dozens of overlapping translucent
+ * surfaces. Applying backdrop-filter to them promotes large portions of the
+ * workspace to separate GPU layers and can make Electron appear frozen,
+ * especially when a recommendation table is visible. Keep the translucent
+ * colours and artwork, but avoid live blur inside the application workspace.
+ */
+body.has-bg .app-shell *,
+body[data-ma-layout="designed"] .app-shell * {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
 body.theme-technology-core .feedback-core-particles i {
   position: absolute;
   left: 50%;

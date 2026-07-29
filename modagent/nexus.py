@@ -508,15 +508,12 @@ def _match_and_detail(query: str, mods: list, game_slug: str, api_key: str) -> l
 
     pool = cf.ThreadPoolExecutor(max_workers=min(8, len(candidates) or 1))
     futures = [pool.submit(fetch, candidate) for candidate in candidates]
-    done, not_done = cf.wait(futures, timeout=22)
     rows = []
-    for future in done:
+    for future in cf.as_completed(futures):
         score, item = future.result()
         if item and (not wanted or score > 0):
             rows.append((score, item))
-    for future in not_done:
-        future.cancel()
-    pool.shutdown(wait=False)
+    pool.shutdown(wait=True)
     rows.sort(key=lambda pair: (
         pair[0],
         pair[1].get("endorsements") or 0,
@@ -603,7 +600,9 @@ def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888)
     deps = [d.get("mod_id") for d in mod.get("dependencies", []) if d.get("mod_id")]
     dependency_labels = _extract_dependency_labels(mod.get("description", ""))
     required_loader = _extract_required_loader(
-        mod.get("description", ""), dependency_labels
+        mod.get("description", ""),
+        dependency_labels,
+        mod.get("name", ""),
     )
 
     return {
@@ -719,7 +718,11 @@ def _extract_dependency_labels(desc: str) -> list[str]:
     return labels[:12]
 
 
-def _extract_required_loader(desc: str, dependency_labels: list[str] | None = None) -> str:
+def _extract_required_loader(
+    desc: str,
+    dependency_labels: list[str] | None = None,
+    name: str = "",
+) -> str:
     labels = {
         re.sub(r"[^a-z0-9]+", "", str(label).casefold())
         for label in (dependency_labels or [])
@@ -730,11 +733,18 @@ def _extract_required_loader(desc: str, dependency_labels: list[str] | None = No
         return "BepInEx"
 
     plain = _source_plain_text(desc)
+    title = _source_plain_text(name)
+    if re.search(r"(?:^|[\s(\[])BepInEx(?:Pack)?(?:[\s)\]]|$)", title, flags=re.I):
+        return "BepInEx"
+    if re.search(r"(?:^|[\s(\[])MelonLoader(?:[\s)\]]|$)", title, flags=re.I):
+        return "MelonLoader"
     strong_patterns = (
         (r"\bport(?:ed)?\b.{0,100}\bto\s+MelonLoader\b", "MelonLoader"),
         (r"\b(?:requires?|built\s+for|made\s+for)\s+MelonLoader\b", "MelonLoader"),
+        (r"\bMelonLoader[\\/](?:Mods|UserData)\b", "MelonLoader"),
         (r"\bport(?:ed)?\b.{0,100}\bto\s+BepInEx\b", "BepInEx"),
         (r"\b(?:requires?|built\s+for|made\s+for)\s+BepInEx(?:Pack)?\b", "BepInEx"),
+        (r"\bBepInEx[\\/](?:plugins|patchers|config)\b", "BepInEx"),
     )
     for pattern, loader in strong_patterns:
         if re.search(pattern, plain, flags=re.I | re.S):
