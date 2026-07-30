@@ -66,10 +66,9 @@ async def verify():
         assert result["stage"] == "captured"
         assert sum("__modAgentDownloadCaptureInstalled" in c for c in calls) >= 4
         page_url = downloader._nexus_files_page_url(
-            "finalfantasy7rebirth", 816
+            "finalfantasy7rebirth", 816, 9565
         )
-        assert page_url.endswith("/mods/816?tab=files")
-        assert "file_id=" not in page_url
+        assert page_url.endswith("/mods/816?tab=files&file_id=9565")
         assert "尚未登录" not in downloader._nexus_gate_reason({
             "loggedIn": True,
             "login": True,

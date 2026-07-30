@@ -255,9 +255,9 @@ const proReport = reports.find(item => item.edition === 'subscription')
 const proPortable = path.join(verifiedRoot, 'ModAgentP')
 copyTree(path.dirname(proReport.executable), proPortable)
 for (const [sourceName, targetName] of [
-  ['USER-GUIDE-v1.3.0.md', '使用教程.md'],
+  [`USER-GUIDE-v${packageInfo.version}.md`, '使用教程.md'],
   ['MODAGENT-P-MEMBERSHIP-GUIDE.md', 'ModAgent-P-会员教程.md'],
-  ['RELEASE-SECURITY-REVIEW-v1.3.0.md', '发行安全审查.md'],
+  [`RELEASE-SECURITY-REVIEW-v${packageInfo.version}.md`, '发行安全审查.md'],
 ]) {
   fs.copyFileSync(
     path.join(repoRoot, 'docs', sourceName),

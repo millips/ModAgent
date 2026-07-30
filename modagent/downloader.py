@@ -138,13 +138,25 @@ _NEXUS_MANUAL_GATES: dict[str, dict] = {}
 _NEXUS_MANUAL_GATE_SECONDS = 30
 
 
-def _nexus_files_page_url(game_slug: str, mod_id: int) -> str:
-    """Use the real Files tab; a bare file_id deep-link no longer hydrates it."""
-    return f"https://www.nexusmods.com/{game_slug}/mods/{int(mod_id)}?tab=files"
+def _nexus_files_page_url(
+    game_slug: str, mod_id: int, file_id: int = 0,
+) -> str:
+    """Open the Files tab while preserving the exact selected file identity."""
+    url = f"https://www.nexusmods.com/{game_slug}/mods/{int(mod_id)}?tab=files"
+    if int(file_id or 0) > 0:
+        url += f"&file_id={int(file_id)}"
+    return url
 
 
 def _nexus_gate_reason(state: dict, automated_stage: str = "") -> str:
     """Describe the observed gate without calling a signed-in user logged out."""
+    if automated_stage == "target-file-control-ambiguous":
+        return (
+            "Nexus 文件页同时存在多个版本按钮，页面没有把目标 file_id "
+            "唯一关联到可点击控件；为避免下载错版本，已跳过当前项"
+        )
+    if automated_stage in {"no-progress", "timeout"}:
+        return "Nexus 页面自动流程未产生新状态，已停止当前项的页面操作"
     if state.get("siteDownloadError"):
         return (
             "（Nexus 页面自身未生成下载位置："
@@ -912,6 +924,9 @@ async def _nexus_automate_slow_download(
       const all = deepQuery(document).filter(visible);
       const component = [...document.querySelectorAll('mod-file-download')]
         .find(el => String(el.getAttribute('file-id') || '') === String(fid));
+      const componentControls = component
+        ? deepQuery(component).filter(visible)
+        : [];
       const componentUrl = component?.getAttribute('download-url') || '';
       const componentLoggedIn = component?.getAttribute('user-is-logged-in') === 'true';
       if (/^https?:\\/\\//i.test(componentUrl)) {{
@@ -945,18 +960,31 @@ async def _nexus_automate_slow_download(
       const actionable = dialogs.length ? dialogs : all;
       const slow = actionable.find(el => /slow\\s*download/i.test(text(el)));
       if (slow) return prepare(slow, 'slow');
-      const exact = actionable.find(el => {{
+      const exact = [...componentControls, ...actionable].find(el => {{
         const hay = [
           el.href, el.dataset?.id, el.dataset?.fileId, el.getAttribute('data-file-id'),
           el.getAttribute('data-id'), el.getAttribute('onclick')
         ].filter(Boolean).join(' ');
         return /^(manual|manual\\s+download)$/i.test(text(el)) &&
-               (hay.includes(String(fid)) || location.search.includes('file_id=' + fid));
+               (componentControls.includes(el) || hay.includes(String(fid)));
       }});
-      const manual = exact || actionable.find(el =>
+      const genericManual = actionable.filter(el =>
         /^(manual|manual\\s+download)$/i.test(text(el))
       );
+      const manual = exact || (
+        genericManual.length === 1 ? genericManual[0] : null
+      );
       if (manual) return prepare(manual, 'manual');
+      if (!exact && genericManual.length > 1) {{
+        return {{
+          clicked: false,
+          stage: 'target-file-control-ambiguous',
+          targetFileId: fid,
+          manualControlCount: genericManual.length,
+          title: document.title,
+          url: location.href
+        }};
+      }}
       const files = all.find(el => {{
         const href = String(el.href || '');
         return /^files(?:\\s+\\d+)?$/i.test(text(el)) &&
@@ -1081,6 +1109,12 @@ async def _nexus_automate_slow_download(
             if isinstance(direct_url, str) and direct_url.startswith(("http://", "https://")):
                 return {"url": direct_url, "stage": "component-url"}
             stage = state.get("stage")
+            if stage == "target-file-control-ambiguous":
+                return {
+                    "url": "",
+                    "stage": stage,
+                    "state": state,
+                }
             partial_downloads = [
                 path for path in glob.glob(os.path.join(capture_dir, "*"))
                 if os.path.isfile(path)
@@ -1156,6 +1190,7 @@ async def _nexus_automate_slow_download(
                             str(state.get("url") or ""),
                             str(stage or ""),
                             capture_dir,
+                            int(file_id),
                         )
                     except Exception as exc:
                         fallback = {
@@ -1187,7 +1222,7 @@ async def _nexus_automate_slow_download(
                         )
             if not should_click and (
                 (state.get("login") and unchanged_state_count >= 4)
-                or unchanged_state_count >= 16
+                or unchanged_state_count >= 8
             ):
                 # A visible CAPTCHA is a recoverable wait state. Keep polling
                 # so a user who solves it early resumes in this same download
@@ -1283,7 +1318,7 @@ async def get_download_url_filepage(
     """
     import websockets
 
-    page_url = _nexus_files_page_url(game_slug, mod_id)
+    page_url = _nexus_files_page_url(game_slug, mod_id, file_id)
     captured = await _find_captured_nexus_download(cdp_port, game_slug, mod_id)
     if captured:
         _NEXUS_MANUAL_GATES.pop(game_slug, None)
@@ -1433,16 +1468,30 @@ async def get_download_url_filepage(
                 "site_download_error": state.get("siteDownloadError", ""),
                 "logged_in": bool(state.get("loggedIn")),
                 "login_required": bool(state.get("login")),
+                "adult_confirmation_required": bool(state.get("adult")),
                 "captcha": bool(state.get("captcha")),
+                "target_file_id": int(file_id),
+                "manual_control_count": int(
+                    state.get("manualControlCount") or 0
+                ),
             }
-            keep_tab = True
-            _NEXUS_MANUAL_GATES[game_slug] = {
-                "until": time.monotonic() + _NEXUS_MANUAL_GATE_SECONDS,
-                "page_url": state.get("url") or page_url,
-                "tab_id": tab.get("id", ""),
-                "mod_id": int(mod_id),
-                "file_id": int(file_id),
-            }
+            human_gate = bool(
+                state.get("login") or state.get("adult")
+                or state.get("captcha")
+            )
+            if human_gate:
+                keep_tab = True
+                _NEXUS_MANUAL_GATES[game_slug] = {
+                    "until": time.monotonic() + _NEXUS_MANUAL_GATE_SECONDS,
+                    "page_url": state.get("url") or page_url,
+                    "tab_id": tab.get("id", ""),
+                    "mod_id": int(mod_id),
+                    "file_id": int(file_id),
+                }
+            else:
+                _NEXUS_MANUAL_GATES.pop(game_slug, None)
+                _close_tab(cdp_port, tab.get("id", ""))
+                created_tab = False
             reason = _nexus_gate_reason(state, automated.get("stage", ""))
             raise NexusManualDownloadRequired(
                 state.get("url") or page_url,
