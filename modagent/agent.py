@@ -252,6 +252,8 @@ def is_broad_recommendation_request(value: str) -> bool:
     discovery = (
         "推荐", "搜索", "搜一下", "找一下", "找找", "找几个", "有没有mod",
         "有没有模组", "扩展mod", "扩展模组", "热门mod", "好玩的mod",
+        "最热门", "热门的", "最火", "最好", "最色", "人气", "火爆",
+        "值得装", "必装",
     )
     explicit_source = (
         "nexus", "thunderstore", "github", "gamebanana",
@@ -308,6 +310,10 @@ def explicit_install_target(value: str) -> dict[str, str]:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text:
         return {}
+    # “我没装的 / 尚未装的” describes a discovery filter, not permission to
+    # install a Mod literally named “的”.  Keep any separate positive install
+    # verb intact (for example “安装一个我没装的 X”).
+    text = re.sub(r"(?:还)?(?:没|未|没有|尚未)装(?:过)?", "", text)
     deictic = re.search(
         r"(.+?)(?:请|麻烦)?(?:帮我|给我)?(?:下载并安装|下载安装|安装|装上|装)"
         r"\s*(?:一下)?\s*(?:这个|它)(?:\s*(?:mod|模组))?",
@@ -894,7 +900,15 @@ class Agent:
             support = data.get("decision_support") or {}
             return str(support.get("summary") or "禁用影响预览已生成；等待你的确认")
         if name == "batch_download":
-            return f"下载进度：成功 {len(data.get('success') or [])} 项，待处理 {len(data.get('failed') or [])} 项"
+            succeeded = len(data.get("success") or [])
+            waiting = len(data.get("pending_verification") or [])
+            failed = len(data.get("failed") or [])
+            parts = [f"下载完成 {succeeded} 项"]
+            if waiting:
+                parts.append(f"等待人机验证 {waiting} 项")
+            if failed:
+                parts.append(f"失败 {failed} 项")
+            return "；".join(parts)
         if name == "mod_install_batch":
             return f"安装结果：成功 {data.get('succeeded', 0)}/{data.get('total', 0)} 项"
         if name == "mod_download" and data.get("local_path"):
@@ -903,6 +917,76 @@ class Agent:
         if data.get("already_installed"):
             return "已存在，已跳过重复操作"
         return labels.get(name, ("已完成 " if ok else "未完成 ") + name)
+
+    @staticmethod
+    def _format_install_completion_report(reports: list[dict]) -> str:
+        """Build an auditable result from tool facts instead of generic prose."""
+        items = []
+        snapshots = []
+        for report in reports:
+            snapshot_id = str(report.get("snapshot_id") or "").strip()
+            if snapshot_id and snapshot_id not in snapshots:
+                snapshots.append(snapshot_id)
+            if isinstance(report.get("results"), list):
+                items.extend(report["results"])
+            else:
+                items.append({
+                    "mod_id": report.get("mod_id", ""),
+                    "ok": not bool(report.get("error")),
+                    "name": report.get("name", ""),
+                    "version": report.get("version", ""),
+                    "files": len(report.get("files_installed") or []),
+                    "files_installed": report.get("files_installed") or [],
+                    "dependencies": report.get("dependencies") or [],
+                    "warnings": report.get("warnings") or [],
+                    "status": (
+                        "already_installed"
+                        if report.get("already_installed")
+                        else "installed"
+                    ),
+                    "error": report.get("error", ""),
+                })
+        succeeded = sum(1 for item in items if item.get("ok"))
+        lines = [
+            f"安装完成：成功 {succeeded}/{len(items)} 项。",
+            "",
+            "| 目标 | 结果 | 版本 | 写入文件 | 依赖/警告 |",
+            "|---|---|---|---:|---|",
+        ]
+        for item in items:
+            name = str(
+                item.get("name") or item.get("mod_id") or "未命名 Mod"
+            ).replace("|", "\\|")
+            version = str(item.get("version") or "未提供").replace("|", "\\|")
+            if item.get("ok"):
+                result = (
+                    "已存在，跳过重复安装"
+                    if item.get("status") == "already_installed"
+                    else "安装成功"
+                )
+            else:
+                result = "失败：" + str(item.get("error") or "未知错误")
+            dependencies = item.get("dependencies") or []
+            warnings = item.get("warnings") or []
+            notes = []
+            if dependencies:
+                notes.append(f"依赖 {len(dependencies)} 项已核验")
+            else:
+                notes.append("未声明额外依赖")
+            if warnings:
+                notes.append(f"警告 {len(warnings)} 项")
+            lines.append(
+                f"| {name} | {result} | {version} | "
+                f"{int(item.get('files') or len(item.get('files_installed') or []))} | "
+                f"{'；'.join(notes)} |"
+            )
+        if snapshots:
+            lines.extend(["", "安全快照：" + "、".join(snapshots)])
+        lines.extend([
+            "",
+            "本轮没有继续搜索、替换未选候选或处理历史中的其他目标。",
+        ])
+        return "\n".join(lines)
 
     @staticmethod
     def _ensure_disable_decision_support(reply: str, persisted: list[dict]) -> str:
@@ -1539,6 +1623,7 @@ class Agent:
         recommendation_evidence: list[tuple[str, str]] = []
         recommendation_update: dict = {}
         completed_install_names: list[str] = []
+        completed_install_reports: list[dict] = []
         completed_update_names: list[str] = []
 
         # 开发者模式:开一个轮次(记录 pre_history 供重放)
@@ -1603,14 +1688,25 @@ class Agent:
                             if (
                                 install_result.get("files_installed")
                                 or install_result.get("already_installed")
+                                or (
+                                    t["function"]["name"] == "mod_install_batch"
+                                    and isinstance(install_result.get("results"), list)
+                                )
                             ):
+                                completed_install_reports.append(install_result)
                                 installed_name = str(
                                     install_result.get("name")
                                     or args.get("mod_id")
                                     or "已选 Mod"
                                 )
-                                if installed_name not in completed_install_names:
-                                    completed_install_names.append(installed_name)
+                                batch_names = [
+                                    str(item.get("name") or item.get("mod_id") or "").strip()
+                                    for item in (install_result.get("results") or [])
+                                    if isinstance(item, dict) and item.get("ok")
+                                ]
+                                for name in batch_names or [installed_name]:
+                                    if name and name not in completed_install_names:
+                                        completed_install_names.append(name)
                         if (
                             Tier.can(
                                 getattr(self.cfg, "tier", Tier.FREE),
@@ -1743,10 +1839,8 @@ class Agent:
                             )
                         )
                     ):
-                        installed = "、".join(completed_install_names) or "已确认目标"
-                        final_text = (
-                            f"已完成本次明确确认的安装：{installed}。"
-                            "本轮已在这里结束，没有继续搜索、替换候选或处理历史中的其他目标。"
+                        final_text = self._format_install_completion_report(
+                            completed_install_reports
                         )
                         yield self._emit({"chunk": final_text})
                         persist.append({

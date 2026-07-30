@@ -1,7 +1,7 @@
 import json
 import os
 
-from modagent import api, db, scanner, tools
+from modagent import api, db, scanner, snapshot, tools
 from modagent.agent import (
     explicit_install_target,
     is_broad_recommendation_request,
@@ -143,6 +143,31 @@ def test_snapshot_guard_uses_install_instance_identity(tmp_path, monkeypatch):
     assert rejected.get("requires_confirmation") is not True
 
 
+def test_snapshot_locator_recovers_historical_bucket_without_false_invalid(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(db, "DB_FILE", str(tmp_path / "state.db"))
+    monkeypatch.setattr(snapshot, "SNAPSHOTS_DIR", str(tmp_path / "snapshots"))
+    db.init_db()
+    db.add_snapshot(db.Snapshot(
+        id="snap_historical",
+        timestamp=1,
+        files="[]",
+        trigger_mod_name="legacy",
+        game_slug="gi_current",
+    ))
+    historical = tmp_path / "snapshots" / "repo" / "snap_historical"
+    historical.mkdir(parents=True)
+    (historical / "manifest.json").write_text(json.dumps({
+        "snapshot_id": "snap_historical",
+        "files": [],
+    }), encoding="utf-8")
+
+    assert snapshot.find_snapshot_dir("snap_historical", "gi_current") == str(historical)
+    assert api.list_snapshots("gi_current")[0]["valid"] is True
+    assert api.snapshots_reconcile("gi_current")["invalid"] == []
+
+
 def test_github_requires_game_and_mod_evidence(monkeypatch):
     queries = []
 
@@ -181,6 +206,7 @@ def test_github_requires_game_and_mod_evidence(monkeypatch):
 
 def test_broad_discovery_and_contextual_entity_normalization():
     assert is_broad_recommendation_request("帮我找找有没有扩展 Mod")
+    assert is_broad_recommendation_request("还有没有最色、最热门的我没装的？")
     assert not is_broad_recommendation_request("去 GitHub 搜 BepInEx")
     for misspelling in ("benplex", "beniplex", "bepin ex"):
         parsed = explicit_install_target(f"你先装 {misspelling} 吧")

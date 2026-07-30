@@ -703,10 +703,7 @@ def list_snapshots(game_slug: str = ""):
     def _valid(s):
         # 账本 ≠ 事实:v0.8 的病是目录删了照列不误、回滚按钮照点不误。
         # 列表直接带失效标记,前端标灰 + 禁用回滚。
-        d = os.path.join(snapshot.SNAPSHOTS_DIR, s.game_slug or "", s.id)
-        if not os.path.isdir(d):
-            d = os.path.join(snapshot.SNAPSHOTS_DIR, s.id)
-        return os.path.exists(os.path.join(d, "manifest.json"))
+        return bool(snapshot.find_snapshot_dir(s.id, s.game_slug or ""))
 
     return [{"id": s.id, "timestamp": s.timestamp, "trigger_mod_name": s.trigger_mod_name,
              "files_count": _count(s), "game_slug": s.game_slug,
@@ -724,9 +721,7 @@ def get_snapshot_detail(sid: str):
     snap = db.get_snapshot(sid)
     if not snap:
         raise HTTPException(404, "Snapshot not found")
-    snap_dir = os.path.join(snapshot.SNAPSHOTS_DIR, snap.game_slug or "", sid)
-    if not os.path.isdir(snap_dir):
-        snap_dir = os.path.join(snapshot.SNAPSHOTS_DIR, sid)
+    snap_dir = snapshot.find_snapshot_dir(sid, snap.game_slug or "")
     manifest_path = os.path.join(snap_dir, "manifest.json")
     files = []
     if os.path.exists(manifest_path):
@@ -771,10 +766,7 @@ def snapshots_reconcile(game_slug: str = "", clean: bool = False):
     snaps = db.list_snapshots(slug) if slug else db.list_snapshots()
     invalid = []
     for s in snaps:
-        d = os.path.join(snapshot.SNAPSHOTS_DIR, s.game_slug or "", s.id)
-        if not os.path.isdir(d):
-            d = os.path.join(snapshot.SNAPSHOTS_DIR, s.id)
-        if not os.path.exists(os.path.join(d, "manifest.json")):
+        if not snapshot.find_snapshot_dir(s.id, s.game_slug or ""):
             invalid.append(s.id)
             if clean:
                 db.delete_snapshot(s.id)

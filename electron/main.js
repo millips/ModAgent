@@ -19,6 +19,12 @@ const PACKAGE_INFO = require('./package.json');
 const IDENTITY = getAppIdentity(PACKAGE_INFO);
 const APP_EDITION = IDENTITY.edition;
 const IS_SMOKE_TEST = process.argv.includes('--smoke-test');
+// Packaged smoke tests run without a user-visible desktop session on some
+// builders. Chromium's GPU subprocess can fail there before the renderer is
+// created, which is unrelated to the packaged app's backend/renderer health.
+// Keep normal launches hardware accelerated and make only smoke mode headless-
+// environment safe.
+if (IS_SMOKE_TEST) app.disableHardwareAcceleration();
 // ModAgent's startup cue is part of the desktop shell, not page media. Allow it
 // to begin as soon as the renderer is ready; the renderer still retries safely
 // on the first gesture if a device is temporarily unavailable.

@@ -57,6 +57,37 @@ def test_source_alignment_exposes_item_counter_and_current_name():
     progress.finish()
 
 
+def test_download_phase_is_exposed_without_faking_byte_progress():
+    progress.start(
+        [{"mod_id": "nexus-1", "name": "Example", "source": "nexus"}],
+        task_kind="download",
+        label="下载 Mod",
+    )
+    progress.set_phase(
+        "nexus-1",
+        "waiting_verification",
+        label="等待完成人机验证",
+        detail="验证完成后会自动继续",
+        status="waiting_verification",
+    )
+    waiting = progress.snapshot()
+    assert waiting["current_item"]["phase"] == "waiting_verification"
+    assert waiting["current_item"]["phase_label"] == "等待完成人机验证"
+    assert waiting["current_item"]["detail"] == "验证完成后会自动继续"
+    assert waiting["overall_pct"] == 0
+
+    progress.set_phase(
+        "nexus-1",
+        "browser_download_complete",
+        label="浏览器下载完成",
+        status="processing",
+    )
+    resumed = progress.snapshot()
+    assert resumed["current_item"]["phase"] == "browser_download_complete"
+    assert resumed["current_item"]["status"] == "processing"
+    progress.finish(cancelled=True)
+
+
 def test_exclusive_task_can_be_cancelled_without_being_overwritten():
     assert progress.start(
         [{"mod_id": "a", "name": "Alpha"}],

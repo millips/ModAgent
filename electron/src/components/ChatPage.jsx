@@ -19,6 +19,15 @@ const SIDE_EFFECT_TOOLS = new Set([
   'workshop_install', 'workshop_uninstall',
 ])
 
+// These tools change the current game's managed inventory.  Refresh the
+// dashboard immediately after a successful result instead of waiting for the
+// user to visit the Mod page or rescan the game.
+const REFRESH_AFTER_SUCCESS_TOOLS = new Set([
+  'mod_install', 'mod_install_batch', 'mod_install_custom',
+  'mod_uninstall', 'mod_update', 'mod_disable', 'mod_enable',
+  'import_existing_mods', 'workshop_install', 'workshop_uninstall',
+])
+
 // 面向普通用户隐藏低层网页侦察与只读校验。完整轨迹仍保存在会话数据库和
 // 开发者面板；聊天区只展示下载/安装/快照等用户关心的阶段动作。
 const QUIET_TOOLS = new Set([
@@ -454,16 +463,22 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         if (!response.ok) return
         const download = await response.json()
         if (cancelled || !download?.active || !Array.isArray(download.items)) return
-        const current = download.items.find(item => item.status === 'downloading')
+        const current = download.current_item
+          || download.items.find(item => ['downloading', 'processing', 'waiting_verification'].includes(item.status))
         const currentLabel = current?.name
           ? `${current.name}${current.source_label ? `（${current.source_label}）` : ''}`
           : ''
+        const phaseLabel = String(current?.phase_label || '').trim()
+        const isTransfer = ['browser_downloading', 'transferring'].includes(current?.phase)
         setTaskProgress(previous => ({
           ...(previous || {}),
-          label: currentLabel ? `正在下载：${currentLabel}` : `正在下载 ${download.items.length} 个 Mod`,
-          mode: 'determinate',
+          label: currentLabel
+            ? `${phaseLabel || '正在处理'}：${currentLabel}`
+            : phaseLabel || `正在处理 ${download.items.length} 个 Mod`,
+          detail: current?.detail || '',
+          mode: isTransfer ? 'determinate' : 'indeterminate',
           pct: Number(download.overall_pct) || 0,
-          etaSeconds: download.eta_seconds,
+          etaSeconds: isTransfer ? download.eta_seconds : null,
           expectedSeconds: null,
         }))
       } catch (_) {}
@@ -573,6 +588,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       if (data.tool_result) {
         recoveryAgentRef.current = { id: null, text: '' }
         const tr = data.tool_result
+        if (tr.ok && REFRESH_AFTER_SUCCESS_TOOLS.has(tr.name)) {
+          onRefresh?.()
+        }
         if (!QUIET_TOOLS.has(tr.name)) {
           setMessages(prev => [...prev, {
             id: mkId(), role: 'sys', kind: 'tool', ok: tr.ok, name: tr.name,
@@ -1005,6 +1023,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             if (data.tool_result) {
               curAgentId = null
               const tr = data.tool_result
+              if (tr.ok && REFRESH_AFTER_SUCCESS_TOOLS.has(tr.name)) {
+                onRefresh?.()
+              }
               if (
                 options.selectionAction === 'confirm'
                 && ['mod_download', 'batch_download', 'mod_install', 'mod_install_batch', 'mod_install_custom'].includes(tr.name)

@@ -21,6 +21,7 @@ export default function DownloadPanel({ api }) {
   const [dismissed, setDismissed] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const previous = useRef(null)
+  const startedGeneration = useRef(null)
 
   useEffect(() => {
     let timer
@@ -31,14 +32,28 @@ export default function DownloadPanel({ api }) {
         const s = await r.json()
         if (!s || !Array.isArray(s.items)) throw new Error('invalid download status')
         const prev = previous.current
+        const generation = s.generation ?? 0
+        const actualTransfer = s.items.some(item => [
+          'browser_downloading', 'browser_download_complete', 'transferring',
+        ].includes(item.phase))
+        if (actualTransfer && startedGeneration.current !== generation) {
+          startedGeneration.current = generation
+          setDismissed(false)
+          emitFeedback('download-start', { count: s.items.length })
+        }
         if (prev) {
           if (s.active && !prev.active) {
             setDismissed(false)
-            emitFeedback('download-start', { count: s.items.length })
           }
           const oldItems = new Map(prev.items.map((item, index) => [String(item.mod_id ?? index), item]))
           s.items.forEach((item, index) => {
             const old = oldItems.get(String(item.mod_id ?? index))
+            if (item.phase === 'waiting_verification' && old?.phase !== 'waiting_verification') {
+              emitFeedback('warning', { modId: item.mod_id, name: item.name })
+            }
+            if (item.phase === 'verification_resolved' && old?.phase === 'waiting_verification') {
+              emitFeedback('notice', { modId: item.mod_id, name: item.name })
+            }
             if (item.status === 'done' && old?.status !== 'done') {
               emitFeedback('download-item-complete', { modId: item.mod_id, name: item.name })
             }
@@ -48,7 +63,6 @@ export default function DownloadPanel({ api }) {
           }
         } else if (s.active) {
           setDismissed(false)
-          emitFeedback('download-start', { count: s.items.length })
         }
         previous.current = s
         setState(s)
@@ -71,6 +85,8 @@ export default function DownloadPanel({ api }) {
   const overall = finished && !failed && !cancelledCount
     ? 100 : Math.max(0, Math.min(100, Number(state.overall_pct) || 0))
   const eta = state.eta_seconds == null ? '正在估算' : `约 ${formatDuration(state.eta_seconds)}`
+  const currentPhase = state.current_item?.phase || ''
+  const showEta = ['browser_downloading', 'transferring'].includes(currentPhase)
   const taskLabels = {
     source_align: ['来源对齐已结束', '正在对齐维护来源'],
     update_check: ['更新检查已结束', '正在检查更新'],
@@ -133,7 +149,7 @@ export default function DownloadPanel({ api }) {
           <span>{overall.toFixed(overall % 1 ? 1 : 0)}%</span>
           <span className="flex items-center gap-1"><Clock3 size={10} />
             已用 {formatDuration(state.elapsed_seconds)}
-            {state.active && state.eta_seconds != null ? ` · 剩余 ${eta}` : ''}
+            {state.active && showEta && state.eta_seconds != null ? ` · 剩余 ${eta}` : ''}
           </span>
         </div>
         <div className="h-1.5 mt-1 rounded-full bg-surface-700 overflow-hidden">
@@ -148,7 +164,8 @@ export default function DownloadPanel({ api }) {
               <span className="shrink-0">
                 {it.status === 'done' ? <Check size={12} className="text-cyber-green" />
                   : it.status === 'failed' ? <AlertCircle size={12} className="text-cyber-red" />
-                  : ['processing', 'downloading'].includes(it.status) ? <Loader2 size={12} className="text-cyber-cyan animate-spin" />
+                  : ['processing', 'downloading', 'waiting_verification'].includes(it.status)
+                    ? <Loader2 size={12} className="text-cyber-cyan animate-spin" />
                   : <span className="block w-3 h-3 rounded-full border border-surface-500" />}
               </span>
               <span
@@ -161,16 +178,20 @@ export default function DownloadPanel({ api }) {
                 {it.status === 'done' ? '完成'
                   : it.status === 'failed' ? '失败'
                   : it.status === 'cancelled' ? '已取消'
-                  : it.status === 'downloading' ? `${it.pct}%`
+                  : it.phase_label || (it.status === 'downloading' ? `${it.pct}%`
                   : it.status === 'processing' ? '处理中'
-                  : '等待'}
+                  : it.status === 'waiting_verification' ? '等待验证'
+                  : '等待')}
               </span>
             </div>
             <div className="h-1 rounded-full bg-surface-700 overflow-hidden">
               <div className={`h-full rounded-full transition-all duration-300 ${
                 it.status === 'failed' ? 'bg-cyber-red' : it.status === 'done' ? 'bg-cyber-green' : 'bg-cyber-cyan'}`}
-                style={{ width: `${it.status === 'done' ? 100 : ['queued', 'processing'].includes(it.status) ? 3 : it.pct}%` }} />
+                style={{ width: `${it.status === 'done' ? 100 : ['queued', 'processing', 'waiting_verification'].includes(it.status) ? 3 : it.pct}%` }} />
             </div>
+            {it.detail && !['done', 'failed'].includes(it.status) && (
+              <div className="mt-1 text-[10px] text-surface-400 truncate" title={it.detail}>{it.detail}</div>
+            )}
             {it.status === 'failed' && it.error && (
               <div className="mt-1 text-[10px] text-cyber-red/80 truncate" title={it.error}>{it.error}</div>
             )}

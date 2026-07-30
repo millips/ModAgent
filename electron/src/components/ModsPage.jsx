@@ -338,6 +338,8 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     const lockId = `align:${item.mod_id}`
     if (actionLock) return
     setActionLock(lockId)
+    const controller = new AbortController()
+    const timeoutId = window.setTimeout(() => controller.abort(), 30000)
     try {
       const body = {
         local_mod_id: String(item.mod_id),
@@ -352,7 +354,9 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       const response = await fetch(api + '/tool/mod_source_bind', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: controller.signal,
       })
+      if (!response.ok) throw new Error(`来源绑定请求失败 (${response.status})`)
       const envelope = await response.json()
       const result = JSON.parse(envelope.result || '{}')
       if (result.error || !result.bound) throw new Error(result.error || '绑定失败')
@@ -366,8 +370,12 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       await loadFromApi()
       onRefresh?.()
     } catch (error) {
-      toast(error?.message || '确认绑定失败', 'error')
+      const message = error?.name === 'AbortError'
+        ? '来源确认超过 30 秒，已停止等待；此前确认项不会丢失，请稍后重试'
+        : (error?.message || '确认绑定失败')
+      toast(message, 'error')
     } finally {
+      window.clearTimeout(timeoutId)
       setActionLock(null)
     }
   }
@@ -1134,7 +1142,12 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                             disabled={!!actionLock}
                             onClick={() => confirmAlignmentCandidate(item, candidate)}
                           >
-                            确认此来源
+                            {actionLock === `align:${item.mod_id}` ? (
+                              <span className="inline-flex items-center gap-1.5">
+                                <RefreshCw size={12} className="animate-spin" />
+                                确认中
+                              </span>
+                            ) : '确认此来源'}
                           </button>
                         </div>
                       </div>

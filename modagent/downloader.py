@@ -9,6 +9,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -826,6 +827,7 @@ async def _cdp_command(
 
 async def _nexus_automate_slow_download(
     ws, file_id: int, cdp_port: int = 0,
+    stage_callback: Optional[Callable] = None,
 ) -> dict:
     """Drive Nexus' free-account UI and capture the generated CDN URL.
 
@@ -1005,6 +1007,21 @@ async def _nexus_automate_slow_download(
     )
     os.makedirs(capture_dir, exist_ok=True)
     capture_started = time.time()
+    last_reported_phase = ""
+
+    def report_phase(phase: str, detail: str = "") -> None:
+        nonlocal last_reported_phase
+        if not stage_callback:
+            return
+        if phase == last_reported_phase and not detail:
+            return
+        last_reported_phase = phase
+        try:
+            stage_callback(phase, detail)
+        except Exception:
+            pass
+
+    report_phase("browser_opened", "Nexus 文件页已打开")
     for old_path in glob.glob(os.path.join(capture_dir, "*")):
         try:
             if os.path.isfile(old_path):
@@ -1034,6 +1051,10 @@ async def _nexus_automate_slow_download(
         ]
         if completed_downloads:
             newest = max(completed_downloads, key=os.path.getmtime)
+            report_phase(
+                "browser_download_complete",
+                f"浏览器下载完成：{os.path.basename(newest)}",
+            )
             return {
                 "url": Path(newest).resolve().as_uri(),
                 "local_path": os.path.abspath(newest),
@@ -1060,6 +1081,25 @@ async def _nexus_automate_slow_download(
             if isinstance(direct_url, str) and direct_url.startswith(("http://", "https://")):
                 return {"url": direct_url, "stage": "component-url"}
             stage = state.get("stage")
+            partial_downloads = [
+                path for path in glob.glob(os.path.join(capture_dir, "*"))
+                if os.path.isfile(path)
+                and path.lower().endswith((".crdownload", ".tmp"))
+            ]
+            if partial_downloads:
+                report_phase("browser_downloading", "浏览器正在接收文件")
+            elif state.get("captcha"):
+                report_phase(
+                    "waiting_verification",
+                    "请在已打开的 Nexus 页面完成人机验证；完成后会自动继续",
+                )
+            elif last_reported_phase == "waiting_verification":
+                report_phase(
+                    "verification_resolved",
+                    "已检测到验证完成，正在继续下载",
+                )
+            elif stage in {"manual", "slow", "intermediate", "files"}:
+                report_phase("browser_preparing", "正在操作 Nexus 下载页面")
             action_key = "|".join([
                 str(state.get("url") or ""),
                 str(stage or ""),
@@ -1127,6 +1167,10 @@ async def _nexus_automate_slow_download(
                     fallback_downloads = fallback.get("downloads") or []
                     if fallback_downloads:
                         newest = max(fallback_downloads, key=os.path.getmtime)
+                        report_phase(
+                            "browser_download_complete",
+                            f"浏览器下载完成：{os.path.basename(newest)}",
+                        )
                         return {
                             "url": Path(newest).resolve().as_uri(),
                             "local_path": os.path.abspath(newest),
@@ -1136,11 +1180,21 @@ async def _nexus_automate_slow_download(
                 if clicked:
                     clicked_actions.add(action_key)
                     unchanged_state_count = 0
+                    if stage == "slow":
+                        report_phase(
+                            "browser_downloading",
+                            "已触发 Nexus 免费下载，正在等待浏览器接收文件",
+                        )
             if not should_click and (
-                (state.get("captcha") and unchanged_state_count >= 12)
-                or (state.get("login") and unchanged_state_count >= 4)
+                (state.get("login") and unchanged_state_count >= 4)
                 or unchanged_state_count >= 16
             ):
+                # A visible CAPTCHA is a recoverable wait state. Keep polling
+                # so a user who solves it early resumes in this same download
+                # instead of producing a failed batch followed by a retry.
+                if state.get("captcha"):
+                    await asyncio.sleep(0.75)
+                    continue
                 return {
                     "url": "",
                     "stage": "human-verification" if state.get("captcha") else "no-progress",
@@ -1170,7 +1224,15 @@ async def _nexus_automate_slow_download(
         else:
             await asyncio.sleep(0.75)
 
-    return {"url": "", "stage": "timeout", "state": last_state}
+    return {
+        "url": "",
+        "stage": (
+            "human-verification"
+            if isinstance(last_state, dict) and last_state.get("captcha")
+            else "timeout"
+        ),
+        "state": last_state,
+    }
 
 
 async def _find_captured_nexus_download(
@@ -1207,7 +1269,8 @@ async def _find_captured_nexus_download(
 
 
 async def get_download_url_filepage(
-    cdp_port: int, game_slug: str, mod_id: int, file_id: int, game_id: int
+    cdp_port: int, game_slug: str, mod_id: int, file_id: int, game_id: int,
+    stage_callback: Optional[Callable] = None,
 ) -> str:
     """免费账号通路:专开一个标签页导航到该 mod 的文件页,在**正确的页面上下文**里
     请求 GenerateDownloadUrl(免费账号该接口校验来源页,从首页/其他页发起必 403)。
@@ -1355,6 +1418,7 @@ async def get_download_url_filepage(
 
             automated = await _nexus_automate_slow_download(
                 ws, file_id, cdp_port=cdp_port,
+                stage_callback=stage_callback,
             )
             automated_url = automated.get("url", "")
             if automated_url:
@@ -1530,6 +1594,58 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
         )
 
     _raise_if_download_cancelled()
+    os.replace(tmp_path, local_path)
+    return local_path
+
+
+def import_local_download(
+    source_path: str,
+    local_path: str,
+    progress_callback: Optional[Callable] = None,
+) -> str:
+    """Move a browser-completed file into managed cache without downloading it again."""
+    _raise_if_download_cancelled()
+    source_path = os.path.abspath(source_path)
+    local_path = os.path.abspath(local_path)
+    if source_path == local_path:
+        if progress_callback:
+            progress_callback(1.0)
+        return local_path
+    if not os.path.isfile(source_path):
+        raise DownloadFailure(
+            "浏览器报告下载完成，但临时文件已经不存在。",
+            failure_kind="browser_file_missing",
+            retryable=True,
+            attempts=1,
+        )
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    tmp_path = local_path + ".part"
+    for stale in (tmp_path,):
+        try:
+            if os.path.exists(stale):
+                os.remove(stale)
+        except OSError:
+            pass
+    try:
+        # Browser capture and managed cache normally share one volume, making
+        # this an atomic metadata move instead of a second 100 MB byte stream.
+        os.replace(source_path, tmp_path)
+        if progress_callback:
+            progress_callback(1.0)
+    except OSError:
+        total = max(1, os.path.getsize(source_path))
+        copied = 0
+        with open(source_path, "rb") as src, open(tmp_path, "wb") as dst:
+            while True:
+                _raise_if_download_cancelled()
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                copied += len(chunk)
+                if progress_callback:
+                    progress_callback(min(copied / total, 1.0))
+        os.remove(source_path)
     os.replace(tmp_path, local_path)
     return local_path
 
@@ -1716,17 +1832,23 @@ async def download_mod(
     api_key: str,
     cdp_port: int = 18888,
     progress_callback: Optional[Callable] = None,
+    stage_callback: Optional[Callable] = None,
     file_id: Optional[int] = None,
 ) -> dict:
     """完整下载一个 mod 的标准流程（按 SOP）。传入 file_id 可直接下载指定变体。"""
     # 0. 检查本地缓存 — 命中直接返回，不要求开 Chrome
     cached = find_cached_nexus_download(game_slug, mod_id, file_id)
     if cached:
+        if stage_callback:
+            stage_callback("cache_hit", "已命中 ModAgent 下载缓存")
         return {"mod_id": mod_id, "file_id": file_id,
-                "local_path": cached, "cached": True}
+                "local_path": cached, "cached": True,
+                "download_stage": "cache_hit"}
 
     # 1. 前置检查 — 真要下载才需要 Chrome
     ws_url = preflight_check(cdp_port, api_key)
+    if stage_callback:
+        stage_callback("preparing", "正在确认 Nexus 文件与下载页面")
 
     # 2. 获取 file_id（未指定时自动解析；指定则跳过，直接下载该变体）
     if file_id is None:
@@ -1770,6 +1892,7 @@ async def download_mod(
             if not cdn_url:
                 cdn_url = await get_download_url_filepage(
                     cdp_port, game_slug, mod_id, file_id, game_id,
+                    stage_callback=stage_callback,
                 )
         except NexusManualDownloadRequired as exc:
             if direct_failure:
@@ -1788,18 +1911,41 @@ async def download_mod(
             continue
 
         try:
-            download_file(cdn_url, local_path, progress_callback)  # 内部断点续传 + 字节完整性校验
+            parsed_url = urllib.parse.urlparse(cdn_url)
+            if parsed_url.scheme.lower() == "file":
+                browser_path = urllib.request.url2pathname(parsed_url.path)
+                if parsed_url.netloc:
+                    browser_path = f"//{parsed_url.netloc}{browser_path}"
+                if stage_callback:
+                    stage_callback(
+                        "importing",
+                        "浏览器下载已完成，正在导入 ModAgent 缓存",
+                    )
+                import_local_download(
+                    browser_path, local_path, progress_callback
+                )
+                transfer_stage = "browser_download"
+            else:
+                if stage_callback:
+                    stage_callback("transferring", "正在接收下载文件")
+                download_file(cdn_url, local_path, progress_callback)  # 内部断点续传 + 字节完整性校验
+                transfer_stage = "direct_download"
         except Exception as e:
             last_err = e  # 链接中途失效/断流 → 保留 .part，下次用新链续传
             await asyncio.sleep(2)
             continue
 
         # 字节完整 → 再验解压完整性（抓"满大小但内部损坏"）
+        if stage_callback:
+            stage_callback("verifying", "正在校验压缩包完整性")
         if _verify_archive(local_path):
             _remember_download(local_path, game_slug, mod_id, file_id)
+            if stage_callback:
+                stage_callback("download_complete", "文件已下载并校验通过")
             return {
                 "mod_id": mod_id, "file_id": file_id, "local_path": local_path,
                 "cached": False, "mod_name": mod_name, "version": version,
+                "download_stage": transfer_stage,
             }
         # 损坏 → 删掉（含 .part）重新整下
         last_err = RuntimeError("压缩包完整性校验失败")

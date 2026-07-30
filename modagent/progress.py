@@ -67,6 +67,9 @@ def start(
             "status": "queued",  # queued | downloading | done | failed
             "pct": 0,
             "error": "",
+            "phase": "queued",
+            "phase_label": "等待处理",
+            "detail": "",
         } for m in mods]
         _state["task_kind"] = str(task_kind or "download")
         _state["label"] = str(label or "")
@@ -108,6 +111,11 @@ def set_status(mod_id, status: str, error: str = ""):
             it["status"] = status
             if status == "done":
                 it["pct"] = 100
+                it["phase"] = "complete"
+                it["phase_label"] = "处理完成"
+            elif status == "failed":
+                it["phase"] = "failed"
+                it["phase_label"] = "处理失败"
             if error:
                 it["error"] = error[:200]
         now = time.time()
@@ -123,6 +131,30 @@ def set_pct(mod_id, pct: int):
         if it:
             it["status"] = "downloading"
             it["pct"] = max(0, min(100, int(pct)))
+        now = time.time()
+        _state["updated"] = now
+        _record_sample(now)
+
+
+def set_phase(
+    mod_id, phase: str, label: str = "", detail: str = "",
+    *, status: str = "", pct: int | None = None,
+):
+    """Publish the real workflow stage instead of reducing everything to download."""
+    with _lock:
+        if not _owns_current_task():
+            return
+        it = _find(mod_id)
+        if it:
+            it["phase"] = str(phase or "processing")
+            it["phase_label"] = str(label or phase or "处理中")
+            it["detail"] = str(detail or "")[:240]
+            if status:
+                it["status"] = status
+            elif it.get("status") in {"queued", "downloading"}:
+                it["status"] = "processing"
+            if pct is not None:
+                it["pct"] = max(0, min(100, int(pct)))
         now = time.time()
         _state["updated"] = now
         _record_sample(now)
@@ -256,11 +288,19 @@ def snapshot() -> dict:
                 {
                     "mod_id": item.get("mod_id"),
                     "name": item.get("name", ""),
+                    "source": item.get("source", ""),
+                    "source_label": item.get("source_label", ""),
                     "status": item.get("status", ""),
+                    "phase": item.get("phase", ""),
+                    "phase_label": item.get("phase_label", ""),
+                    "detail": item.get("detail", ""),
                 }
                 for item in _state["items"]
-                if item.get("status") in {"processing", "downloading"}
+                if item.get("status") in {
+                    "processing", "downloading", "waiting_verification"
+                }
             ), None),
+            "generation": _state["generation"],
             "updated": _state["updated"],
             "started": _state["started"],
             "elapsed_seconds": max(0, round(now - _state["started"])) if _state["started"] else 0,

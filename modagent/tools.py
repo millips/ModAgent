@@ -25,6 +25,39 @@ from .inventory_match import find_installed_duplicate
 from . import task_control
 
 
+_DOWNLOAD_PHASE_LABELS = {
+    "cache_hit": "已命中下载缓存",
+    "preparing": "正在确认文件信息",
+    "browser_opened": "已打开 Nexus 下载页面",
+    "browser_preparing": "正在操作 Nexus 下载页面",
+    "waiting_verification": "等待你完成人机验证",
+    "verification_resolved": "验证已完成，正在继续",
+    "browser_downloading": "浏览器正在下载",
+    "browser_download_complete": "浏览器下载已完成",
+    "transferring": "正在联网下载",
+    "importing": "正在导入浏览器下载",
+    "verifying": "正在校验压缩包",
+    "download_complete": "下载并校验完成",
+}
+
+
+def _publish_download_phase(mod_id: str, phase: str, detail: str = "") -> None:
+    status = (
+        "waiting_verification"
+        if phase == "waiting_verification"
+        else "downloading"
+        if phase in {"browser_downloading", "transferring"}
+        else "processing"
+    )
+    progress.set_phase(
+        mod_id,
+        phase,
+        _DOWNLOAD_PHASE_LABELS.get(phase, phase),
+        detail,
+        status=status,
+    )
+
+
 def _download_failure_payload(exc: Exception, tool_name: str) -> dict:
     """Normalize download failures so the Agent can stop or offer a later retry."""
     if isinstance(exc, task_control.TaskCancelled):
@@ -1679,17 +1712,20 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "name": requested_detail.get("name", "") or f"Nexus Mod {_mid}",
             "source": "nexus",
         }])
-        progress.set_status(_mid, "downloading")
+        _publish_download_phase(_mid, "preparing")
         try:
             result = asyncio.run(downloader.download_mod(
                 mod_id=_mid, game_slug=nexus_slug, game_id=nexus_gid,
                 api_key=api_key, cdp_port=cfg.chrome_cdp_port,
                 progress_callback=lambda f: progress.set_pct(_mid, int(f * 100)),
+                stage_callback=lambda phase, detail="": _publish_download_phase(
+                    _mid, phase, detail
+                ),
                 file_id=args.get("file_id")))
         except downloader.NexusManualDownloadRequired as e:
             progress.set_status(
                 _mid,
-                "queued" if e.existing_gate else "failed",
+                "queued" if e.existing_gate else "waiting_verification",
                 "因前一项暂停，尚未尝试" if e.existing_gate else "等待 Nexus 页面人工确认",
             )
             progress.finish()
@@ -1834,31 +1870,32 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         async def _batch():
             for m in mods:
                 mid = m["mod_id"]
-                progress.set_status(mid, "downloading")
+                _publish_download_phase(mid, "preparing")
                 try:
                     downloaded = await downloader.download_mod(
                         mod_id=mid, game_slug=nexus_slug, game_id=nexus_gid,
                         api_key=api_key, cdp_port=cfg.chrome_cdp_port,
                         file_id=m.get("file_id"),
-                        progress_callback=lambda f, _m=mid: progress.set_pct(_m, int(f * 100)))
+                        progress_callback=lambda f, _m=mid: progress.set_pct(_m, int(f * 100)),
+                        stage_callback=lambda phase, detail="", _m=mid: _publish_download_phase(
+                            _m, phase, detail
+                        ))
                     progress.set_status(mid, "done")
                     success.append({
                         "mod_id": mid,
                         "file_id": downloaded.get("file_id"),
                         "local_path": os.path.abspath(downloaded.get("local_path", "")),
                         "cached": bool(downloaded.get("cached")),
+                        "mod_name": downloaded.get("mod_name", ""),
+                        "version": downloaded.get("version", ""),
+                        "download_stage": downloaded.get("download_stage", ""),
                     })
                 except downloader.NexusManualDownloadRequired as e:
                     progress.set_status(
                         mid,
-                        "failed",
+                        "waiting_verification",
                         "该项等待 Nexus 页面验证；继续处理其他项",
                     )
-                    failed.append({
-                        "mod_id": mid,
-                        "error": "manual_download_required",
-                        "attempted": True,
-                    })
                     manual_action.append({
                         "mod_id": mid,
                         "page_url": e.page_url,
@@ -1874,6 +1911,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         return json.dumps({
             "success": success,
             "failed": failed,
+            "pending_verification": manual_action,
             "blocked_dependencies": blocked_dependencies,
             "skipped_installed": skipped_installed,
             "preflight_detected": preflight.get("detected", 0),
@@ -1948,8 +1986,27 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             if "error" in r:
                 results.append({"mod_id": mid, "ok": False, "error": r["error"]})
             else:
-                results.append({"mod_id": mid, "ok": True, "name": r.get("name", ""),
-                                "files": len(r.get("files_installed", []))})
+                verification = r.get("verification_report") or {}
+                results.append({
+                    "mod_id": mid,
+                    "ok": True,
+                    "name": r.get("name", ""),
+                    "version": r.get("version", ""),
+                    "files": len(r.get("files_installed", [])),
+                    "files_installed": r.get("files_installed", []),
+                    "dependencies": (
+                        verification.get("declared_dependencies")
+                        or verification.get("required_dependencies")
+                        or []
+                    ),
+                    "satisfied_dependencies": (
+                        verification.get("satisfied_dependencies") or []
+                    ),
+                    "source_binding": r.get("source_binding") or {},
+                    "warnings": r.get("warnings") or [],
+                    "cache_cleanup": r.get("cache_cleanup") or {},
+                    "status": r.get("status", "installed"),
+                })
         ok_n = sum(1 for r in results if r["ok"])
         return json.dumps({"snapshot_id": batch_snap, "total": len(ids), "succeeded": ok_n,
                            "failed": len(ids) - ok_n, "results": results},
@@ -2146,6 +2203,8 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         cache_cleanup = downloader.cleanup_installed_archive(local_path)
         return json.dumps({"snapshot_id": snap_id, "files_installed": files_installed,
                            "load_order": lo, "name": mod_name,
+                           "version": mod_ver,
+                           "dependencies": mod_deps,
                            "source_binding": source_binding,
                            "verification_report": source_preflight,
                            "cache_cleanup": cache_cleanup,
