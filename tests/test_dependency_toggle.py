@@ -46,6 +46,10 @@ B = add_mod("B", ["A"])
 C = add_mod("C", ["B"])
 D = add_mod("D", ["A-extra"])
 E = add_mod("E", ["missing-framework"], disabled=True)
+F = add_mod(
+    "F", ["BepInEx-BepInExPack-5.4.2100"], disabled=True,
+)
+os.makedirs(os.path.join(GAME, "BepInEx"), exist_ok=True)
 
 cfg = types.SimpleNamespace(
     nexus_api_key="", game_slug="repo", game_id=0, game_root=GAME,
@@ -101,6 +105,12 @@ blocked = execute("mod_enable", {"mod_id": "E", "confirmed": True})
 assert blocked["blocked"] is True
 assert blocked["missing_dependencies"] == ["missing-framework"]
 assert os.path.exists(E + ".disabled")
+
+# Thunderstore's BepInExPack coordinate represents the already-present loader,
+# not another local Mod row that must be installed.
+loader_satisfied = execute("mod_enable", {"mod_id": "F"})
+assert loader_satisfied["enabled_mods"][0]["id"] == "F"
+assert os.path.exists(F)
 
 # Cycles terminate safely and never include the root twice.
 X = add_mod("X", ["Y"])

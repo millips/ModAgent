@@ -237,18 +237,13 @@ copyIfExists(
   path.join(candidateRoot, 'README.md')
 )
 copyIfExists(
-  path.join(repoRoot, 'docs', 'USER-GUIDE-v1.3.0.md'),
+  path.join(repoRoot, 'docs', `USER-GUIDE-v${packageInfo.version}.md`),
   path.join(candidateRoot, '使用教程.md')
 )
 copyIfExists(
   path.join(repoRoot, 'updates', 'free-update.json'),
   path.join(candidateRoot, 'free-update.json')
 )
-copyIfExists(
-  path.join(repoRoot, 'updates', 'p-update.json'),
-  path.join(candidateRoot, 'p-update.json')
-)
-
 const artifacts = [
   {
     type: 'installer',

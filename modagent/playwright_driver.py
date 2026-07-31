@@ -203,7 +203,7 @@ def click(
 
 
 def click_download_control(
-    cdp_port: int, url: str, stage: str, capture_dir: str,
+    cdp_port: int, url: str, stage: str, capture_dir: str, file_id: int = 0,
 ) -> dict:
     """Fallback for Nexus controls that reject or lose raw CDP mouse events.
 
@@ -257,6 +257,16 @@ def click_download_control(
         if not pattern:
             return {"status": "unsupported_stage", "clicked": False}
         locator = page.get_by_text(pattern, exact=True)
+        component_scoped = False
+        if stage == "manual" and int(file_id or 0) > 0:
+            component = page.locator(
+                f'mod-file-download[file-id="{int(file_id)}"]'
+            )
+            if component.count() == 1:
+                exact_locator = component.get_by_text(pattern, exact=True)
+                if exact_locator.count():
+                    locator = exact_locator
+                    component_scoped = True
         visible = []
         for index in range(min(locator.count(), 12)):
             item = locator.nth(index)
@@ -267,6 +277,17 @@ def click_download_control(
                 continue
         if not visible:
             return {"status": "target_missing", "clicked": False}
+        if stage == "manual" and len(visible) > 1:
+            # A multi-file Nexus page can contain one Manual button per
+            # variant.  Clicking the first one would silently install a
+            # different file than the user selected.
+            if not component_scoped:
+                return {
+                    "status": "target_ambiguous",
+                    "clicked": False,
+                    "file_id": int(file_id or 0),
+                    "matches": len(visible),
+                }
         target = visible[0]
         target.scroll_into_view_if_needed()
         target.click(timeout=8000)

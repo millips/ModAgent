@@ -10,6 +10,45 @@ from .config import CONFIG_DIR
 SNAPSHOTS_DIR = os.path.join(CONFIG_DIR, "snapshots")
 
 
+def find_snapshot_dir(snapshot_id: str, game_scope: str = "") -> str:
+    """Find a snapshot by its globally unique ID across historical layouts.
+
+    Snapshot rows have moved from catalogue slugs to install-instance IDs over
+    several releases.  A stale folder bucket must not make an intact snapshot
+    appear invalid, so every caller uses this one compatibility locator.
+    """
+    snapshot_id = str(snapshot_id or "").strip()
+    if not snapshot_id or not os.path.isdir(SNAPSHOTS_DIR):
+        return ""
+
+    candidates = []
+    if game_scope:
+        candidates.append(os.path.join(SNAPSHOTS_DIR, game_scope, snapshot_id))
+    candidates.append(os.path.join(SNAPSHOTS_DIR, snapshot_id))
+    for bucket in os.listdir(SNAPSHOTS_DIR):
+        candidates.append(os.path.join(SNAPSHOTS_DIR, bucket, snapshot_id))
+
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.normcase(os.path.realpath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        manifest_path = os.path.join(candidate, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest_id = str(manifest.get("snapshot_id") or snapshot_id)
+            if manifest_id != snapshot_id:
+                continue
+        except (OSError, ValueError, TypeError):
+            continue
+        return candidate
+    return ""
+
+
 def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
     """Move legacy snapshot folders under the selected install identity."""
     if not legacy_slug or not instance_id or legacy_slug == instance_id:
@@ -434,10 +473,7 @@ def snapshot_delete(snapshot_id: str) -> dict:
     snap = get_snapshot(snapshot_id)
     if snap is None:
         raise FileNotFoundError(f"快照不存在: {snapshot_id}")
-    snap_dir = os.path.join(SNAPSHOTS_DIR, snap.game_slug or "", snapshot_id)
-    if not os.path.isdir(snap_dir):
-        alt = os.path.join(SNAPSHOTS_DIR, snapshot_id)   # 兼容旧版无 slug 分桶的布局
-        snap_dir = alt if os.path.isdir(alt) else ""
+    snap_dir = find_snapshot_dir(snapshot_id, snap.game_slug or "")
     if snap_dir:
         shutil.rmtree(snap_dir, ignore_errors=True)
     db_delete(snapshot_id)
@@ -489,10 +525,7 @@ def snapshot_storage_usage(game_slug: str = "") -> dict:
     row_by_dir = {}
     invalid = 0
     for row in rows:
-        snap_dir = os.path.join(SNAPSHOTS_DIR, row.game_slug or "", row.id)
-        if not os.path.isdir(snap_dir):
-            legacy = os.path.join(SNAPSHOTS_DIR, row.id)
-            snap_dir = legacy if os.path.isdir(legacy) else ""
+        snap_dir = find_snapshot_dir(row.id, row.game_slug or "")
         if snap_dir:
             row_by_dir[os.path.normcase(os.path.realpath(snap_dir))] = row
         else:
@@ -568,14 +601,9 @@ def _locate_snapshot(snapshot_id: str) -> tuple[str, dict]:
     if snap is None:
         raise FileNotFoundError(f"快照不存在: {snapshot_id}")
 
-    snap_dir = None
-    for game_dir in (os.listdir(SNAPSHOTS_DIR) if os.path.isdir(SNAPSHOTS_DIR) else []):
-        candidate = os.path.join(SNAPSHOTS_DIR, game_dir, snapshot_id)
-        if os.path.isdir(candidate):
-            snap_dir = candidate
-            break
+    snap_dir = find_snapshot_dir(snapshot_id, snap.game_slug or "")
     if not snap_dir:
-        snap_dir = os.path.join(SNAPSHOTS_DIR, snapshot_id)
+        snap_dir = os.path.join(SNAPSHOTS_DIR, snap.game_slug or "", snapshot_id)
 
     manifest_path = os.path.join(snap_dir, "manifest.json")
     if not os.path.exists(manifest_path):

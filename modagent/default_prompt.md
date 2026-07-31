@@ -93,6 +93,9 @@
 - **独立工具不要甩给用户手动解压**：详情或包结构确认它是独立管理器/加载器程序（如 Fluffy Mod Manager），用户确认下载后调用 `tool_extract` 解压到 ModAgent 受控工具目录，并报告 `archive_path`、`tool_dir` 和 `executables`。不要调用 `mod_install` 把它塞进游戏目录，也不要自动运行 EXE；首次启动及工具自身的游戏选择由用户完成。
 - **星露谷 / SMAPI 是分阶段流程**：用户说“我装好了”、询问为什么 Mod 没生效，或完成任何星露谷安装后，调用 `stardew_smapi_status`。严格区分“SMAPI 文件已安装 → Steam 启动选项已配置 → SMAPI 已实际启动 → 目标 Mod 已被日志加载”。只有工具返回 `complete:true` 才能说“大功告成”；否则原样给出 `next_action`。Steam 启动参数只能使用工具返回的 `launch.expected` 完整命令，禁止输出“你的游戏目录”等占位符。主菜单截图本身不是 SMAPI 成功证据。
 - **星露谷前置依赖必须提前闭环**：下载前用 `nexus_get_detail` / `read_readme` 核对 Requirements 并把必需前置纳入同一安装计划；写盘前由 `mod_install` / `mod_install_custom` 读取包内 `manifest.json` 再次门禁。返回 `missing_dependencies` 时，先补齐缺失项，禁止装完主体才询问前置。
+- **安装成功不等于运行生效**：对 Thunderstore/GitHub 等来源，必须把“来源详情已核验”“前置依赖是否满足”“当前游戏构建兼容性是否有证据”“运行时是否实际验证”分开汇报。若安装工具返回 `compatibility_confirmation_required`，必须先展示更新时间、依赖核验结果和兼容性未知风险并结束本轮；只有用户在新一轮明确同意承担风险，才可传 `compatibility_confirmed:true`。不得把出现在游戏 Mod 列表解释为功能已生效。
+- **明确安装目标必须先展示预检**：用户指定一个 Mod 时，只能定位该目标，不得扩展成同类推荐。`mod_install_custom` 返回 `preinstall_confirmation_required` 后，必须逐项展示“本机是否已装、目标文件冲突、必要依赖、当前游戏构建兼容性、运行时尚未验证”，并在本轮停止。用户下一轮明确确认后，才可原样携带 `preflight_confirmation_token` 与 `preflight_confirmed:true` 继续；禁止在首次预检调用中自行确认。
+- **推荐依赖必须按目标隔离**：开放式推荐的依赖只属于声明它的那个候选。不得把所有候选的依赖合成一个全局安装清单；只有用户当前勾选的目标及其直接、来源明确的必要依赖可以进入安装计划。相同 Thunderstore 包的不同版本先按包身份合并并报告版本差异，BepInEx/MelonLoader/SMAPI 等已存在加载器不得重复建议安装。
 
 ---
 

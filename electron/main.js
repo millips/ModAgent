@@ -10,7 +10,7 @@ const os = require('os');
 const fs = require('fs');
 const { getAppIdentity } = require('./appIdentity');
 const { createSecurityStore } = require('./securityStore');
-const { createLicenseStore } = require('./licenseStore');
+const { createLicenseStore, canUsePBenefits } = require('./licenseStore');
 const { createRuntimeDiagnostics, buildDiagnosticReport } = require('./runtimeDiagnostics');
 const { setupAutoUpdater } = require('./updater');
 const { findInstalledBrowser, profileDirectory } = require('./browserLauncher');
@@ -19,6 +19,12 @@ const PACKAGE_INFO = require('./package.json');
 const IDENTITY = getAppIdentity(PACKAGE_INFO);
 const APP_EDITION = IDENTITY.edition;
 const IS_SMOKE_TEST = process.argv.includes('--smoke-test');
+// Packaged smoke tests run without a user-visible desktop session on some
+// builders. Chromium's GPU subprocess can fail there before the renderer is
+// created, which is unrelated to the packaged app's backend/renderer health.
+// Keep normal launches hardware accelerated and make only smoke mode headless-
+// environment safe.
+if (IS_SMOKE_TEST) app.disableHardwareAcceleration();
 // ModAgent's startup cue is part of the desktop shell, not page media. Allow it
 // to begin as soon as the renderer is ready; the renderer still retries safely
 // on the first gesture if a device is temporarily unavailable.
@@ -480,6 +486,10 @@ ipcMain.handle('activate-p-license', (_, code) => {
 });
 ipcMain.handle('open-external', (_, url) => openTrustedExternal(url));
 ipcMain.handle('notify-reply-complete', () => {
+  const licenseStatus = pLicenseStore.status();
+  if (!canUsePBenefits(licenseStatus)) {
+    return { ok: false, shown: false, reason: 'p_license_required' };
+  }
   if (!mainWindow || mainWindow.isFocused()) return { ok: true, shown: false };
   if (!replyAttentionPending) {
     replyAttentionPending = true;

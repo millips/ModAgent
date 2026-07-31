@@ -2,9 +2,31 @@ const path = require('path');
 const packageInfo = require('./package.json');
 const { getAppIdentity } = require('./appIdentity');
 
-const buildEdition = process.env.MODAGENT_EDITION === 'subscription' ? 'subscription' : 'free';
+const buildEdition = process.env.MODAGENT_EDITION === 'free' ? 'free' : 'subscription';
 const buildPackageInfo = { ...packageInfo, modagentEdition: buildEdition };
 const identity = getAppIdentity(buildPackageInfo);
+const markerPath = path.join(__dirname, 'dist', 'edition.json');
+if (!require('fs').existsSync(markerPath)) {
+  throw new Error(
+    `Frontend build marker is missing: ${markerPath}. Run the matching Vite build before electron-builder.`
+  );
+}
+let frontendMarker;
+try {
+  frontendMarker = JSON.parse(require('fs').readFileSync(markerPath, 'utf8'));
+} catch (error) {
+  throw new Error(`Frontend build marker is invalid: ${error.message}`);
+}
+if (
+  frontendMarker.edition !== identity.edition
+  || frontendMarker.channel !== identity.channel
+) {
+  throw new Error(
+    `Refusing mixed build: Electron expects ${identity.edition}/${identity.channel}, `
+    + `but dist contains ${frontendMarker.edition || 'unknown'}/${frontendMarker.channel || 'unknown'}. `
+    + 'Rebuild the frontend with the same MODAGENT_EDITION and MODAGENT_CHANNEL.'
+  );
+}
 const updateBase = String(process.env.MODAGENT_UPDATE_URL || '').replace(/\/$/, '');
 const commonLegalResources = [
   {

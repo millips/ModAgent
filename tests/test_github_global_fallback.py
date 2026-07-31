@@ -1,4 +1,4 @@
-"""GitHub searches retry globally when a game-scoped tool query is empty."""
+"""Only allowlisted framework/tool searches may retry globally."""
 from urllib.parse import parse_qs, urlparse
 
 from modagent.sources import github
@@ -28,8 +28,8 @@ try:
     github._http_json = fake_http_json
     results = github.search("Fluffy Mod Manager", "Street Fighter 6")
     assert queries == [
-        "Fluffy Mod Manager Street Fighter 6",
-        "Fluffy Mod Manager",
+        '"Street Fighter 6" Fluffy Mod Manager in:name,description,topics',
+        "Fluffy Mod Manager in:name,description,topics",
     ]
     assert results[0]["full_name"] == "fluffy-mods/ModManager"
     assert results[0]["search_scope"] == "global_fallback"

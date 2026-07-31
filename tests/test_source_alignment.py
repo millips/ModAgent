@@ -59,11 +59,21 @@ packages = [
         "versions": [{"version_number": "1.3.0", "description": "map", "downloads": 8}],
     },
 ]
+assert source_alignment._package_row(packages[0])["source"] == "thunderstore"
 
 old_find = thunderstore.find_community
 old_list = thunderstore.list_packages
+old_get = thunderstore.get_package
 thunderstore.find_community = lambda _name: "repo"
 thunderstore.list_packages = lambda _community, force_refresh=False: packages
+thunderstore.get_package = lambda owner, name, **_kwargs: next(
+    {
+        **package,
+        "latest": package["versions"][0],
+    }
+    for package in packages
+    if package["owner"] == owner and package["name"] == name
+)
 
 cfg = types.SimpleNamespace(
     game_name="R.E.P.O.", game_slug="repo", game_id=0, game_root=TMP,
@@ -76,6 +86,30 @@ try:
     assert db.get_mod_source_binding("local_repolib", "repo")["source_key"] == "Zehs-REPOLib"
     assert db.get_mod_source_binding("local_pickup", "repo")["latest_version"] == "1.0.4"
 
+    candidate = {
+        "source_key": "Tansinator-MapValueTracker",
+        "url": "https://thunderstore.io/c/repo/p/Tansinator/MapValueTracker/",
+        "name": "MapValueTracker",
+        "latest_version": "1.3.0",
+    }
+    confirmed = json.loads(tools.execute(
+        "mod_source_bind",
+        {
+            "local_mod_id": "local_map",
+            "source": "thunderstore",
+            "source_key": candidate["source_key"],
+            "source_url": candidate["url"],
+            "candidate_name": candidate["name"],
+            "latest_version": candidate["latest_version"],
+            "confirmed": True,
+        },
+        cfg,
+    ))
+    assert confirmed["bound"] is True, confirmed
+    assert db.get_mod_source_binding(
+        "local_map", "repo"
+    )["match_method"] == "user_confirmed"
+
     checked = json.loads(tools.execute("mod_update_check", {}, cfg))
     by_id = {item["mod_id"]: item for item in checked["items"]}
     assert by_id["local_repolib"]["status"] == "version_unknown"
@@ -85,6 +119,7 @@ try:
 finally:
     thunderstore.find_community = old_find
     thunderstore.list_packages = old_list
+    thunderstore.get_package = old_get
 
 
 promise = "数据够了。我来手动帮你查最新情况——先搜索 Thunderstore。"

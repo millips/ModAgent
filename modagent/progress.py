@@ -3,12 +3,19 @@ import threading
 import time
 
 _lock = threading.Lock()
+_thread_state = threading.local()
 _state = {
     "active": False,
     "items": [],
+    "task_kind": "",
+    "label": "",
+    "exclusive": False,
+    "cancel_requested": False,
+    "cancel_reason": "",
     "updated": 0.0,
     "started": 0.0,
     "samples": [],
+    "generation": 0,
 }
 
 _SOURCE_LABELS = {
@@ -37,9 +44,16 @@ def _record_sample(now: float) -> None:
     _state["samples"] = [sample for sample in samples if sample[0] >= cutoff][-30:]
 
 
-def start(mods: list):
+def start(
+    mods: list, *, task_kind: str = "download", label: str = "",
+    exclusive: bool = False,
+) -> bool:
     """mods: [{mod_id, name, source?, source_label?}]，开始一批下载。"""
     with _lock:
+        if _state["active"] and (_state["exclusive"] or exclusive):
+            return False
+        _state["generation"] += 1
+        _thread_state.generation = _state["generation"]
         _state["items"] = [{
             "mod_id": m.get("mod_id"),
             "name": m.get("name", "") or f"mod {m.get('mod_id')}",
@@ -53,12 +67,21 @@ def start(mods: list):
             "status": "queued",  # queued | downloading | done | failed
             "pct": 0,
             "error": "",
+            "phase": "queued",
+            "phase_label": "等待处理",
+            "detail": "",
         } for m in mods]
+        _state["task_kind"] = str(task_kind or "download")
+        _state["label"] = str(label or "")
+        _state["exclusive"] = bool(exclusive)
+        _state["cancel_requested"] = False
+        _state["cancel_reason"] = ""
         _state["active"] = True
         now = time.time()
         _state["started"] = now
         _state["updated"] = now
         _state["samples"] = [(now, 0.0)]
+        return True
 
 
 def _find(mod_id):
@@ -68,13 +91,31 @@ def _find(mod_id):
     return None
 
 
+def _owns_current_task() -> bool:
+    """Prevent a cancelled/stale worker from mutating a newer progress task."""
+    return (
+        bool(_state["active"])
+        and getattr(_thread_state, "generation", None) == _state["generation"]
+    )
+
+
 def set_status(mod_id, status: str, error: str = ""):
     with _lock:
+        if not _owns_current_task():
+            return
         it = _find(mod_id)
         if it:
+            if _state["cancel_requested"] and status == "failed":
+                status = "cancelled"
+                error = _state["cancel_reason"] or error or "用户已取消"
             it["status"] = status
             if status == "done":
                 it["pct"] = 100
+                it["phase"] = "complete"
+                it["phase_label"] = "处理完成"
+            elif status == "failed":
+                it["phase"] = "failed"
+                it["phase_label"] = "处理失败"
             if error:
                 it["error"] = error[:200]
         now = time.time()
@@ -84,6 +125,8 @@ def set_status(mod_id, status: str, error: str = ""):
 
 def set_pct(mod_id, pct: int):
     with _lock:
+        if not _owns_current_task():
+            return
         it = _find(mod_id)
         if it:
             it["status"] = "downloading"
@@ -93,18 +136,103 @@ def set_pct(mod_id, pct: int):
         _record_sample(now)
 
 
+def set_phase(
+    mod_id, phase: str, label: str = "", detail: str = "",
+    *, status: str = "", pct: int | None = None,
+):
+    """Publish the real workflow stage instead of reducing everything to download."""
+    with _lock:
+        if not _owns_current_task():
+            return
+        it = _find(mod_id)
+        if it:
+            it["phase"] = str(phase or "processing")
+            it["phase_label"] = str(label or phase or "处理中")
+            it["detail"] = str(detail or "")[:240]
+            if status:
+                it["status"] = status
+            elif it.get("status") in {"queued", "downloading"}:
+                it["status"] = "processing"
+            if pct is not None:
+                it["pct"] = max(0, min(100, int(pct)))
+        now = time.time()
+        _state["updated"] = now
+        _record_sample(now)
+
+
 def set_name(mod_id, name: str):
     with _lock:
+        if not _owns_current_task():
+            return
         it = _find(mod_id)
         if it and name:
             it["name"] = name
         _state["updated"] = time.time()
 
 
-def finish():
+def request_cancel(task_kind: str = "") -> bool:
+    """Cooperatively cancel the current task without killing the backend."""
     with _lock:
-        _state["active"] = False
+        expected = str(task_kind or "").strip()
+        if not _state["active"]:
+            return False
+        if expected and expected != _state["task_kind"]:
+            return False
+        _state["cancel_requested"] = True
+        _state["cancel_reason"] = "用户已取消"
         _state["updated"] = time.time()
+        return True
+
+
+def is_cancel_requested(task_kind: str = "") -> bool:
+    with _lock:
+        expected = str(task_kind or "").strip()
+        return bool(
+            _state["active"]
+            and _state["cancel_requested"]
+            and (not expected or expected == _state["task_kind"])
+        )
+
+
+def active_task() -> dict:
+    with _lock:
+        return {
+            "active": bool(_state["active"]),
+            "task_kind": str(_state["task_kind"] or ""),
+            "exclusive": bool(_state["exclusive"]),
+            "cancel_requested": bool(_state["cancel_requested"]),
+        }
+
+
+def finish(*, cancelled: bool = False):
+    with _lock:
+        if not _owns_current_task():
+            return
+        if cancelled or _state["cancel_requested"]:
+            for item in _state["items"]:
+                if item.get("status") not in {"done", "failed"}:
+                    item["status"] = "cancelled"
+                    item["error"] = _state["cancel_reason"] or "用户已取消"
+        _state["active"] = False
+        _state["exclusive"] = False
+        _state["updated"] = time.time()
+
+
+def abort_active(reason: str = "用户已停止") -> bool:
+    """Immediately retire the visible task; stale worker updates are ignored."""
+    with _lock:
+        if not _state["active"]:
+            return False
+        _state["cancel_requested"] = True
+        _state["cancel_reason"] = str(reason or "用户已停止")
+        for item in _state["items"]:
+            if item.get("status") not in {"done", "failed"}:
+                item["status"] = "cancelled"
+                item["error"] = _state["cancel_reason"]
+        _state["active"] = False
+        _state["exclusive"] = False
+        _state["updated"] = time.time()
+        return True
 
 
 def snapshot() -> dict:
@@ -125,7 +253,11 @@ def snapshot() -> dict:
                 if rate >= 0.02:
                     eta_seconds = min(24 * 3600, round((100.0 - overall_pct) / rate))
                     eta_kind = "measured"
-        if _state["active"] and eta_seconds is None:
+        if (
+            _state["active"]
+            and eta_seconds is None
+            and _state["task_kind"] in {"download", "mod_update"}
+        ):
             # Before the first response bytes arrive there is no transfer rate,
             # but leaving the UI at "estimating" for a minute feels broken.
             # Give a conservative stage baseline, then replace it as soon as
@@ -141,7 +273,34 @@ def snapshot() -> dict:
                 eta_kind = "baseline"
         return {
             "active": _state["active"],
+            "task_kind": _state["task_kind"],
+            "label": _state["label"],
+            "exclusive": _state["exclusive"],
+            "cancel_requested": _state["cancel_requested"],
+            "cancel_reason": _state["cancel_reason"],
             "items": [dict(it) for it in _state["items"]],
+            "completed_count": sum(
+                1 for item in _state["items"]
+                if item.get("status") in {"done", "failed", "cancelled"}
+            ),
+            "total_count": len(_state["items"]),
+            "current_item": next((
+                {
+                    "mod_id": item.get("mod_id"),
+                    "name": item.get("name", ""),
+                    "source": item.get("source", ""),
+                    "source_label": item.get("source_label", ""),
+                    "status": item.get("status", ""),
+                    "phase": item.get("phase", ""),
+                    "phase_label": item.get("phase_label", ""),
+                    "detail": item.get("detail", ""),
+                }
+                for item in _state["items"]
+                if item.get("status") in {
+                    "processing", "downloading", "waiting_verification"
+                }
+            ), None),
+            "generation": _state["generation"],
             "updated": _state["updated"],
             "started": _state["started"],
             "elapsed_seconds": max(0, round(now - _state["started"])) if _state["started"] else 0,

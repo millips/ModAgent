@@ -2,7 +2,7 @@
 
 面向 Windows 的本地 AI Mod 管理器：对话搜索、方案分析、安装确认、Mod 管理与快照回滚。
 
-当前版本：**v1.3.0 稳定版候选**。
+当前版本：**v1.3.5 稳定版**。
 
 [下载普通版](https://github.com/millips/ModAgent/releases) · [提交问题](https://github.com/millips/ModAgent/issues) · [隐私说明](PRIVACY.md)
 

@@ -1,11 +1,105 @@
 """GitHub Releases 适配器：解析仓库最新 release 的资产并下载;Search API 搜仓库。
 很多工具型 mod（脚本扩展、BepInEx 插件、框架）只发在 GitHub。"""
 import re
+import platform
 import urllib.error
 import urllib.parse
 
 from . import _http_json, _safe, _dest
 from .. import downloader
+
+
+_MOD_EVIDENCE = {
+    "mod", "mods", "modding", "plugin", "plugins", "bepinex", "ue4ss",
+    "melonloader", "reshade", "nexusmods", "thunderstore", "gamebanana",
+    "workshop",
+}
+_GENERIC_NON_MOD_NAMES = {
+    "config", ".config", "utils", "utility", "log", "logs", "faults",
+    "template", "tutorial", "example", "examples",
+}
+_FRAMEWORK_ALIASES = {
+    "bepinex": ("bepinex/bepinex", "bepinex"),
+    "ue4ss": ("ue4ss-re/ue4ss", "ue4ss"),
+    "melonloader": ("lavagang/melonloader", "melonloader"),
+    "fluffymodmanager": ("fluffy-mods/modmanager", "modmanager"),
+}
+
+
+def _tokens(value: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", (value or "").casefold()))
+
+
+def _compact(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
+
+
+def _game_aliases(game_name: str) -> set[str]:
+    raw = str(game_name or "").strip()
+    aliases = {_compact(raw)}
+    # Strip storefront trademark suffixes without splitting the game title
+    # into broad single words.
+    aliases.add(_compact(re.sub(r"[™®©]", "", raw)))
+    return {item for item in aliases if len(item) >= 4}
+
+
+def _evidence(item: dict, game_name: str) -> tuple[list[str], list[str]]:
+    text = " ".join([
+        str(item.get("name") or ""),
+        str(item.get("full_name") or ""),
+        str(item.get("summary") or ""),
+        " ".join(item.get("topics") or []),
+        str(item.get("homepage") or ""),
+    ])
+    compact_text = _compact(text)
+    game_hits = [
+        alias for alias in _game_aliases(game_name)
+        if alias in compact_text
+    ]
+    tokens = _tokens(text)
+    mod_hits = sorted(tokens & _MOD_EVIDENCE)
+    return game_hits, mod_hits
+
+
+def _is_explicit_framework(query: str, item: dict) -> bool:
+    compact_query = _compact(query)
+    full_name = str(item.get("full_name") or "").casefold()
+    name = _compact(str(item.get("name") or ""))
+    for alias, (official, token) in _FRAMEWORK_ALIASES.items():
+        if alias in compact_query and (
+            full_name == official or token in name
+        ):
+            return True
+    return False
+
+
+def _filter_game_mod_results(
+    rows: list[dict], query: str, game_name: str,
+) -> list[dict]:
+    """Require both game identity and Mod/install evidence.
+
+    GitHub has no game-Mod category.  Search hits caused only by logs, config
+    files or generic utility words must not enter the recommendation table.
+    Official loader/framework repositories are the one deliberate exception
+    when the user explicitly searched for that framework.
+    """
+    kept = []
+    for item in rows:
+        game_hits, mod_hits = _evidence(item, game_name)
+        generic_name = _compact(str(item.get("name") or "")) in {
+            _compact(value) for value in _GENERIC_NON_MOD_NAMES
+        }
+        framework = _is_explicit_framework(query, item)
+        if not framework and (not game_hits or not mod_hits or generic_name):
+            continue
+        enriched = dict(item)
+        enriched["game_evidence"] = game_hits
+        enriched["mod_evidence"] = mod_hits or (
+            ["official_framework_repository"] if framework else []
+        )
+        enriched["relevance_verified"] = True
+        kept.append(enriched)
+    return kept
 
 
 def _search_once(query: str, limit: int) -> list:
@@ -25,6 +119,8 @@ def _search_once(query: str, limit: int) -> list:
             "full_name": r.get("full_name", ""),
             "url": r.get("html_url", ""),
             "summary": (r.get("description") or "")[:140],
+            "topics": r.get("topics") or [],
+            "homepage": r.get("homepage") or "",
             "stars": r.get("stargazers_count", 0),
             "updated_at": (r.get("pushed_at") or "")[:10],
             "archived": r.get("archived", False),
@@ -40,18 +136,38 @@ def search(query: str, game_name: str = "", limit: int = 10) -> list:
     game_name = (game_name or "").strip()
     if not base_query:
         raise RuntimeError("搜索词为空")
-    scoped_query = " ".join(x for x in (base_query, game_name) if x)
-    out = _search_once(scoped_query, limit)
+    # Constrain repository search to repository metadata.  Code/log hits are
+    # too noisy to be treated as Mod candidates.
+    scoped_query = " ".join(
+        x for x in (f'"{game_name}"' if game_name else "", base_query,
+                    "in:name,description,topics")
+        if x
+    )
+    out = _filter_game_mod_results(
+        _search_once(scoped_query, max(limit * 3, 10)),
+        base_query,
+        game_name,
+    )[:limit]
     if out or not game_name:
         for item in out:
             item["search_scope"] = "game"
         return out
 
-    # 通用管理器、加载器、框架通常不会把某个游戏名写进仓库元数据。
-    # 游戏限定搜索为空时自动退回全局原词，避免把“限定没命中”误报成“不在 GitHub”。
-    out = _search_once(base_query, limit)
+    # Only an explicitly named loader/framework may use global fallback.
+    # Broad feature searches returning no game-scoped evidence stay empty.
+    if not any(alias in _compact(base_query) for alias in _FRAMEWORK_ALIASES):
+        return []
+    out = [
+        item for item in _search_once(
+            f"{base_query} in:name,description,topics", max(limit * 2, 10)
+        )
+        if _is_explicit_framework(base_query, item)
+    ][:limit]
     for item in out:
         item["search_scope"] = "global_fallback"
+        item["game_evidence"] = []
+        item["mod_evidence"] = ["official_framework_repository"]
+        item["relevance_verified"] = True
     return out
 
 
@@ -62,12 +178,81 @@ def _parse_repo(url: str):
     return m.group(1), m.group(2).replace(".git", "")
 
 
-def _pick_asset(assets: list):
-    for a in assets:
-        n = (a.get("name") or "").lower()
-        if n.endswith((".zip", ".rar", ".7z")):
-            return a
-    return assets[0] if assets else None
+def pick_release_asset(
+    assets: list,
+    platform_name: str | None = None,
+    architecture: str | None = None,
+):
+    """Pick a production archive compatible with the current platform."""
+    platform_name = (platform_name or platform.system()).casefold()
+    architecture = (architecture or platform.machine()).casefold()
+    wants_windows = platform_name.startswith("win")
+    wants_x64 = architecture in {"amd64", "x86_64", "x64"}
+
+    archives = [
+        asset for asset in (assets or [])
+        if str(asset.get("name") or "").casefold().endswith(
+            (".zip", ".7z", ".rar")
+        )
+    ]
+    if not archives:
+        return None
+
+    def name_of(asset):
+        return str(asset.get("name") or "").casefold()
+
+    production = [
+        asset for asset in archives
+        if not any(token in name_of(asset) for token in (
+            "zdev", "-dev", "_dev", "debug", "symbols", ".pdb",
+            "source", "src.zip",
+        ))
+    ] or archives
+
+    if wants_windows:
+        production = [
+            asset for asset in production
+            if not any(token in name_of(asset) for token in (
+                "linux", "macos", "osx", "darwin", "android",
+            ))
+        ]
+    if not production:
+        return None
+
+    def score(asset):
+        name = name_of(asset)
+        value = 0
+        if wants_windows:
+            if re.search(r"(?:win|windows)[-_ ]?(?:x64|64bit|amd64)", name):
+                value += 700
+            elif "win64" in name:
+                value += 700
+            elif "windows" in name or re.search(
+                r"(?:^|[_-])win(?:[_-]|$)", name
+            ):
+                value += 450
+            if wants_x64 and re.search(
+                r"(?:^|[_-])(?:x64|amd64)(?:[_-]|$)", name
+            ):
+                value += 180
+            if wants_x64 and re.search(
+                r"(?:^|[_-])x86(?:[_-]|$)", name
+            ):
+                value -= 220
+        if "patcher" in name:
+            value -= 300
+        if any(token in name for token in ("runtime", "standalone", "full")):
+            value += 40
+        return value
+
+    # Preserve the author's release ordering for equal-quality candidates.
+    return max(
+        enumerate(production),
+        key=lambda pair: (score(pair[1]), -pair[0]),
+    )[1]
+
+
+_pick_asset = pick_release_asset
 
 
 def download(url: str, game_slug: str, progress_callback=None) -> dict:

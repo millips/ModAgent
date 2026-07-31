@@ -3,7 +3,9 @@ import json
 
 from modagent.recommendation_ui import (
     apply_chinese_descriptions,
+    merge_recommendation_resolution,
     normalize_recommendations,
+    promote_verified_recommendation,
     recommendation_analysis_text,
     recommendations_from_tool_evidence,
 )
@@ -92,6 +94,9 @@ framework = result["items"][0]
 assert framework["version"] == "1.2.0"
 assert framework["dependencies"] == ["9"]
 assert framework["content"] == "Loads costume mods"
+assert framework["installable"] is True
+assert framework["resolution_kind"] == "ready"
+assert framework["selection_key"] in result["selected_keys"]
 
 workshop_item = next(item for item in result["items"] if item["name"] == "Workshop item")
 assert "功能与适配性尚未核验" in workshop_item["content"]
@@ -185,11 +190,153 @@ assert evidence_result["items"][0]["conflict_status"] == "clear"
 assert "详情已核验" in evidence_result["items"][0]["recommendation_reason"]
 assert evidence_result["items"][1]["version"] == "待详情核验"
 assert len(evidence_result["selected_keys"]) == 2
+assert evidence_result["items"][0]["installable"] is True
+assert evidence_result["items"][0]["resolution_kind"] == "ready"
 
 detail_only = recommendations_from_tool_evidence([
     ("nexus_get_detail", json.dumps({"mod_id": 810, "name": "Physics"})),
 ])
 assert detail_only["items"] == []
+
+loader_blocked = normalize_recommendations({
+    "recommendations": [{
+        "mod_id": 39,
+        "name": "MoneyValueTracker",
+        "summary": "Tracks valuables on the map.",
+        "dependency_labels": ["RepoLib", "MelonLoader"],
+        "required_loader": "MelonLoader",
+        "_detail_verified": True,
+    }],
+}, mod_loader="BepInEx")
+blocked_item = loader_blocked["items"][0]
+assert blocked_item["installable"] is False
+assert blocked_item["resolution_kind"] == "incompatible_loader"
+assert blocked_item["required_loader"] == "MelonLoader"
+assert blocked_item["active_loader"] == "BepInEx"
+assert loader_blocked["selected_keys"] == []
+
+inferred_loader = normalize_recommendations({
+    "recommendations": [{
+        "mod_id": 17,
+        "name": "MorePlayers(BepInEx)",
+        "summary": (
+            "Changes the maximum player count. Install "
+            "YAPYAP_MorePlayers.dll into BepInEx/plugins."
+        ),
+        "_detail_verified": True,
+    }],
+}, mod_loader="")
+inferred_item = inferred_loader["items"][0]
+assert inferred_item["required_loader"] == "BepInEx"
+assert inferred_item["dependencies"] == ["BepInEx"]
+assert inferred_item["installable"] is False
+assert inferred_item["resolution_kind"] == "loader_unverified"
+assert inferred_loader["dependency_requirements"][0]["name"] == "BepInEx"
+assert inferred_loader["selected_keys"] == []
+
+pending = normalize_recommendations({
+    "recommendations": [{
+        "mod_id": 233,
+        "name": "Admin Menu",
+        "summary": "Host administration menu.",
+    }],
+}, mod_loader="BepInEx")
+pending_key = pending["items"][0]["selection_key"]
+pending["wanted_keys"] = [pending_key]
+promoted = promote_verified_recommendation(
+    pending,
+    "nexus",
+    {
+        "mod_id": 233,
+        "name": "Admin Menu",
+        "summary": "Host administration menu with player controls.",
+        "version": "1.1.7",
+    },
+    mod_loader="BepInEx",
+)
+assert promoted["items"][0]["detail_verified"] is True
+assert promoted["items"][0]["installable"] is True
+assert promoted["wanted_keys"] == []
+assert promoted["selected_keys"] == [pending_key]
+assert promoted["promotion"]["selection_key"] == pending_key
+
+# Resolving one wanted target builds a shared, plan-scoped dependency closure.
+# The chosen target and its prerequisite are selected; other candidates that
+# need the same planned loader become selectable without being auto-selected.
+shared_loader = normalize_recommendations({
+    "thunderstore": [
+        {
+            "name": "Target Alpha",
+            "full_name": "Author-TargetAlpha",
+            "summary": "Alpha feature.",
+            "dependencies": ["BepInEx-BepInExPack-5.4.2305"],
+            "required_loader": "BepInEx",
+            "url": "https://thunderstore.io/c/test/p/Author/TargetAlpha/",
+            "_detail_verified": True,
+        },
+        {
+            "name": "Target Beta",
+            "full_name": "Author-TargetBeta",
+            "summary": "Beta feature.",
+            "dependencies": ["BepInEx-BepInExPack-5.4.2305"],
+            "required_loader": "BepInEx",
+            "url": "https://thunderstore.io/c/test/p/Author/TargetBeta/",
+            "_detail_verified": True,
+        },
+    ],
+}, mod_loader="")
+alpha = next(item for item in shared_loader["items"] if item["name"] == "Target Alpha")
+beta = next(item for item in shared_loader["items"] if item["name"] == "Target Beta")
+assert alpha["installable"] is False
+assert beta["installable"] is False
+shared_loader["wanted_keys"] = [alpha["selection_key"]]
+
+resolved_loader = normalize_recommendations({
+    "thunderstore": [
+        {
+            "name": "Target Alpha",
+            "full_name": "Author-TargetAlpha",
+            "summary": "Verified alpha feature.",
+            "dependencies": ["BepInEx-BepInExPack-5.4.2305"],
+            "required_loader": "BepInEx",
+            "url": "https://thunderstore.io/c/test/p/Author/TargetAlpha/",
+            "_detail_verified": True,
+        },
+        {
+            "name": "BepInExPack",
+            "full_name": "BepInEx-BepInExPack",
+            "summary": "BepInEx framework package.",
+            "version": "5.4.2305",
+            "url": "https://thunderstore.io/c/test/p/BepInEx/BepInExPack/",
+            "_detail_verified": True,
+        },
+    ],
+}, mod_loader="")
+refreshed = merge_recommendation_resolution(
+    shared_loader,
+    resolved_loader,
+    target_selection_key=alpha["selection_key"],
+)
+refreshed_alpha = next(
+    item for item in refreshed["items"] if item["name"] == "Target Alpha"
+)
+refreshed_beta = next(
+    item for item in refreshed["items"] if item["name"] == "Target Beta"
+)
+loader_item = next(
+    item for item in refreshed["items"] if item["name"] == "BepInExPack"
+)
+assert refreshed_alpha["installable"] is True
+assert refreshed_beta["installable"] is True
+assert refreshed_alpha["selection_key"] in refreshed["selected_keys"]
+assert refreshed_beta["selection_key"] not in refreshed["selected_keys"]
+assert loader_item["selection_key"] in refreshed["selected_keys"]
+assert refreshed["wanted_keys"] == []
+assert refreshed["resolution_refresh"]["shared_candidates_unlocked"] == 2
+assert any(
+    requirement["status"] == "planned"
+    for requirement in refreshed["dependency_requirements"]
+)
 
 analysis = recommendation_analysis_text("""
 ## 推荐与分析
@@ -230,5 +377,112 @@ assert all(
     any("\u3400" <= char <= "\u9fff" for char in item["content"])
     for item in localized["items"]
 )
+
+# A named installation target must not expand into an open recommendation
+# round, and a present BepInEx loader satisfies Thunderstore's package
+# coordinate without downloading a second framework copy.
+mods_up = recommendations_from_tool_evidence([
+    ("nexus_search", json.dumps({
+        "results": [
+            {
+                "mod_id": 900,
+                "name": "Unrelated Nexus result",
+                "summary": "Not the requested target.",
+                "_detail_verified": True,
+            },
+        ],
+    })),
+    ("thunderstore_search", json.dumps({
+        "results": [
+            {
+                "name": "ModsUp",
+                "full_name": "Zichen-ModsUp",
+                "summary": (
+                    "REPO游戏交流QQ群: 824639225. "
+                    "Runtime compatibility patcher for R.E.P.O."
+                ),
+                "latest_version": "1.0.5",
+                "dependencies": ["BepInEx-BepInExPack-5.4.2100"],
+                "url": "https://thunderstore.io/c/repo/p/Zichen/ModsUp/",
+                "has_files": True,
+                "_detail_verified": True,
+            },
+            {
+                "name": "RepoDarkSoulsPopUpMod",
+                "full_name": "MisterBraadorwst-RepoDarkSoulsPopUpMod",
+                "summary": "Unrelated search result.",
+                "latest_version": "0.2.2",
+                "dependencies": ["BepInEx-BepInExPack-5.4.2100"],
+                "url": "https://thunderstore.io/c/repo/p/MisterBraadorwst/RepoDarkSoulsPopUpMod/",
+                "has_files": True,
+                "_detail_verified": True,
+            },
+        ],
+    })),
+], mod_loader="BepInEx", target_name="ModsUp", target_version="1.0.5")
+assert [item["name"] for item in mods_up["items"]] == ["ModsUp"]
+assert mods_up["items"][0]["installable"] is True
+assert mods_up["items"][0]["selection_key"] in mods_up["selected_keys"]
+assert "824639225" not in mods_up["items"][0]["content"]
+assert mods_up["dependency_requirements"] == [{
+    "name": "BepInEx-BepInExPack-5.4.2100",
+    "required_by": ["ModsUp"],
+    "matched_selection_key": "",
+    "status": "satisfied_local",
+}]
+
+# Dependency aggregation is candidate-scoped and package-version aware.
+scoped_dependencies = normalize_recommendations({
+    "thunderstore": [
+        {
+            "name": "Target Alpha",
+            "full_name": "Author-TargetAlpha",
+            "summary": "Alpha feature.",
+            "dependencies": [
+                "bbepis-BepInExPack-5.3.1",
+                "RiskofThunder-HookGenPatcher-1.2.3",
+                "Author-AlphaLibrary-1.0.0",
+            ],
+            "url": "https://thunderstore.io/c/riskofrain2/p/Author/TargetAlpha/",
+            "_detail_verified": True,
+        },
+        {
+            "name": "Target Beta",
+            "full_name": "Author-TargetBeta",
+            "summary": "Beta feature.",
+            "dependencies": [
+                "BepInEx-BepInExPack-5.4.2113",
+                "RiskofThunder-HookGenPatcher-1.2.9",
+                "Author-BetaLibrary-2.0.0",
+            ],
+            "url": "https://thunderstore.io/c/riskofrain2/p/Author/TargetBeta/",
+            "_detail_verified": True,
+        },
+    ],
+}, mod_loader="BepInEx")
+assert len(scoped_dependencies["dependency_requirements"]) == 4
+bepinex_requirement = next(
+    item for item in scoped_dependencies["dependency_requirements"]
+    if "BepInExPack" in item["name"]
+)
+assert bepinex_requirement["status"] == "satisfied_local"
+assert bepinex_requirement["version_conflict"] is True
+assert bepinex_requirement["requested_versions"] == ["5.4.2113", "5.3.1"]
+hook_requirement = next(
+    item for item in scoped_dependencies["dependency_requirements"]
+    if "HookGenPatcher" in item["name"]
+)
+assert hook_requirement["name"].endswith("-1.2.9")
+assert hook_requirement["version_conflict"] is True
+
+alpha_key = next(
+    item["selection_key"] for item in scoped_dependencies["items"]
+    if item["name"] == "Target Alpha"
+)
+scoped_dependencies["selected_keys"] = [alpha_key]
+scoped_text = recommendation_analysis_text("", scoped_dependencies)
+dependency_summary = scoped_text.split("\n1. ", 1)[0]
+assert "AlphaLibrary" in dependency_summary
+assert "BetaLibrary" not in dependency_summary
 
 print("ALL PASS")

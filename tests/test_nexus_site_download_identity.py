@@ -75,8 +75,8 @@ async def verify_single_page_attempt():
     original_page = downloader.get_download_url_filepage
     attempts = []
 
-    async def fail_once(*args):
-        attempts.append(args)
+    async def fail_once(*args, **kwargs):
+        attempts.append((args, kwargs))
         raise RuntimeError("未获取到下载链接(原始返回: [])")
 
     try:
