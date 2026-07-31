@@ -1,6 +1,18 @@
 name: Release gates
 
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - main
+      - 'v*'
+      - 'anchor-v*'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: release-gates-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   python-regression:
@@ -17,6 +29,12 @@ jobs:
 
   electron-build-and-release-text:
     runs-on: windows-latest
+    env:
+      # The public repository must be buildable without private P assets.
+      # P packages are built by the private release pipeline, where their
+      # commercial audio is still hash-verified.
+      MODAGENT_EDITION: free
+      MODAGENT_CHANNEL: stable
     defaults:
       run:
         working-directory: electron
@@ -31,6 +49,7 @@ jobs:
       - run: npm run test:browser
       - run: npm run test:diagnostics
       - run: npm run test:identity
+      - run: npm run test:build-policy
       - run: npm run verify:text
       - run: npm run build
 
