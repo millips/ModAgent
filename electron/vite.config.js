@@ -5,7 +5,7 @@ import path from 'node:path'
 import postcss from 'postcss'
 
 const packageInfo = createRequire(import.meta.url)('./package.json')
-const edition = process.env.MODAGENT_EDITION === 'subscription' ? 'subscription' : 'free'
+const edition = process.env.MODAGENT_EDITION === 'free' ? 'free' : 'subscription'
 const channel = process.env.MODAGENT_CHANNEL === 'beta' ? 'beta' : 'stable'
 
 const freeCssSanitizer = () => ({

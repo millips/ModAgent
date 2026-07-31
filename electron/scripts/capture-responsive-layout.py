@@ -7,6 +7,7 @@ import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -20,9 +21,10 @@ HEIGHT = max(600, int(sys.argv[3])) if len(sys.argv) > 3 else 650
 
 
 def api_payload(url: str):
-    if url.endswith("/health"):
+    path = urlparse(url).path
+    if path == "/health":
         return {"ok": True}
-    if url.endswith("/status"):
+    if path == "/status":
         return {
             "api_key_set": True,
             "tavily_set": True,
@@ -32,7 +34,7 @@ def api_payload(url: str):
             "game_slug": "repo",
             "game_instance_id": "gi_layout_qa",
         }
-    if "/games/detect" in url:
+    if path == "/games/detect":
         return [{
             "name": "R.E.P.O.",
             "path": r"E:\SteamLibrary\steamapps\common\REPO",
@@ -41,9 +43,34 @@ def api_payload(url: str):
             "source": "steam",
             "adapted": True,
         }]
-    if "/chat/tasks/active" in url:
+    if path == "/sessions":
+        return [{
+            "id": "layout-long",
+            "title": "长回复布局回归测试",
+            "created_at": 1785038400,
+        }]
+    if path == "/sessions/layout-long":
+        lines = [
+            f"| snap_20260725_{163400 - index:06d} | 示例 Mod 更新前快照 | 16:{34 - index % 20:02d} |"
+            for index in range(36)
+        ]
+        return {
+            "id": "layout-long",
+            "messages": [
+                {"role": "user", "content": "快照太多了，你看看能不能清理一下"},
+                {
+                    "role": "assistant",
+                    "content": (
+                        "一共 36 个快照。下面这段内容故意超过窗口高度，用于验证消息区独立滚动，"
+                        "并确保顶部工具栏与底部输入栏始终可见。\n\n"
+                        + "\n".join(lines)
+                    ),
+                },
+            ],
+        }
+    if path == "/chat/tasks/active":
         return {"active": False}
-    if "/downloads/status" in url:
+    if path == "/downloads/status":
         return {"active": []}
     return []
 
@@ -93,6 +120,15 @@ with sync_playwright() as playwright:
     page.route("http://127.0.0.1:18890/**", route_api)
     page.goto(f"http://127.0.0.1:{server.server_port}/index.html", wait_until="networkidle")
     page.wait_for_timeout(1200)
+    session_item = page.locator(".chat-session-list [class*='cursor-pointer']").first
+    if session_item.count():
+        session_item.click()
+        page.wait_for_timeout(300)
+    if WIDTH <= 1280:
+        collapse = page.locator('.chat-composer button[title="收起"]')
+        if collapse.count():
+            collapse.click()
+            page.wait_for_timeout(200)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(OUTPUT))
     drawer_output = OUTPUT.with_name(f"{OUTPUT.stem}-sessions{OUTPUT.suffix}")
@@ -124,10 +160,49 @@ with sync_playwright() as playwright:
             primary: box('.chat-primary-pane'),
             quick: box('.chat-quick-sidebar'),
             sessions: box('.chat-session-rail'),
+            sessionHeader: box('.chat-session-header'),
+            messageScroll: box('.chat-message-scroll'),
+            composer: box('.chat-composer'),
+            newSessionAction: box('.chat-session-header .btn-cyber'),
+            sessionCloseAction: box('.chat-session-close'),
+            composerVisible: (() => {
+              const node = document.querySelector('.chat-composer');
+              if (!node) return false;
+              const rect = node.getBoundingClientRect();
+              return rect.top >= 0 && rect.bottom <= innerHeight;
+            })(),
+            messageScrollContained: (() => {
+              const node = document.querySelector('.chat-message-scroll');
+              if (!node) return false;
+              const rect = node.getBoundingClientRect();
+              return rect.top >= 0 && rect.bottom <= innerHeight
+                && node.scrollHeight > node.clientHeight;
+            })(),
           };
         }
         """
     )
+    required = {
+        "composerVisible": metrics["composerVisible"],
+        "messageScrollContained": metrics["messageScrollContained"],
+        "noBodyOverflowX": not metrics["bodyOverflowX"],
+    }
+    if WIDTH <= 1280:
+        action = metrics["newSessionAction"]
+        close_action = metrics["sessionCloseAction"]
+        required["newSessionActionVisible"] = bool(
+            action
+            and action["y"] >= 0
+            and action["y"] + action["height"] <= HEIGHT
+        )
+        required["sessionCloseActionVisible"] = bool(
+            close_action
+            and close_action["y"] >= 0
+            and close_action["y"] + close_action["height"] <= HEIGHT
+        )
+    failures = [name for name, passed in required.items() if not passed]
+    if failures:
+        raise RuntimeError(f"Responsive layout regression: {', '.join(failures)}")
     print(json.dumps({
         "capture": str(OUTPUT),
         "drawer_capture": str(drawer_output) if drawer_output.exists() else None,

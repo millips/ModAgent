@@ -72,6 +72,38 @@ class FakeAgent(Agent):
         })
 
 
+class MultiSearchAgent(FakeAgent):
+    def _stream(self, _messages, _tools):
+        self.round += 1
+        if self.round <= 3:
+            search_call = type("ToolCall", (), {
+                "index": 0,
+                "id": f"nexus-search-{self.round}",
+                "function": type("Function", (), {
+                    "name": "nexus_search",
+                    "arguments": json.dumps({"query": f"mai costume {self.round}"}),
+                })(),
+            })()
+            return [chunk(tool_calls=[search_call])]
+        return [chunk(
+            content="找到了三个候选，你想装哪一个？",
+            tool_calls=None,
+        )]
+
+    def _exec(self, _name, args):
+        query = str(args.get("query") or "")
+        index = int(query.rsplit(" ", 1)[-1])
+        return json.dumps({
+            "status": "ok",
+            "source": "nexus",
+            "results": [{
+                "mod_id": 2400 + index,
+                "name": f"Mai Costume {index}",
+                "summary": f"Costume candidate {index}.",
+            }],
+        })
+
+
 old_prompt = agent_module.build_prompt
 old_tools = agent_module.build_tools_definitions
 old_report = agent_module.ENABLE_REPORT_VALIDATION
@@ -79,7 +111,8 @@ old_state = agent_module.ENABLE_STATE_CHECK
 old_edition = os.environ.get("MODAGENT_EDITION")
 agent_module.build_prompt = lambda _cfg: "system"
 agent_module.build_tools_definitions = lambda _tier: [
-    {"type": "function", "function": {"name": "mod_recommend"}}
+    {"type": "function", "function": {"name": "mod_recommend"}},
+    {"type": "function", "function": {"name": "nexus_search"}},
 ]
 agent_module.ENABLE_REPORT_VALIDATION = False
 agent_module.ENABLE_STATE_CHECK = False
@@ -90,6 +123,13 @@ try:
     recommendation_events = [event for event in pro_events if "recommendations" in event]
     assert len(recommendation_events) == 1
     assert len(recommendation_events[0]["recommendations"]["items"]) == 2
+    recommendation_index = next(
+        index for index, event in enumerate(pro_events) if "recommendations" in event
+    )
+    narrative_index = next(
+        index for index, event in enumerate(pro_events) if event.get("chunk")
+    )
+    assert recommendation_index < narrative_index
     narrative = "\n".join(event.get("chunk", "") for event in pro_events)
     assert "1. **One**" in narrative
     assert "2. **Two**" in narrative
@@ -106,6 +146,14 @@ try:
     free_recommendations = [event for event in free_events if "recommendations" in event]
     assert len(free_recommendations) == 1
     assert len(free_recommendations[0]["recommendations"]["items"]) == 2
+
+    # Even when the model performs several searches and ends with a plain-text
+    # question, the accumulated evidence must still produce one decision table.
+    os.environ["MODAGENT_EDITION"] = "subscription"
+    multi_events = [json.loads(value) for value in MultiSearchAgent().chat_stream("mai costumes")]
+    multi_recommendations = [event for event in multi_events if "recommendations" in event]
+    assert len(multi_recommendations) == 1
+    assert len(multi_recommendations[0]["recommendations"]["items"]) == 3
 finally:
     agent_module.build_prompt = old_prompt
     agent_module.build_tools_definitions = old_tools

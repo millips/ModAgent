@@ -7,12 +7,17 @@ const PRODUCT_ID = 'modagent-p'
 const TRIAL_DAYS = 3
 const CLOCK_ROLLBACK_GRACE_MS = 6 * 60 * 60 * 1000
 const DAY_MS = 24 * 60 * 60 * 1000
+const PERMANENT_ENTITLEMENT = 'permanent'
 
 function atomicWriteJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true })
   const temporary = `${filePath}.${process.pid}.tmp`
   fs.writeFileSync(temporary, JSON.stringify(value, null, 2), 'utf8')
   fs.renameSync(temporary, filePath)
+}
+
+function canUsePBenefits(status) {
+  return Boolean(status?.edition === 'subscription' && status?.entitled)
 }
 
 function decodeToken(rawToken, publicKey) {
@@ -41,6 +46,22 @@ function decodeToken(rawToken, publicKey) {
   }
   if (!/^[A-Za-z0-9_-]{8,64}$/.test(String(payload.id || ''))) {
     throw new Error('兑换码编号无效')
+  }
+  if (payload.entitlement === PERMANENT_ENTITLEMENT) {
+    if (Object.prototype.hasOwnProperty.call(payload, 'days')) {
+      throw new Error('兑换码有效期无效')
+    }
+    return {
+      token,
+      payload: {
+        ...payload,
+        permanent: true,
+        days: null,
+      },
+    }
+  }
+  if (payload.entitlement != null) {
+    throw new Error('兑换码有效期无效')
   }
   const days = Number(payload.days)
   if (!Number.isInteger(days) || days < 1 || days > 366) {
@@ -131,6 +152,19 @@ function createLicenseStore({
         const { payload } = decodeToken(state.current_token, getPublicKey())
         const activation = state.activations?.[payload.id]
         const activatedAt = Number(activation?.activated_at || 0)
+        if (activatedAt && payload.permanent) {
+          return {
+            edition: 'subscription',
+            state: 'permanent',
+            entitled: true,
+            permanent: true,
+            license_id: payload.id,
+            duration_days: null,
+            activated_at: new Date(activatedAt).toISOString(),
+            expires_at: null,
+            days_remaining: null,
+          }
+        }
         const expiresAt = activatedAt + payload.days * DAY_MS
         if (activatedAt && timestamp < expiresAt) {
           return {
@@ -215,18 +249,25 @@ function createLicenseStore({
     const state = loaded.state
     const timestamp = now()
     const currentStatus = evaluateState(state, { touch: false })
+    if (currentStatus.state === 'permanent' && !payload.permanent) {
+      return currentStatus
+    }
     const existing = state.activations?.[payload.id]
     const activatedAt = existing?.activated_at
       ? Number(existing.activated_at)
-      : Math.max(
-          timestamp,
-          currentStatus.state === 'active' ? Date.parse(currentStatus.expires_at) : timestamp,
-        )
+      : payload.permanent
+        ? timestamp
+        : Math.max(
+            timestamp,
+            currentStatus.state === 'active' ? Date.parse(currentStatus.expires_at) : timestamp,
+          )
     state.activations = {
       ...(state.activations || {}),
       [payload.id]: {
         activated_at: activatedAt,
-        duration_days: payload.days,
+        ...(payload.permanent
+          ? { entitlement: PERMANENT_ENTITLEMENT }
+          : { duration_days: payload.days }),
       },
     }
     state.current_token = token
@@ -245,4 +286,6 @@ module.exports = {
   PRODUCT_ID,
   TRIAL_DAYS,
   DAY_MS,
+  PERMANENT_ENTITLEMENT,
+  canUsePBenefits,
 }

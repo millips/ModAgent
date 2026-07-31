@@ -19,7 +19,9 @@ function downloadItemLabel(item) {
 export default function DownloadPanel({ api }) {
   const [state, setState] = useState({ active: false, items: [], updated: 0, overall_pct: 0 })
   const [dismissed, setDismissed] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const previous = useRef(null)
+  const startedGeneration = useRef(null)
 
   useEffect(() => {
     let timer
@@ -30,14 +32,28 @@ export default function DownloadPanel({ api }) {
         const s = await r.json()
         if (!s || !Array.isArray(s.items)) throw new Error('invalid download status')
         const prev = previous.current
+        const generation = s.generation ?? 0
+        const actualTransfer = s.items.some(item => [
+          'browser_downloading', 'browser_download_complete', 'transferring',
+        ].includes(item.phase))
+        if (actualTransfer && startedGeneration.current !== generation) {
+          startedGeneration.current = generation
+          setDismissed(false)
+          emitFeedback('download-start', { count: s.items.length })
+        }
         if (prev) {
           if (s.active && !prev.active) {
             setDismissed(false)
-            emitFeedback('download-start', { count: s.items.length })
           }
           const oldItems = new Map(prev.items.map((item, index) => [String(item.mod_id ?? index), item]))
           s.items.forEach((item, index) => {
             const old = oldItems.get(String(item.mod_id ?? index))
+            if (item.phase === 'waiting_verification' && old?.phase !== 'waiting_verification') {
+              emitFeedback('warning', { modId: item.mod_id, name: item.name })
+            }
+            if (item.phase === 'verification_resolved' && old?.phase === 'waiting_verification') {
+              emitFeedback('notice', { modId: item.mod_id, name: item.name })
+            }
             if (item.status === 'done' && old?.status !== 'done') {
               emitFeedback('download-item-complete', { modId: item.mod_id, name: item.name })
             }
@@ -47,10 +63,10 @@ export default function DownloadPanel({ api }) {
           }
         } else if (s.active) {
           setDismissed(false)
-          emitFeedback('download-start', { count: s.items.length })
         }
         previous.current = s
         setState(s)
+        if (!s.active || !s.cancel_requested) setCancelling(false)
       } catch (_) {}
     }
     poll()
@@ -62,11 +78,42 @@ export default function DownloadPanel({ api }) {
   const recent = items.length > 0 && (Date.now() / 1000 - (state.updated || 0) < 12)
   if (dismissed || items.length === 0 || (!state.active && !recent)) return null
 
-  const done = items.filter(i => i.status === 'done').length
+  const done = items.filter(i => ['done', 'cancelled'].includes(i.status)).length
   const failed = items.filter(i => i.status === 'failed').length
+  const cancelledCount = items.filter(i => i.status === 'cancelled').length
   const finished = !state.active
-  const overall = finished && !failed ? 100 : Math.max(0, Math.min(100, Number(state.overall_pct) || 0))
+  const overall = finished && !failed && !cancelledCount
+    ? 100 : Math.max(0, Math.min(100, Number(state.overall_pct) || 0))
   const eta = state.eta_seconds == null ? '正在估算' : `约 ${formatDuration(state.eta_seconds)}`
+  const currentPhase = state.current_item?.phase || ''
+  const showEta = ['browser_downloading', 'transferring'].includes(currentPhase)
+  const taskLabels = {
+    source_align: ['来源对齐已结束', '正在对齐维护来源'],
+    update_check: ['更新检查已结束', '正在检查更新'],
+    mod_update: ['Mod 更新已结束', '正在更新 Mod'],
+    download: ['下载任务已结束', '正在下载'],
+  }
+  const [finishedLabel, activeLabel] = taskLabels[state.task_kind] || [
+    '任务已结束', state.label || '正在处理',
+  ]
+  const cancellable = state.active && [
+    'source_align', 'update_check', 'mod_update', 'download',
+  ].includes(state.task_kind)
+
+  const cancelTask = async () => {
+    if (cancelling || !cancellable) return
+    setCancelling(true)
+    try {
+      await fetch(`${api}/tasks/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_kind: state.task_kind }),
+      })
+      emitFeedback('cancel', { source: 'task-progress' })
+    } catch (_) {
+      setCancelling(false)
+    }
+  }
 
   return (
     <div className="fixed bottom-4 right-4 w-80 z-40 rounded-xl border border-cyber-cyan/25 bg-surface-800/95 backdrop-blur-md shadow-2xl shadow-black/40 overflow-hidden animate-fade-in">
@@ -74,10 +121,25 @@ export default function DownloadPanel({ api }) {
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 text-xs font-medium text-cyber-cyan min-w-0">
             {finished ? <Download size={13} /> : <Loader2 size={13} className="animate-spin shrink-0" />}
-            <span className="truncate">{finished ? '下载任务已结束' : '正在下载'} · {done}/{items.length}</span>
+            <span className="truncate">
+              {state.cancel_requested
+                ? '正在取消'
+                : cancelledCount && finished
+                ? '任务已取消'
+                : finished ? finishedLabel : activeLabel} · {done}/{items.length}
+            </span>
             {failed > 0 && <span className="text-cyber-red shrink-0">{failed} 失败</span>}
           </div>
-          {finished && (
+          {cancellable ? (
+            <button
+              onClick={cancelTask}
+              disabled={cancelling}
+              className="flex items-center gap-1 text-[10px] text-cyber-red hover:text-white disabled:opacity-50 transition-colors"
+              title="安全停止当前任务，已完成结果会保留"
+            >
+              <X size={13} /> {cancelling || state.cancel_requested ? '正在取消' : '取消'}
+            </button>
+          ) : finished && (
             <button onClick={() => setDismissed(true)} className="text-surface-500 hover:text-white transition-colors">
               <X size={14} />
             </button>
@@ -86,7 +148,8 @@ export default function DownloadPanel({ api }) {
         <div className="flex items-center justify-between mt-2 text-[10px] text-surface-400">
           <span>{overall.toFixed(overall % 1 ? 1 : 0)}%</span>
           <span className="flex items-center gap-1"><Clock3 size={10} />
-            已用 {formatDuration(state.elapsed_seconds)}{state.active ? ` · 剩余 ${eta}` : ''}
+            已用 {formatDuration(state.elapsed_seconds)}
+            {state.active && showEta && state.eta_seconds != null ? ` · 剩余 ${eta}` : ''}
           </span>
         </div>
         <div className="h-1.5 mt-1 rounded-full bg-surface-700 overflow-hidden">
@@ -101,7 +164,8 @@ export default function DownloadPanel({ api }) {
               <span className="shrink-0">
                 {it.status === 'done' ? <Check size={12} className="text-cyber-green" />
                   : it.status === 'failed' ? <AlertCircle size={12} className="text-cyber-red" />
-                  : it.status === 'downloading' ? <Loader2 size={12} className="text-cyber-cyan animate-spin" />
+                  : ['processing', 'downloading', 'waiting_verification'].includes(it.status)
+                    ? <Loader2 size={12} className="text-cyber-cyan animate-spin" />
                   : <span className="block w-3 h-3 rounded-full border border-surface-500" />}
               </span>
               <span
@@ -111,14 +175,23 @@ export default function DownloadPanel({ api }) {
                 {downloadItemLabel(it)}
               </span>
               <span className="text-[10px] text-surface-500 shrink-0">
-                {it.status === 'done' ? '完成' : it.status === 'failed' ? '失败' : it.status === 'downloading' ? `${it.pct}%` : '等待'}
+                {it.status === 'done' ? '完成'
+                  : it.status === 'failed' ? '失败'
+                  : it.status === 'cancelled' ? '已取消'
+                  : it.phase_label || (it.status === 'downloading' ? `${it.pct}%`
+                  : it.status === 'processing' ? '处理中'
+                  : it.status === 'waiting_verification' ? '等待验证'
+                  : '等待')}
               </span>
             </div>
             <div className="h-1 rounded-full bg-surface-700 overflow-hidden">
               <div className={`h-full rounded-full transition-all duration-300 ${
                 it.status === 'failed' ? 'bg-cyber-red' : it.status === 'done' ? 'bg-cyber-green' : 'bg-cyber-cyan'}`}
-                style={{ width: `${it.status === 'done' ? 100 : it.status === 'queued' ? 3 : it.pct}%` }} />
+                style={{ width: `${it.status === 'done' ? 100 : ['queued', 'processing', 'waiting_verification'].includes(it.status) ? 3 : it.pct}%` }} />
             </div>
+            {it.detail && !['done', 'failed'].includes(it.status) && (
+              <div className="mt-1 text-[10px] text-surface-400 truncate" title={it.detail}>{it.detail}</div>
+            )}
             {it.status === 'failed' && it.error && (
               <div className="mt-1 text-[10px] text-cyber-red/80 truncate" title={it.error}>{it.error}</div>
             )}

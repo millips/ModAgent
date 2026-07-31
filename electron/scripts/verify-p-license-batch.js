@@ -30,7 +30,16 @@ for (const row of ledger.licenses) {
   const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
   assert.strictEqual(payload.product, 'modagent-p')
   assert.strictEqual(payload.id, row.license_id)
-  assert.strictEqual(payload.days, ledger.duration_days)
+  if (ledger.entitlement === 'permanent') {
+    assert.strictEqual(payload.entitlement, 'permanent')
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(payload, 'days'), false)
+    assert.strictEqual(row.entitlement, 'permanent')
+    assert.strictEqual(row.duration_days, null)
+  } else {
+    assert.strictEqual(payload.entitlement, undefined)
+    assert.strictEqual(payload.days, ledger.duration_days)
+    assert.strictEqual(row.duration_days, ledger.duration_days)
+  }
   assert.strictEqual(
     crypto.verify(null, Buffer.from(parts[1], 'utf8'), publicKey, Buffer.from(parts[2], 'base64url')),
     true,

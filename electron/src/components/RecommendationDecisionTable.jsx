@@ -28,8 +28,10 @@ export function RecommendationDecisionTable({
   onChange,
   onSubmit,
   onResolve,
+  onResolveWanted,
   disabled = false,
 }) {
+  const [showAllDependencies, setShowAllDependencies] = React.useState(false)
   if (message?.payload?.kind !== 'recommendation_set') return null
   const payload = message.payload
   const items = Array.isArray(payload.items) ? payload.items : []
@@ -54,8 +56,21 @@ export function RecommendationDecisionTable({
   const sourceCount = new Set(items.map(item => item.source).filter(Boolean)).size
   const verifiedCount = items.filter(item => item.detail_verified).length
   const unavailableCount = items.filter(item => item.installable === false).length
-  const unresolvedRequirements = requirements.filter(
-    requirement => requirement.status !== 'ready'
+  const activeTargetNames = new Set(items
+    .filter(item => (
+      !item.is_prerequisite
+      && (selected.has(item.selection_key) || wanted.has(item.selection_key))
+    ))
+    .flatMap(item => [item.name, item.localized_name].filter(Boolean)))
+  const visibleRequirements = requirements.filter(
+    requirement => (requirement.required_by || []).some(
+      name => activeTargetNames.has(name)
+    )
+  )
+  const renderedRequirements = showAllDependencies
+    ? visibleRequirements : visibleRequirements.slice(0, 8)
+  const unresolvedRequirements = visibleRequirements.filter(
+    requirement => ['unresolved', 'needs_resolution'].includes(requirement.status)
   )
   const verificationCoverage = items.length
     ? Math.round((verifiedCount / items.length) * 100)
@@ -127,7 +142,7 @@ export function RecommendationDecisionTable({
           <p className="mt-1.5 max-w-3xl text-[11px] leading-relaxed text-surface-500">
             {isConfirmation
               ? '实际安装只处理最终勾选项及核实后的必要依赖；执行前仍会进行下载包与路径检查。'
-              : '前置依赖置顶；暂不可安装的候选仍可保留目标，并通过核验、来源页或手动导入继续处理。'}
+              : '先选择目标；这里只汇总所选目标的直接依赖，生成计划时再逐项核验，不会把其他候选的依赖混进来。'}
           </p>
           <div className="mt-3 flex flex-wrap gap-2 text-[10px] text-surface-400">
             <span className="pro-recommendation-stat">{items.length} 个候选</span>
@@ -155,18 +170,18 @@ export function RecommendationDecisionTable({
         </div>
       </div>
 
-      {requirements.length > 0 && (
+      {visibleRequirements.length > 0 && (
         <div className="border-b border-surface-700/80 bg-cyber-purple/[0.06] px-5 py-3">
           <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-white">
             <Wrench size={14} className="text-cyber-purple" />
-            前置 / 必要依赖（优先处理）
+            当前所选目标的前置 / 必要依赖（{visibleRequirements.length} 项）
           </div>
           <div className="grid gap-2 md:grid-cols-2">
-            {requirements.map(requirement => (
+            {renderedRequirements.map(requirement => (
               <div
                 key={`${requirement.name}:${(requirement.required_by || []).join('|')}`}
                 className={`rounded border px-3 py-2 text-[10px] ${
-                  requirement.status === 'ready'
+                  ['ready', 'planned', 'satisfied_installed', 'satisfied_local'].includes(requirement.status)
                     ? 'border-cyber-green/25 bg-cyber-green/[0.06]'
                     : 'border-cyber-yellow/25 bg-cyber-yellow/[0.06]'
                 }`}
@@ -180,16 +195,43 @@ export function RecommendationDecisionTable({
                 <p className="mt-1 text-surface-400">
                   被 {(requirement.required_by || []).join('、') || '目标 Mod'} 需要
                 </p>
-                <p className={requirement.status === 'ready' ? 'text-cyber-green' : 'text-cyber-yellow'}>
+                {requirement.version_conflict && (
+                  <p className="text-cyber-yellow">
+                    多个目标声明了不同版本：
+                    {(requirement.requested_versions || []).join(' / ')}
+                    ；计划阶段将核验可共同满足的版本
+                  </p>
+                )}
+                <p className={
+                  ['ready', 'planned', 'satisfied_installed', 'satisfied_local'].includes(requirement.status)
+                    ? 'text-cyber-green' : 'text-cyber-yellow'
+                }>
                   {requirement.status === 'ready'
                     ? '已匹配可安装候选，将排在目标 Mod 之前'
+                    : requirement.status === 'planned'
+                      ? '已加入本轮拟安装计划，共享该依赖的候选已重新计算'
+                    : requirement.status === 'satisfied_installed'
+                      ? '本机已经安装，安装计划不会重复下载'
+                      : requirement.status === 'satisfied_local'
+                        ? '当前加载器环境已经满足'
                     : requirement.status === 'needs_resolution'
                       ? '已匹配候选，但需要先完成核验或下载处理'
-                      : '尚未匹配明确来源；计划阶段必须继续核验'}
+                      : '尚未匹配明确来源；该目标不能进入安装确认'}
                 </p>
               </div>
             ))}
           </div>
+          {visibleRequirements.length > 8 && (
+            <button
+              type="button"
+              onClick={() => setShowAllDependencies(value => !value)}
+              className="btn-ghost mt-2 px-2.5 py-1 text-[10px]"
+            >
+              {showAllDependencies
+                ? '收起依赖'
+                : `展开其余 ${visibleRequirements.length - 8} 项`}
+            </button>
+          )}
           {unresolvedRequirements.length > 0 && (
             <p className="mt-2 flex items-center gap-1 text-[10px] text-cyber-yellow">
               <AlertTriangle size={11} />
@@ -227,7 +269,7 @@ export function RecommendationDecisionTable({
                       type="button"
                       role="checkbox"
                       aria-checked={checked}
-                      aria-label={unavailable ? `保留目标 ${item.name}` : `选择 ${item.name}`}
+                      aria-label={unavailable ? `我要这个 ${item.name}` : `选择 ${item.name}`}
                       disabled={disabled || locked || dependencyLocked}
                       onClick={() => toggle(item)}
                       className={`mx-auto flex h-5 w-5 items-center justify-center rounded border transition-colors ${
@@ -241,7 +283,10 @@ export function RecommendationDecisionTable({
                       {unavailable ? <Heart size={12} fill={checked ? 'currentColor' : 'none'} /> : <Check size={13} strokeWidth={3} />}
                     </button>
                     {unavailable && (
-                      <p className="mt-1 text-[9px] text-cyber-yellow">保留目标</p>
+                      <p className="mt-1 text-[9px] text-cyber-yellow">我要这个</p>
+                    )}
+                    {!unavailable && !dependencyLocked && (
+                      <p className="mt-1 text-[9px] text-cyber-cyan">安装</p>
                     )}
                     {dependencyLocked && (
                       <p className="mt-1 text-[9px] text-cyber-purple">必要依赖</p>
@@ -251,6 +296,11 @@ export function RecommendationDecisionTable({
                     {item.is_prerequisite && (
                       <span className="mb-1.5 inline-flex rounded bg-cyber-purple/15 px-1.5 py-0.5 text-[9px] text-cyber-purple">
                         前置依赖 · 已置顶
+                      </span>
+                    )}
+                    {item.installed_match_kind === 'functional_alternative' && (
+                      <span className="mb-1.5 inline-flex rounded border border-cyber-yellow/25 bg-cyber-yellow/10 px-1.5 py-0.5 text-[9px] text-cyber-yellow">
+                        已安装同类替代方案
                       </span>
                     )}
                     <p className="font-medium leading-snug text-white">
@@ -315,6 +365,18 @@ export function RecommendationDecisionTable({
                     <span className={`inline-flex max-w-full rounded border px-2 py-1 text-[10px] leading-relaxed ${conflictTone[item.conflict_status] || conflictTone.unknown}`}>
                       {item.conflict}
                     </span>
+                    {item.required_loader && (
+                      <div className={`mt-2 rounded border px-2 py-1.5 text-[10px] ${
+                        item.loader_compatible === true
+                          ? 'border-cyber-green/25 bg-cyber-green/[0.06] text-cyber-green'
+                          : 'border-cyber-red/25 bg-cyber-red/[0.06] text-cyber-red'
+                      }`}>
+                        必需加载器：{item.required_loader}
+                        {item.active_loader
+                          ? ` · 当前：${item.active_loader}`
+                          : ' · 当前加载器待核验'}
+                      </div>
+                    )}
                     <div className="mt-2">
                       {item.dependencies?.length
                         ? (
@@ -359,24 +421,36 @@ export function RecommendationDecisionTable({
             </button>
           </div>
         </div>
-        <button
-          type="button"
-          disabled={disabled || locked || selectedItems.length === 0}
-          onClick={() => onSubmit?.(selectedItems)}
-          className={`rounded-md px-4 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-            isConfirmation
-              ? 'bg-cyber-yellow/90 text-black hover:bg-cyber-yellow'
-              : 'bg-cyber-cyan/90 text-black hover:bg-cyber-cyan'
-          }`}
-        >
-          {phase === 'executing'
-            ? '正在执行安装流程…'
-            : phase === 'completed'
-              ? '安装流程已提交'
-              : isConfirmation
-                ? `确认下载并安装 ${selectedItems.length} 项`
-                : `生成安装计划（${selectedItems.length} 项）`}
-        </button>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {!isConfirmation && wantedItems.length > 0 && (
+            <button
+              type="button"
+              disabled={disabled || locked}
+              onClick={() => onResolveWanted?.(wantedItems)}
+              className="rounded-md border border-cyber-yellow/50 bg-cyber-yellow/10 px-4 py-2 text-xs font-medium text-cyber-yellow transition-colors hover:bg-cyber-yellow/20 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              补齐当前需要（{wantedItems.length} 个）
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={disabled || locked || selectedItems.length === 0}
+            onClick={() => onSubmit?.(selectedItems)}
+            className={`rounded-md px-4 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+              isConfirmation
+                ? 'bg-cyber-yellow/90 text-black hover:bg-cyber-yellow'
+                : 'bg-cyber-cyan/90 text-black hover:bg-cyber-cyan'
+            }`}
+          >
+            {phase === 'executing'
+              ? '正在执行安装流程…'
+              : phase === 'completed'
+                ? '安装流程已提交'
+                : isConfirmation
+                  ? `确认下载并安装 ${selectedItems.length} 项`
+                  : `生成安装计划（${selectedItems.length} 项）`}
+          </button>
+        </div>
       </div>
     </section>
   )

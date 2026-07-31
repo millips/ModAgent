@@ -93,6 +93,15 @@ _VER_RE = re.compile(r"(incompatible|mismatch|expected .* got|wrong version|unsu
 # 噪音:框架启动时 dump 的成员变量偏移(Name::field = 0xHEX),含 Error/Missing 字样但是地址不是错误
 _NOISE_RE = re.compile(r"::\w+\s*=\s*0x[0-9A-Fa-f]+")
 
+# Global Unity/BepInEx exception loggers describe who printed an exception,
+# not who caused it.  They must never be used as Mod ownership evidence.
+_LOGGER_FRAME_RE = re.compile(
+    r"(?:PartShrinkerLogFilter:LogException|"
+    r"UnityEngine\.DebugLogHandler:LogException|"
+    r"UnityEngine\.Debug:CallOverridenDebugHandler)",
+    re.I,
+)
+
 # 框架强信号(带 mod 名的明确失败,可直接结构化归因,比通用文本匹配可靠得多):
 # UE4SS "ModClass for 'DekBasicMinimap_P' is not valid" = 该 mod 蓝图类加载失败,
 # 最常见原因是 mod 太久没更新、与当前游戏版本不兼容。
@@ -175,6 +184,8 @@ def game_diagnose(game_root: str, game_slug: str = "", installed_mods=None,
         for ln in lines:
             s = ln.strip()
             if not s or _NOISE_RE.search(s):     # ① 先过噪音(成员偏移 dump)
+                continue
+            if _LOGGER_FRAME_RE.search(s):
                 continue
             m = _UE4SS_MODFAIL_RE.search(s)      # ② 框架强信号:带 mod 名的明确失败
             if m:

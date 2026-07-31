@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "channel": "free",
-  "latest_version": "1.3.0",
-  "minimum_safe_version": "1.3.0",
+  "latest_version": "1.3.5",
+  "minimum_safe_version": "1.3.5",
   "severity": "normal",
-  "title": "ModAgent v1.3.0",
+  "title": "ModAgent v1.3.5",
   "message": "当前已是最新稳定版。",
-  "download_page": "https://github.com/millips/ModAgent/releases/tag/v1.3.0"
+  "download_page": "https://github.com/millips/ModAgent/releases/tag/v1.3.5"
 }

@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -34,8 +35,37 @@ _agent_last_used: dict[str, float] = {}            # ← 补回:被 _get_agent �
 _AGENT_TTL = 3600                                  # ← 补回:agent 空闲回收时间(秒)
 _chat_tasks: dict[str, dict] = {}
 _chat_tasks_lock = threading.RLock()
+
+
+def _new_session_id() -> str:
+    """Generate a collision-resistant boundary for conversation state."""
+    return f"session_{uuid.uuid4().hex}"
+
+
+def _cancel_chat_task_locked(task: dict, reason: str) -> bool:
+    """Invalidate one chat turn while holding ``_chat_tasks_lock``."""
+    if not task or task.get("done"):
+        return False
+    event = task.get("cancel_event")
+    if event:
+        event.set()
+    task["cancelled"] = True
+    task["cancel_reason"] = str(reason or "用户已停止")
+    task["done"] = True
+    task["updated"] = time.time()
+    pending = list(task.get("pending_history") or [])
+    if pending:
+        pending.append({
+            "role": "assistant",
+            "content": (
+                "本轮已停止。旧任务不会自动恢复；请以用户之后的新指令为准。"
+            ),
+        })
+        db.update_session_messages(str(task.get("session_id") or ""), pending)
+    return True
 _inventory_scan_jobs: dict[str, dict] = {}
 _inventory_scan_jobs_lock = threading.RLock()
+_catalog_enrichment_lock = threading.Lock()
 
 PROMPT_REFERENCED_TOOLS = {
     # 与 I 盘真身 tools.py 的 build_tools_definitions 保持一致(32 个)
@@ -533,7 +563,39 @@ def update_config(body: ConfigUpdate):
 
 @app.get("/mods")
 def list_mods(game_slug: str = ""):
-    mods = db.get_installed_mods(game_slug if game_slug else cfg.game_slug)
+    scope = game_slug if game_slug else game_storage_id(cfg)
+    # The management page is also a repair boundary.  Do not require another
+    # download/install operation before historical aliases disappear from the
+    # UI; merging only removes duplicate database rows that reference the exact
+    # same physical file set.
+    db.merge_duplicate_inventory_rows(scope)
+    mods = db.get_installed_mods(scope)
+    notes = db.get_mod_catalog_notes(scope)
+    bindings = {
+        str(item.get("mod_id")): item
+        for item in db.get_mod_source_bindings(scope)
+    }
+
+    def package_shape(mod):
+        files = _mod_files(mod)
+        unreal_parts = {}
+        for path in files:
+            normalized = str(path or "").replace("\\", "/")
+            base, ext = os.path.splitext(normalized)
+            if ext.casefold() in {".pak", ".utoc", ".ucas"}:
+                unreal_parts.setdefault(base.casefold(), set()).add(
+                    ext.casefold()
+                )
+        complete_unreal_variants = sum(
+            1 for extensions in unreal_parts.values()
+            if {".pak", ".utoc", ".ucas"} <= extensions
+        )
+        return {
+            "file_count": len(files),
+            "variant_count": max(1, complete_unreal_variants)
+            if files else 0,
+            "management_unit": "package",
+        }
 
     return [{
         "id": m.id, "name": m.name, "version": m.version,
@@ -541,7 +603,68 @@ def list_mods(game_slug: str = ""):
         "installed_at": m.installed_at, "installed_by": m.installed_by,
         "game_slug": m.game_slug,
         "disabled": installer.is_mod_disabled(_mod_files(m)),
+        "localized_name": (notes.get(str(m.id)) or {}).get("localized_name", ""),
+        "summary": (notes.get(str(m.id)) or {}).get("summary", ""),
+        "summary_evidence": (notes.get(str(m.id)) or {}).get("evidence_kind", ""),
+        "summary_confidence": (notes.get(str(m.id)) or {}).get("confidence", ""),
+        "source": (bindings.get(str(m.id)) or {}).get("source", ""),
+        "source_key": (bindings.get(str(m.id)) or {}).get("source_key", ""),
+        "source_url": (bindings.get(str(m.id)) or {}).get("source_url", ""),
+        "source_match_method": (bindings.get(str(m.id)) or {}).get("match_method", ""),
+        "source_confidence": (bindings.get(str(m.id)) or {}).get("confidence", 0),
+        **package_shape(m),
     } for m in mods]
+
+
+@app.post("/mods/enrich")
+def enrich_mod_catalog(game_slug: str = "", force: bool = False):
+    """Generate cached Chinese names and decision-grade functional summaries."""
+    from modagent.catalog_enrichment import (
+        build_enrichment_inputs, generate_catalog_notes,
+    )
+
+    scope = game_slug or game_storage_id(cfg)
+    if not scope:
+        raise HTTPException(status_code=400, detail="请先选择游戏")
+    if not getattr(cfg, "llm_api_key", ""):
+        return {
+            "status": "llm_required",
+            "updated": 0,
+            "notes": db.get_mod_catalog_notes(scope),
+        }
+    with _catalog_enrichment_lock:
+        mods = db.get_installed_mods(scope)
+        cached = db.get_mod_catalog_notes(scope)
+        bindings = {
+            str(item.get("mod_id")): item
+            for item in db.get_mod_source_bindings(scope)
+        }
+        manual = (getattr(cfg, "manual_mod_dirs", {}) or {}).get(scope, [])
+        allowed_roots = [cfg.game_root, *manual]
+        pending = build_enrichment_inputs(
+            mods, bindings, cached, allowed_roots, force=force,
+        )
+        if not pending:
+            return {"status": "cached", "updated": 0, "notes": cached}
+        try:
+            agent = _get_agent("__catalog_enrichment__")
+            generated = generate_catalog_notes(
+                agent.client, cfg.llm_model, pending,
+            )
+        except Exception as exc:
+            return {
+                "status": "generation_failed",
+                "updated": 0,
+                "error": str(exc)[:240],
+                "notes": cached,
+            }
+        updated = db.upsert_mod_catalog_notes(scope, generated)
+        return {
+            "status": "ok",
+            "updated": updated,
+            "attempted": len(pending),
+            "notes": db.get_mod_catalog_notes(scope),
+        }
 
 
 def _mod_files(mod) -> list:
@@ -580,10 +703,7 @@ def list_snapshots(game_slug: str = ""):
     def _valid(s):
         # 账本 ≠ 事实:v0.8 的病是目录删了照列不误、回滚按钮照点不误。
         # 列表直接带失效标记,前端标灰 + 禁用回滚。
-        d = os.path.join(snapshot.SNAPSHOTS_DIR, s.game_slug or "", s.id)
-        if not os.path.isdir(d):
-            d = os.path.join(snapshot.SNAPSHOTS_DIR, s.id)
-        return os.path.exists(os.path.join(d, "manifest.json"))
+        return bool(snapshot.find_snapshot_dir(s.id, s.game_slug or ""))
 
     return [{"id": s.id, "timestamp": s.timestamp, "trigger_mod_name": s.trigger_mod_name,
              "files_count": _count(s), "game_slug": s.game_slug,
@@ -601,9 +721,7 @@ def get_snapshot_detail(sid: str):
     snap = db.get_snapshot(sid)
     if not snap:
         raise HTTPException(404, "Snapshot not found")
-    snap_dir = os.path.join(snapshot.SNAPSHOTS_DIR, snap.game_slug or "", sid)
-    if not os.path.isdir(snap_dir):
-        snap_dir = os.path.join(snapshot.SNAPSHOTS_DIR, sid)
+    snap_dir = snapshot.find_snapshot_dir(sid, snap.game_slug or "")
     manifest_path = os.path.join(snap_dir, "manifest.json")
     files = []
     if os.path.exists(manifest_path):
@@ -648,10 +766,7 @@ def snapshots_reconcile(game_slug: str = "", clean: bool = False):
     snaps = db.list_snapshots(slug) if slug else db.list_snapshots()
     invalid = []
     for s in snaps:
-        d = os.path.join(snapshot.SNAPSHOTS_DIR, s.game_slug or "", s.id)
-        if not os.path.isdir(d):
-            d = os.path.join(snapshot.SNAPSHOTS_DIR, s.id)
-        if not os.path.exists(os.path.join(d, "manifest.json")):
+        if not snapshot.find_snapshot_dir(s.id, s.game_slug or ""):
             invalid.append(s.id)
             if clean:
                 db.delete_snapshot(s.id)
@@ -660,8 +775,9 @@ def snapshots_reconcile(game_slug: str = "", clean: bool = False):
 
 @app.post("/mods/reconcile")
 def mods_reconcile(game_slug: str = ""):
-    """已装 mod 对账:files_installed 里的文件是否还在磁盘上。"""
+    """Reconcile physical files and duplicate inventory aliases."""
     slug = game_slug or cfg.game_slug
+    merged_aliases = db.merge_duplicate_inventory_rows(slug)
     mods = db.get_installed_mods(slug) if slug else db.get_installed_mods()
     issues = []
     for m in mods:
@@ -677,7 +793,12 @@ def mods_reconcile(game_slug: str = ""):
                            "total": len(files), "missing": len(missing),
                            "missing_sample": missing[:5],
                            "problem": "记录里没有任何文件(空账)" if not files else "部分文件已不在磁盘"})
-    return {"checked": len(mods), "issues": issues}
+    return {
+        "checked": len(mods),
+        "issues": issues,
+        "duplicates_merged": len(merged_aliases),
+        "merged_aliases": merged_aliases,
+    }
 
 
 @app.get("/log")
@@ -690,7 +811,7 @@ def chat(req: ChatRequest):
     try:
         session_id = req.session_id
         if not session_id:
-            session_id = f"session_{int(time.time())}"
+            session_id = _new_session_id()
             db.create_session(session_id, req.message[:20], game_storage_id(cfg))
 
         existing = db.get_session(session_id)
@@ -721,71 +842,101 @@ def chat(req: ChatRequest):
 def chat_stream(req: ChatRequest):
     session_id = req.session_id
     if not session_id:
-        session_id = f"session_{int(time.time())}"
+        session_id = _new_session_id()
         db.create_session(session_id, req.message[:20], game_storage_id(cfg))
 
     with _chat_tasks_lock:
         active = _chat_tasks.get(session_id)
         if active and not active.get("done"):
-            task = active
+            _cancel_chat_task_locked(active, "已被同一会话中的新指令替代")
+
+        existing = db.get_session(session_id)
+        # A turn gets its own Agent instance.  Sharing one mutable Agent across
+        # overlapping old/new turns lets the stale worker overwrite fields and
+        # history belonging to the new instruction.
+        ag = Agent(cfg)
+        ag.session_id = session_id
+        if existing:
+            history = json.loads(existing.get("messages", "[]")) if isinstance(existing.get("messages"), str) else (existing.get("messages") or [])
+            ag.history = history
         else:
+            db.create_session(session_id, req.message[:20], game_storage_id(cfg))
+            ag.history = []
             existing = db.get_session(session_id)
-            ag = _get_agent(session_id)
-            if existing:
-                history = json.loads(existing.get("messages", "[]")) if isinstance(existing.get("messages"), str) else (existing.get("messages") or [])
-                ag.history = history
-            else:
-                db.create_session(session_id, req.message[:20], game_storage_id(cfg))
-                ag.history = []
-                existing = db.get_session(session_id)
 
-            # Persist the user's request before work starts.  If the renderer
-            # reloads mid-turn, the conversation still has the request that
-            # explains the running operation.
-            pending = list(ag.history)
-            pending.append({"role": "user", "content": req.message})
-            db.update_session_messages(session_id, pending)
-            task = {
-                "session_id": session_id,
-                "game_slug": game_storage_id(cfg),
-                "events": [],
-                "done": False,
-                "error": "",
-                "started": time.time(),
-                "updated": time.time(),
-            }
-            _chat_tasks[session_id] = task
+        # Persist the user's request before work starts.  If the renderer
+        # reloads mid-turn, the conversation still has the request that
+        # explains the running operation.
+        pending = list(ag.history)
+        pending.append({"role": "user", "content": req.message})
+        db.update_session_messages(session_id, pending)
+        cancel_event = threading.Event()
+        task = {
+            "task_id": uuid.uuid4().hex,
+            "session_id": session_id,
+            "game_slug": game_storage_id(cfg),
+            "events": [],
+            "done": False,
+            "cancelled": False,
+            "cancel_reason": "",
+            "cancel_event": cancel_event,
+            "pending_history": pending,
+            "error": "",
+            "started": time.time(),
+            "updated": time.time(),
+        }
+        _chat_tasks[session_id] = task
 
-            def run_task():
-                try:
-                    for chunk in ag.chat_stream(
-                        req.message,
-                        regenerate=req.regenerate,
-                        completed_effects=req.completed_effects,
-                        recommendation_selection=req.recommendation_selection,
-                        selection_action=req.selection_action,
-                    ):
-                        with _chat_tasks_lock:
-                            task["events"].append(chunk)
-                            task["updated"] = time.time()
-                except Exception as exc:
-                    error_event = json.dumps({"error": str(exc)}, ensure_ascii=False)
+        def run_task():
+            try:
+                for chunk in ag.chat_stream(
+                    req.message,
+                    regenerate=req.regenerate,
+                    completed_effects=req.completed_effects,
+                    recommendation_selection=req.recommendation_selection,
+                    selection_action=req.selection_action,
+                    cancel_check=cancel_event.is_set,
+                ):
                     with _chat_tasks_lock:
+                        if (
+                            task.get("cancelled")
+                            or _chat_tasks.get(session_id) is not task
+                        ):
+                            break
+                        task["events"].append(chunk)
+                        task["updated"] = time.time()
+            except Exception as exc:
+                error_event = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                with _chat_tasks_lock:
+                    if (
+                        not task.get("cancelled")
+                        and _chat_tasks.get(session_id) is task
+                    ):
                         task["events"].append(error_event)
                         task["error"] = str(exc)
-                finally:
+            finally:
+                with _chat_tasks_lock:
+                    current = (
+                        _chat_tasks.get(session_id) is task
+                        and not task.get("cancelled")
+                    )
+                # A stale/cancelled turn is never allowed to overwrite the DB
+                # history or canonical in-memory Agent after it returns late.
+                if current:
                     if existing and not (existing.get("title") or "").strip():
                         db.update_session_title(session_id, req.message[:20])
                     db.update_session_messages(session_id, ag.history)
-                    with _chat_tasks_lock:
-                        task["done"] = True
-                        task["updated"] = time.time()
+                    agents[session_id] = ag
+                    _agent_last_used[session_id] = time.time()
+                with _chat_tasks_lock:
+                    task["done"] = True
+                    task["updated"] = time.time()
 
-            threading.Thread(
-                target=run_task,
-                name=f"modagent-chat-{session_id[-12:]}",
-                daemon=True,
-            ).start()
+        threading.Thread(
+            target=run_task,
+            name=f"modagent-chat-{session_id[-12:]}",
+            daemon=True,
+        ).start()
 
     def generate(after: int = 0):
         cursor = max(0, int(after))
@@ -848,6 +999,8 @@ def get_chat_task(session_id: str, after: int = 0):
             "started": task.get("started", 0),
             "updated": task.get("updated", 0),
             "error": task.get("error", ""),
+            "cancelled": bool(task.get("cancelled")),
+            "cancel_reason": task.get("cancel_reason", ""),
         }
 
 
@@ -867,7 +1020,7 @@ def list_sessions(game_slug: str = ""):
 
 @app.post("/sessions")
 def create_session(req: SessionCreate):
-    sid = f"session_{int(time.time())}"
+    sid = _new_session_id()
     db.create_session(sid, req.title, req.game_slug or game_storage_id(cfg))
     return {"id": sid, "title": req.title}
 
@@ -1026,6 +1179,40 @@ def downloads_status():
     """Expose the in-process download queue to the authenticated renderer."""
     from . import progress
     return progress.snapshot()
+
+
+@app.post("/tasks/cancel")
+def cancel_active_task(body: dict = None):
+    """Request cooperative cancellation of the current long-running task."""
+    from . import progress
+    body = body or {}
+    session_id = str(body.get("session_id") or "").strip()
+    chat_cancelled = False
+    if session_id:
+        with _chat_tasks_lock:
+            task = _chat_tasks.get(session_id)
+            chat_cancelled = _cancel_chat_task_locked(
+                task, "用户点击了停止"
+            )
+    task_kind = str(body.get("task_kind") or "").strip()
+    if chat_cancelled:
+        progress.abort_active("用户停止了当前对话任务")
+        cancelled = True
+    else:
+        cancelled = progress.request_cancel(task_kind)
+    state = progress.snapshot()
+    return {
+        "ok": cancelled,
+        "chat_cancelled": chat_cancelled,
+        "session_id": session_id,
+        "task_kind": state.get("task_kind") or task_kind,
+        "message": (
+            "当前轮次已失效，旧任务结果不会继续执行或写回"
+            if chat_cancelled else
+            "已请求取消，正在结束当前网络请求"
+            if cancelled else "没有可取消的匹配任务"
+        ),
+    }
 
 
 @app.get("/static/bg/{filename}")

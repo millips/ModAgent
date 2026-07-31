@@ -35,7 +35,7 @@ async def verify():
     async def no_sleep(_seconds):
         return None
 
-    def successful_fallback(_port, _url, _stage, capture_dir):
+    def successful_fallback(_port, _url, _stage, capture_dir, _file_id=0):
         path = os.path.join(capture_dir, "mod.zip")
         os.makedirs(capture_dir, exist_ok=True)
         with open(path, "wb") as handle:

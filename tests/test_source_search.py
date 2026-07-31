@@ -21,11 +21,11 @@ gh._http_json = lambda url, headers=None: {"items": [
      "description": None, "stargazers_count": 1, "pushed_at": "2023-01-01T00:00:00Z", "archived": True},
 ]}
 r = gh.search("minimap", "Palworld", limit=5)
-check("A1 github: two results shaped", len(r) == 2)
+check("A1 github: irrelevant/archived result filtered", len(r) == 1)
 check("A2 github: summary truncated to 140", len(r[0]["summary"]) <= 140)
 check("A3 github: stars/updated/archived", r[0]["stars"] == 42
-      and r[0]["updated_at"] == "2026-05-21" and r[1]["archived"] is True)
-check("A4 github: None description safe", r[1]["summary"] == "")
+      and r[0]["updated_at"] == "2026-05-21" and r[0]["archived"] is False)
+check("A4 github: relevant result retained", r[0]["name"] == "PalMod")
 
 # 限流 → 友好报错
 def _rate_limited(url, headers=None):

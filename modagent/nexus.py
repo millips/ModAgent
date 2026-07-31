@@ -471,33 +471,55 @@ def _search_api(query: str, game_slug: str, api_key: str, game_id: int) -> list[
 
 def _match_and_detail(query: str, mods: list, game_slug: str, api_key: str) -> list[dict]:
     """从缓存的 mod_id 列表中按名称匹配，补全详情。"""
-    if not query.strip():
-        return mods[:10]
+    import concurrent.futures as cf
 
-    q = query.lower().replace(" ", "").replace("_", "").replace("-", "")
-    candidates = mods[:20]
+    broad_words = {
+        "latest", "popular", "trending", "new", "hot", "best", "recommended",
+        "mods", "mod", "最近", "最新", "热门", "推荐",
+    }
+    cleaned_query = query.casefold()
+    for word in broad_words:
+        cleaned_query = cleaned_query.replace(word, " ")
+    wanted = {
+        token for token in re.findall(r"[a-z0-9\u3400-\u9fff]+", cleaned_query)
+        if len(token) >= 2
+    }
+    candidates = mods[:16]
 
-    matched = []
-    for m in candidates:
+    def fetch(m):
         try:
             detail = get_mod(m["mod_id"], game_slug, api_key)
-            name = detail.get("name", "")
-            name_clean = name.lower().replace(" ", "").replace("_", "").replace("-", "")
-            if q in name_clean:
-                matched.append({
-                    "mod_id": m["mod_id"],
-                    "name": name,
-                    "summary": detail.get("summary", ""),
-                    "endorsements": detail.get("endorsement_count", 0),
-                    "version": detail.get("version", ""),
-                    "updated": detail.get("updated_time", ""),
-                })
-                if len(matched) >= 10:
-                    break
+            haystack = " ".join([
+                str(detail.get("name") or ""),
+                str(detail.get("summary") or ""),
+            ]).casefold()
+            compact = re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", haystack)
+            score = sum(1 for token in wanted if token in haystack or token in compact)
+            return score, {
+                "mod_id": m["mod_id"],
+                "name": detail.get("name", ""),
+                "summary": detail.get("summary", ""),
+                "endorsements": detail.get("endorsement_count", 0),
+                "version": detail.get("version", ""),
+                "updated": detail.get("updated_time", ""),
+            }
         except Exception:
-            continue
+            return -1, None
 
-    return matched
+    pool = cf.ThreadPoolExecutor(max_workers=min(8, len(candidates) or 1))
+    futures = [pool.submit(fetch, candidate) for candidate in candidates]
+    rows = []
+    for future in cf.as_completed(futures):
+        score, item = future.result()
+        if item and (not wanted or score > 0):
+            rows.append((score, item))
+    pool.shutdown(wait=True)
+    rows.sort(key=lambda pair: (
+        pair[0],
+        pair[1].get("endorsements") or 0,
+        pair[1].get("updated") or "",
+    ), reverse=True)
+    return [item for _, item in rows[:10]]
 
 
 def _search_cdp(query: str, game_slug: str, api_key: str, cdp_port: int, game_id: int) -> list[dict]:
@@ -576,6 +598,12 @@ def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888)
     except Exception:
         main = None
     deps = [d.get("mod_id") for d in mod.get("dependencies", []) if d.get("mod_id")]
+    dependency_labels = _extract_dependency_labels(mod.get("description", ""))
+    required_loader = _extract_required_loader(
+        mod.get("description", ""),
+        dependency_labels,
+        mod.get("name", ""),
+    )
 
     return {
         "mod_id": mod.get("mod_id", mod_id),
@@ -593,6 +621,8 @@ def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888)
         "updated_at": mod.get("updated_time", ""),
         "staleness": _staleness(mod.get("updated_time", "")),
         "dependencies": deps,
+        "dependency_labels": dependency_labels,
+        "required_loader": required_loader,
         "install_notes": _extract_install_notes(mod.get("description", "")),
     }
 
@@ -628,6 +658,98 @@ def _extract_install_notes(desc: str) -> str:
         if in_install and line.strip():
             notes.append(line.strip())
     return "\n".join(notes[:10]) if notes else ""
+
+
+def _source_plain_text(value: str) -> str:
+    """Convert the small HTML/BBCode subset used by Nexus descriptions."""
+    text = str(value or "")
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</?(?:p|div|li|ul|ol|h[1-6])\b[^>]*>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\[\*\]", "\n* ", text, flags=re.I)
+    text = re.sub(r"\[url=[^\]]+\](.*?)\[/url\]", r"\1", text, flags=re.I | re.S)
+    text = re.sub(r"\[/?(?:b|i|u|size|color|font|list)(?:=[^\]]+)?\]", "", text, flags=re.I)
+    text = re.sub(r"\[[^\]]+\]", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
+def _extract_dependency_labels(desc: str) -> list[str]:
+    """Extract explicitly required dependency names from source prose.
+
+    Nexus' structured dependency array is frequently empty even when the
+    description contains a clear "required dependencies" section.  Only that
+    explicit section is accepted here; incidental framework mentions do not
+    become hard requirements.
+    """
+    plain = _source_plain_text(desc)
+    if not plain:
+        return []
+    marker = re.search(
+        r"(?:required\s+dependencies|requirements?|必需(?:依赖|前置)|前置依赖)"
+        r"(?:\s+(?:installed|安装))?\s*:?",
+        plain,
+        flags=re.I,
+    )
+    if not marker:
+        return []
+    section = plain[marker.end():marker.end() + 900]
+    stop = re.search(
+        r"\n\s*\*?\s*(?:launch|usage|configuration|optional|credits?|"
+        r"how\s+to\s+use|启动|使用|配置)\b",
+        section,
+        flags=re.I,
+    )
+    if stop:
+        section = section[:stop.start()]
+
+    labels = []
+    for raw in re.findall(r"(?:^|\n)\s*\*\s*([^\n]+)", section):
+        label = raw.strip(" :-–—\t")
+        label = re.split(r"\s{2,}|[（(](?:optional|可选)", label, maxsplit=1, flags=re.I)[0]
+        if (
+            label
+            and len(label) <= 80
+            and label.casefold() not in {"download", "extract", "install"}
+            and label not in labels
+        ):
+            labels.append(label)
+    return labels[:12]
+
+
+def _extract_required_loader(
+    desc: str,
+    dependency_labels: list[str] | None = None,
+    name: str = "",
+) -> str:
+    labels = {
+        re.sub(r"[^a-z0-9]+", "", str(label).casefold())
+        for label in (dependency_labels or [])
+    }
+    if "melonloader" in labels:
+        return "MelonLoader"
+    if "bepinex" in labels or "bepinexpack" in labels:
+        return "BepInEx"
+
+    plain = _source_plain_text(desc)
+    title = _source_plain_text(name)
+    if re.search(r"(?:^|[\s(\[])BepInEx(?:Pack)?(?:[\s)\]]|$)", title, flags=re.I):
+        return "BepInEx"
+    if re.search(r"(?:^|[\s(\[])MelonLoader(?:[\s)\]]|$)", title, flags=re.I):
+        return "MelonLoader"
+    strong_patterns = (
+        (r"\bport(?:ed)?\b.{0,100}\bto\s+MelonLoader\b", "MelonLoader"),
+        (r"\b(?:requires?|built\s+for|made\s+for)\s+MelonLoader\b", "MelonLoader"),
+        (r"\bMelonLoader[\\/](?:Mods|UserData)\b", "MelonLoader"),
+        (r"\bport(?:ed)?\b.{0,100}\bto\s+BepInEx\b", "BepInEx"),
+        (r"\b(?:requires?|built\s+for|made\s+for)\s+BepInEx(?:Pack)?\b", "BepInEx"),
+        (r"\bBepInEx[\\/](?:plugins|patchers|config)\b", "BepInEx"),
+    )
+    for pattern, loader in strong_patterns:
+        if re.search(pattern, plain, flags=re.I | re.S):
+            return loader
+    return ""
 
 
 def _parse_readme(desc: str) -> dict:

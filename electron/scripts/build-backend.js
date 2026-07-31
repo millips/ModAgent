@@ -7,7 +7,15 @@ const buildRoot = path.join(root, 'build');
 const venv = path.join(buildRoot, 'backend-venv');
 const venvPython = path.join(venv, 'Scripts', 'python.exe');
 const dist = path.join(buildRoot, 'backend');
-const work = path.join(buildRoot, 'pyinstaller');
+// PyInstaller's analysis cache is occasionally held open for a while by a
+// previously launched packaged backend or an antivirus scanner on Windows.
+// A per-build work directory makes the release reproducible without deleting
+// or reusing that locked cache.  The final dist path remains stable.
+const work = path.join(
+  buildRoot,
+  'pyinstaller-runs',
+  `${Date.now()}-${process.pid}`,
+);
 fs.mkdirSync(buildRoot, { recursive: true });
 fs.mkdirSync(dist, { recursive: true });
 fs.mkdirSync(work, { recursive: true });

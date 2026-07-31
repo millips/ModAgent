@@ -9,8 +9,8 @@ dist/
 snapshots/
 *.egg-info/
 
-# Local workspace state and historical copies must never enter releases.
-.claude/settings.local.json
+# Local Claude Code project configuration must never be published.
+.claude/
 backups/
 _stage_backup/
 electron/release/

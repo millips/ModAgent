@@ -9,6 +9,27 @@ import hashlib
 import uuid
 from typing import Optional
 
+
+class UnsupportedInstallLayout(RuntimeError):
+    """The archive is valid, but deterministic game routing cannot place it.
+
+    Carry the evidence needed by the agent to build an explicit, reviewable
+    ``mod_install_custom`` mapping.  This is deliberately different from an
+    extraction or write failure: callers must not blindly retry the same
+    generic installer.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        archive_members: Optional[list[str]] = None,
+        install_notes: str = "",
+    ):
+        self.archive_members = list(archive_members or [])
+        self.install_notes = str(install_notes or "")
+        super().__init__(message)
+
 from .config import CONFIG_DIR
 
 # C-0:集中备份区。原地 .modagent_bak 兄弟文件是在逃 bug ——
@@ -309,11 +330,24 @@ GAME_LAYOUTS = {
         "patterns": _ue_layout("End")["patterns"],
         "load_order_file": None,
     },
+    # RE Engine / Fluffy Mod Manager packages preserve the ``natives`` tree
+    # under the game root.  Top-level modinfo.ini and preview images are
+    # manager metadata, not runtime files.
+    "streetfighter6": {
+        "patterns": {
+            r"^natives[/\\]": "",
+            r"^reframework[/\\]": "",
+        },
+        "load_order_file": None,
+    },
 }
 
 _GAME_SLUG_ALIASES = {
     "local_final_fantasy_vii_rebirth": "finalfantasy7rebirth",
     "final_fantasy_vii_rebirth": "finalfantasy7rebirth",
+    "local_street_fighter_6": "streetfighter6",
+    "street_fighter_6": "streetfighter6",
+    "streetfighter_6": "streetfighter6",
 }
 
 
@@ -399,11 +433,44 @@ def _extract_with_7zip(seven_zip: str, archive_path: str, extract_to: str) -> li
 
 
 def get_game_layout(game_slug: str) -> dict:
-    canonical = _GAME_SLUG_ALIASES.get(str(game_slug or "").lower(), game_slug)
+    normalized = str(game_slug or "").strip().lower()
+    canonical = _GAME_SLUG_ALIASES.get(normalized, normalized)
     return GAME_LAYOUTS.get(canonical, {
         "patterns": {},
         "load_order_file": None,
     })
+
+
+_INSTALL_NOTE_NAMES = {
+    "readme.txt", "readme.md", "readme", "readme.html",
+    "install.txt", "install.md", "installation.txt", "installation.md",
+}
+
+
+def _read_install_notes_from_tree(root_dir: str, limit: int = 20000) -> str:
+    """Read package-authored installation notes from an extracted archive."""
+    candidates = []
+    for current, _, files in os.walk(root_dir):
+        for filename in files:
+            if filename.casefold() in _INSTALL_NOTE_NAMES:
+                path = os.path.join(current, filename)
+                rel = os.path.relpath(path, root_dir).replace("\\", "/")
+                candidates.append((rel.count("/"), rel.casefold(), rel, path))
+    chunks = []
+    remaining = max(1000, int(limit))
+    for _, _, rel, path in sorted(candidates):
+        if remaining <= 0:
+            break
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read(remaining)
+        except OSError:
+            continue
+        if content.strip():
+            section = f"## {rel}\n{content.strip()}"
+            chunks.append(section)
+            remaining -= len(section)
+    return "\n\n".join(chunks)
 
 
 def _ff7r_dest(member: str, plugin_roots: set[str], game_root: str) -> Optional[str]:
@@ -793,9 +860,14 @@ def _install_bepinex(archive_path: str, game_root: str, game_slug: str = "") -> 
             _seg0(m) in _TS_DIRS or m.lower().endswith(".dll") for m in members
         )
         if not recognizable:
-            raise RuntimeError(
+            raise UnsupportedInstallLayout(
                 f"暂不支持该压缩包的自动安装:未发现 BepInEx/plugins 结构或 .dll"
-                f"(game_slug={game_slug or '?'})。已中止以免误报安装成功。"
+                f"(game_slug={game_slug or '?'})。已停止通用规则，等待根据包内说明"
+                "或来源教程生成显式安装映射。",
+                archive_members=[
+                    member.replace("\\", "/") for member in members
+                ],
+                install_notes=_read_install_notes_from_tree(walk_root),
             )
 
         game_has_loader = (
@@ -884,6 +956,96 @@ def plan_custom_targets(game_root: str, mapping: dict) -> dict:
         rel, reason = _validate_custom_target(game_root, real_root, dst_rel)
         (valid.append(rel) if rel else rejected.append({"src": src_rel, "reason": reason}))
     return {"valid": valid, "rejected": rejected}
+
+
+def preview_custom_install(
+    archive_path: str,
+    game_root: str,
+    game_slug: str,
+    mapping: dict,
+) -> dict:
+    """Inspect explicit archive mappings without writing to the game."""
+    plan = plan_custom_targets(game_root, mapping)
+    real_root = os.path.realpath(game_root)
+    installed_files = {
+        os.path.normcase(os.path.realpath(path)): owner
+        for path, owner in _get_installed_files_map(game_slug).items()
+    }
+    archive_files = set()
+    with tempfile.TemporaryDirectory() as tmp:
+        extract_archive(archive_path, tmp)
+        walk_root = _strip_wrapper_dirs(tmp)
+        for current, _, files in os.walk(walk_root):
+            for filename in files:
+                archive_files.add(
+                    os.path.relpath(
+                        os.path.join(current, filename), walk_root,
+                    ).replace("\\", "/")
+                )
+
+    rejected_by_source = {
+        str(item.get("src") or ""): str(item.get("reason") or "")
+        for item in plan.get("rejected", [])
+    }
+    checked = []
+    missing_sources = []
+    target_conflicts = []
+    for src_rel, dst_rel in (mapping or {}).items():
+        source = str(src_rel).replace("\\", "/").lstrip("/")
+        if source not in archive_files:
+            missing_sources.append(source)
+            continue
+        rel, reason = _validate_custom_target(game_root, real_root, dst_rel)
+        if not rel:
+            rejected_by_source[source] = reason
+            continue
+        destination = os.path.normpath(
+            os.path.join(game_root, rel.replace("/", os.sep))
+        )
+        destination_key = os.path.normcase(os.path.realpath(destination))
+        owner = installed_files.get(destination_key, "")
+        exists = os.path.exists(destination)
+        disabled_exists = os.path.exists(destination + ".disabled")
+        conflict = None
+        if owner:
+            conflict = {
+                "source": source,
+                "target": rel,
+                "path": destination,
+                "kind": "installed_mod_file",
+                "owned_by": owner,
+            }
+        elif exists or disabled_exists:
+            conflict = {
+                "source": source,
+                "target": rel,
+                "path": destination,
+                "kind": "unmanaged_existing_file",
+                "owned_by": "",
+                "disabled_copy": bool(disabled_exists and not exists),
+            }
+        if conflict:
+            target_conflicts.append(conflict)
+        checked.append({
+            "source": source,
+            "target": rel,
+            "exists": bool(exists or disabled_exists),
+        })
+
+    return {
+        "archive_file_count": len(archive_files),
+        "mapping_count": len(mapping or {}),
+        "checked_mappings": checked,
+        "missing_archive_sources": missing_sources,
+        "rejected_targets": [
+            {"src": source, "reason": reason}
+            for source, reason in rejected_by_source.items()
+        ],
+        "target_conflicts": target_conflicts,
+        "safe_to_install": not (
+            missing_sources or rejected_by_source or target_conflicts
+        ),
+    }
 
 
 def install_mod_custom(archive_path: str, game_root: str, game_slug: str,
@@ -1010,13 +1172,7 @@ def _update_load_order(game_root: str, game_slug: str, layout: dict, load_order:
 def read_readme_zip(archive_path: str) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         extract_archive(archive_path, tmp)
-        for root, _, files in os.walk(tmp):
-            for f in files:
-                bn = os.path.basename(f).lower()
-                if bn in ("readme.txt", "readme.md", "readme", "install.txt", "readme.html"):
-                    with open(os.path.join(root, f), "r", encoding="utf-8", errors="replace") as rf:
-                        return rf.read()
-    return ""
+        return _read_install_notes_from_tree(tmp)
 
 
 def uninstall_mod(mod_id: str, game_root: str, files_installed: list[str],
@@ -1134,7 +1290,7 @@ def conflict_check(archive_path: str, game_root: str, game_slug: str) -> dict:
                        f"但已列出包内 {len(archive_contents)} 个文件供参考(见 archive_contents)。",
         }
 
-    installed_mods = _get_installed_files_map()
+    installed_mods = _get_installed_files_map(game_slug)
     conflicts = [{"file": f, "owned_by": installed_mods[f]}
                  for f in incoming_files if f in installed_mods]
 
@@ -1149,11 +1305,11 @@ def conflict_check(archive_path: str, game_root: str, game_slug: str) -> dict:
     }
 
 
-def _get_installed_files_map() -> dict[str, str]:
+def _get_installed_files_map(game_slug: str = "") -> dict[str, str]:
     result = {}
     try:
         from . import db
-        mods = db.get_installed_mods()
+        mods = db.get_installed_mods(game_slug)
         for m in mods:
             files = json.loads(m.files_installed) if isinstance(m.files_installed, str) else (m.files_installed or [])
             for f in files:

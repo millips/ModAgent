@@ -45,6 +45,25 @@ attr_names = {a["name"] for a in f["attributed_mods"]}
 check("B4 attributed to MoreHead", "MoreHead" in attr_names)
 check("B5 suggestion mentions MoreHead", any("MoreHead" in s for s in f["suggestions"]))
 
+# A global exception logger frame identifies who printed an exception, not who
+# caused it.  It must not attribute unrelated game/API failures to that Mod.
+G_LOGGER = os.path.join(TMP, "GlobalLogger")
+w(os.path.join(G_LOGGER, "BepInEx", "LogOutput.log"), "\n".join([
+    "[Error  : Unity Log] MissingMethodException: Method not found: void .ValuableObject.Discover(State)",
+    "PhysGrabber.DiscoverLogic (UnityEngine.RaycastHit hit)",
+    "UnityEngine.DebugLogHandler:LogException(Exception, Object)",
+    "MoreHeadBridge.PartShrinkerLogFilter:LogException(Exception, Object)",
+    "UnityEngine.Debug:CallOverridenDebugHandler(Exception, Object)",
+]))
+logger_mods = [
+    mod("morehead", "MoreHead", ["/g/BepInEx/plugins/MoreHead/MoreHead.dll"]),
+    mod("bridge", "MoreHeadBridge", ["/g/BepInEx/plugins/MoreHeadBridge/MoreHeadBridge.dll"]),
+]
+logger_result = diag.game_diagnose(G_LOGGER, "repo", logger_mods)["findings"][0]
+check("B6 global logger frame is not Mod attribution",
+      logger_result["attributed_mods"] == [],
+      f"attributed={logger_result['attributed_mods']}")
+
 # ── C. 依赖缺失字样 → dep 建议 ──
 G2 = os.path.join(TMP, "DepMiss")
 w(os.path.join(G2, "BepInEx", "LogOutput.log"),
