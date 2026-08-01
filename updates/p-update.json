@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "channel": "subscription",
-  "latest_version": "1.5.0",
+  "latest_version": "1.5.1",
   "minimum_safe_version": "1.5.0",
   "severity": "normal",
-  "title": "ModAgent P v1.5.0",
-  "message": "v1.5.0 已发布：P Share 创作者投稿、官方合集审核与导入流程上线。",
+  "title": "ModAgent P v1.5.1",
+  "message": "v1.5.1 稳定修复：改进官方合集依赖基础环境识别、分享码显示与 Thunderstore 网络回退。",
   "download_page": ""
 }

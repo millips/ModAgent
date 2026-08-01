@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "channel": "free",
-  "latest_version": "1.5.0",
+  "latest_version": "1.5.1",
   "minimum_safe_version": "1.5.0",
   "severity": "normal",
-  "title": "ModAgent v1.5.0",
-  "message": "v1.5.0 已发布：支持官方社区合集导入、P Share 投稿和审核流程。",
-  "download_page": "https://github.com/millips/ModAgent/releases/tag/v1.5.0"
+  "title": "ModAgent v1.5.1",
+  "message": "v1.5.1 稳定修复：改进官方合集依赖基础环境识别、分享码显示与 Thunderstore 网络回退。",
+  "download_page": "https://github.com/millips/ModAgent/releases/tag/v1.5.1"
 }
