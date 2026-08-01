@@ -6,6 +6,8 @@ import {
 } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
 import { SettingsEditionPanel, applyEditionDefaultBackground } from '@edition'
+import { isPAccessEnabled, usePLicenseStatus } from '../license/pLicense'
+import { activatePShare, usePShareProfile } from '../pshare/pShareStore'
 import {
   readLayoutPreference,
   saveLayoutPreference,
@@ -37,7 +39,9 @@ const MODEL_OPTIONS = [
   ['custom', '自定义模型名'],
 ]
 
-export default function SettingsPage({ toast, api }) {
+export default function SettingsPage({ toast, api, onStartSharePlan, onPShareActivated }) {
+  const pLicense = usePLicenseStatus()
+  const pShareProfile = usePShareProfile()
   const identity = window.modagent?.getAppIdentity?.() || {
     productName: __MODAGENT_SUBSCRIPTION__ ? 'ModAgent P' : 'ModAgent',
     version: __MODAGENT_VERSION__,
@@ -57,6 +61,25 @@ export default function SettingsPage({ toast, api }) {
   const [layoutMode, setLayoutMode] = useState(readLayoutPreference)
   const [bg, setBg] = useState(null)
   const [bgUrl, setBgUrl] = useState(null)
+  const [shareInput, setShareInput] = useState('')
+  const [sharePreview, setSharePreview] = useState(null)
+  const [shareBusy, setShareBusy] = useState(false)
+  const [shareNote, setShareNote] = useState('')
+  const [shareSnapshots, setShareSnapshots] = useState(false)
+  const [officialQuery, setOfficialQuery] = useState('')
+  const [officialCatalog, setOfficialCatalog] = useState(null)
+  const [officialBusy, setOfficialBusy] = useState(false)
+  const [creatorName, setCreatorName] = useState('')
+
+  const activateCreatorProfile = () => {
+    if (!isPAccessEnabled(pLicense)) {
+      toast('需要先完成有效的 ModAgent P 会员验证。', 'error')
+      return
+    }
+    activatePShare(creatorName)
+    toast('P Share 创作者计划已开通。')
+    onPShareActivated?.()
+  }
 
   useEffect(() => {
     fetch(api + '/status').then(r => r.json()).then(s => {
@@ -160,6 +183,79 @@ export default function SettingsPage({ toast, api }) {
       const output = await window.modagent?.exportRuntimeDiagnostics?.()
       if (output) toast('\u8bca\u65ad\u4fe1\u606f\u5df2\u5bfc\u51fa')
     } catch (_) { toast('\u8bca\u65ad\u4fe1\u606f\u5bfc\u51fa\u5931\u8d25', 'error') }
+  }
+
+  const callShareTool = async (name, body = {}) => {
+    const response = await fetch(`${api}/tool/${name}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })
+    if (!response.ok) throw new Error(`share tool failed: ${response.status}`)
+    const data = await response.json()
+    return JSON.parse(data.result)
+  }
+
+  const downloadShare = async () => {
+    setShareBusy(true)
+    try {
+      const result = await callShareTool('share_export', {
+        author_note: shareNote, include_snapshots: shareSnapshots,
+      })
+      const blob = new Blob([result.share_json], { type: 'application/json;charset=utf-8' })
+      const href = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = href
+      anchor.download = `modagent-share-${Date.now()}.json`
+      anchor.click()
+      URL.revokeObjectURL(href)
+      toast('已导出配置 JSON；可上传到 GitHub Gist 或作为文件分享。')
+    } catch (_) { toast('导出配置失败', 'error') }
+    finally { setShareBusy(false) }
+  }
+
+  const copyOfflineShareLink = async () => {
+    setShareBusy(true)
+    try {
+      const result = await callShareTool('share_export', {
+        author_note: shareNote, include_snapshots: shareSnapshots,
+      })
+      await navigator.clipboard.writeText(result.offline_share_link)
+      toast('离线分享链接已复制。配置较多时建议改用导出的 JSON/Gist。')
+    } catch (_) { toast('复制分享链接失败', 'error') }
+    finally { setShareBusy(false) }
+  }
+
+  const inspectShare = async () => {
+    if (!shareInput.trim()) { toast('请粘贴 JSON、离线链接或 GitHub Raw/Gist 链接', 'error'); return }
+    setShareBusy(true)
+    try {
+      const result = await callShareTool('share_import', { share: shareInput.trim() })
+      if (result.error) throw new Error(result.error)
+      setSharePreview(result)
+      toast(`已解析分享：${result.summary?.total || 0} 个 Mod，尚未安装或修改任何内容。`)
+    } catch (error) { toast(error?.message || '解析分享失败', 'error') }
+    finally { setShareBusy(false) }
+  }
+
+  const loadOfficialCatalog = async () => {
+    setOfficialBusy(true)
+    try {
+      const result = await callShareTool('official_share_catalog', { query: officialQuery.trim() })
+      if (result.error) throw new Error(result.error)
+      setOfficialCatalog(result)
+      if (!result.fetched) toast('官方库暂时无法联网读取，已使用本地空白索引。', 'error')
+    } catch (error) { toast(error?.message || '读取官方分享库失败', 'error') }
+    finally { setOfficialBusy(false) }
+  }
+
+  const openOfficialCollection = async (shareId) => {
+    setOfficialBusy(true)
+    try {
+      const result = await callShareTool('official_share_import', { share_id: shareId })
+      if (result.error) throw new Error(result.error)
+      setSharePreview(result)
+      toast(`已打开官方合集 ${shareId}；尚未安装或修改任何内容。`)
+    } catch (error) { toast(error?.message || '打开官方合集失败', 'error') }
+    finally { setOfficialBusy(false) }
   }
 
   const openLegalDocument = async (file) => {
@@ -400,6 +496,136 @@ export default function SettingsPage({ toast, api }) {
 
         <SettingsEditionPanel toast={toast} />
 
+        {__MODAGENT_SUBSCRIPTION__ && (
+          <div className="card-cyber space-y-3">
+            <div className="flex items-center gap-2">
+              <Github size={14} className="text-cyber-cyan" />
+              <span className="text-sm font-medium">P Share · 创作者计划</span>
+              {pShareProfile && <span className="ml-auto rounded-full bg-cyber-green/10 px-2 py-0.5 text-[10px] text-cyber-green">已开通</span>}
+            </div>
+            {pShareProfile ? (
+              <div className="rounded-lg border border-cyber-green/25 bg-cyber-green/5 p-3 text-xs text-surface-300">
+                <p>{pShareProfile.display_name || 'P Share 创作者'} 已具备投稿资格。导出仅允许包含已对齐、可复核原始页面的 Mod。</p>
+                <button type="button" className="btn-ghost mt-3 text-xs" onClick={() => onPShareActivated?.()}>进入分享者主页</button>
+              </div>
+            ) : (
+              <>
+                <p className="text-xs leading-relaxed text-surface-500">通过 P 授权后开通创作者档案，即可导出审核投稿包并追踪自己的投稿状态。档案只保存在本机。</p>
+                <input className="input-cyber text-xs" maxLength={80} value={creatorName} onChange={event => setCreatorName(event.target.value)} placeholder="创作者显示名（可选）" />
+                <button type="button" className="btn-cyber w-full" onClick={activateCreatorProfile} disabled={!isPAccessEnabled(pLicense)}>开通 P Share 创作者计划</button>
+                {!isPAccessEnabled(pLicense) && <p className="text-[11px] text-cyber-yellow">请先在 P 会员验证中完成授权验证。</p>}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Share creation moved to selected Mods; importing moved to the home quick actions. */}
+        <div className="hidden" aria-hidden="true">
+        <div className="card-cyber space-y-3">
+          <div className="flex items-center gap-2">
+            <FileText size={14} className="text-cyber-cyan" />
+            <span className="text-sm font-medium">分享配置（Beta）</span>
+          </div>
+          <p className="text-xs leading-relaxed text-surface-500">
+            导出的是可审核的 Mod 清单：名称、来源、依赖、启用状态和排序。不会包含 API Key、游戏路径、已安装文件路径或配置文件内容。
+          </p>
+          <input
+            className="input-cyber text-xs"
+            value={shareNote}
+            maxLength={2000}
+            onChange={event => setShareNote(event.target.value)}
+            placeholder="作者备注（可选，例如：适合联机/建议先备份存档）"
+          />
+          <label className="flex items-center gap-2 text-xs text-surface-400 cursor-pointer">
+            <input type="checkbox" checked={shareSnapshots} onChange={event => setShareSnapshots(event.target.checked)} />
+            附带快照元数据（仅名称、时间和可用状态；不包含快照文件）
+          </label>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <button type="button" disabled={shareBusy} onClick={downloadShare} className="btn-ghost flex items-center justify-center gap-1.5">
+              <FileDown size={13} /> 导出配置 JSON
+            </button>
+            <button type="button" disabled={shareBusy} onClick={copyOfflineShareLink} className="btn-ghost flex items-center justify-center gap-1.5">
+              <Copy size={13} /> 复制离线分享链接
+            </button>
+          </div>
+          <textarea
+            className="input-cyber min-h-24 resize-y text-xs"
+            value={shareInput}
+            onChange={event => setShareInput(event.target.value)}
+            placeholder="粘贴 ModAgent JSON、离线分享链接、GitHub Raw 或 Gist Raw 链接"
+          />
+          <button type="button" disabled={shareBusy} onClick={inspectShare} className="btn-cyber w-full disabled:opacity-50">
+            {shareBusy ? '正在解析…' : '解析并核验分享配置'}
+          </button>
+          {sharePreview && (
+            <div className="rounded-lg border border-surface-600/80 bg-surface-900/45 p-3 text-xs space-y-2">
+              <div className="flex flex-wrap gap-x-3 gap-y-1 text-surface-300">
+                <span>共 {sharePreview.summary?.total || 0} 个</span>
+                <span>已安装 {sharePreview.summary?.already_installed || 0}</span>
+                <span>待核验 {sharePreview.summary?.needs_verification || 0}</span>
+                <span>待补来源 {sharePreview.summary?.needs_source_resolution || 0}</span>
+              </div>
+              <p className="text-surface-500">已完成只读预览；生成安装计划前仍会核验来源、依赖、冲突与当前游戏适配。</p>
+              {sharePreview?.source_kind !== 'official_collection' && (
+                <button type="button" onClick={() => onStartSharePlan?.(shareInput.trim())} className="btn-ghost w-full text-xs">
+                  在聊天中继续生成安装计划
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="card-cyber space-y-3">
+          <div className="flex items-center gap-2">
+            <Github size={14} className="text-cyber-purple" />
+            <span className="text-sm font-medium">官方审核合集（Beta）</span>
+          </div>
+          <p className="text-xs leading-relaxed text-surface-500">
+            输入 `ma-xxxxxx`、名称或标签，浏览由 ModAgent 审核并托管在 GitHub 的合集。选择后先核验，再生成安装计划。
+          </p>
+          <div className="flex gap-2">
+            <input
+              className="input-cyber text-xs"
+              value={officialQuery}
+              onChange={event => setOfficialQuery(event.target.value)}
+              onKeyDown={event => { if (event.key === 'Enter') loadOfficialCatalog() }}
+              placeholder="例如 ma-263484、星露谷、新手"
+            />
+            <button type="button" disabled={officialBusy} onClick={loadOfficialCatalog} className="btn-ghost shrink-0 text-xs">
+              浏览
+            </button>
+          </div>
+          {officialCatalog && (
+            <div className="space-y-2">
+              {officialCatalog.collections?.length ? officialCatalog.collections.map(item => (
+                <div key={item.id} className="rounded-lg border border-surface-600/80 bg-surface-900/45 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-medium text-white">{item.title || item.id}</p>
+                      <p className="mt-1 text-[11px] text-cyber-cyan">{item.id} · {item.mod_count || 0} 个 Mod</p>
+                    </div>
+                    <button type="button" disabled={officialBusy} onClick={() => openOfficialCollection(item.id)} className="btn-ghost text-[11px] px-2 py-1">
+                      打开
+                    </button>
+                  </div>
+                  {item.description && <p className="mt-2 text-[11px] leading-relaxed text-surface-500">{item.description}</p>}
+                  {item.warnings?.length > 0 && <p className="mt-2 text-[11px] text-cyber-yellow">注意：{item.warnings[0]}</p>}
+                </div>
+              )) : (
+                <p className="rounded-lg border border-dashed border-surface-600 p-3 text-xs text-surface-500">
+                  暂无匹配的官方合集。官方库上线并审核首批内容后会自动显示在这里。
+                </p>
+              )}
+            </div>
+          )}
+          {sharePreview?.source_kind === 'official_collection' && (
+            <button type="button" onClick={() => onStartSharePlan?.({ type: 'official', shareId: sharePreview.official?.id })} className="btn-cyber w-full text-xs">
+              在聊天中继续核验官方合集
+            </button>
+          )}
+        </div>
+        </div>
+
         <div className="card-cyber space-y-3">
           <div className="flex items-center gap-2 mb-1">
             <Image size={14} className="text-cyber-purple" />
@@ -468,6 +694,10 @@ export default function SettingsPage({ toast, api }) {
             <button type="button" className="btn-ghost flex items-center justify-center gap-1.5"
               onClick={() => openProjectLink(`https://github.com/millips/ModAgent/releases/tag/v${identity.version || __MODAGENT_VERSION__}`)}>
               <BookOpen size={13} /> 更新日志
+            </button>
+            <button type="button" className="btn-ghost flex items-center justify-center gap-1.5"
+              onClick={() => openProjectLink('https://github.com/millips/ModAgent-Share')}>
+              <Globe size={13} /> 查看官方共享仓库
             </button>
             <button type="button" className="btn-ghost flex items-center justify-center gap-1.5"
               onClick={() => openLegalDocument('LICENSE.md')}>

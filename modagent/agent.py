@@ -382,9 +382,19 @@ class Agent:
         self._selection_nexus_alias_ids: dict[str, str] = {}
         self._selection_allowed_source_urls: set[str] = set()
         self._selection_download_paths: set[str] = set()
+        self._selection_confirm_rows: list[dict] = []
+        self._selection_strict_nexus = False
+        self._selection_batch_download_attempted = False
+        self._selection_batch_download_result = ""
+        self._selection_batch_download_success: list[dict] = []
+        self._selection_batch_download_complete = False
+        self._selection_batch_install_result = ""
         self._install_completed_this_turn = False
+        self._install_attempted_this_turn = False
         self._explicit_install_target: dict[str, str] = {}
         self._explicit_target_found = False
+        self._manual_resume_turn = False
+        self._manual_resume_targets: list[dict] = []
 
     @property
     def client(self):
@@ -445,6 +455,11 @@ class Agent:
             normalized["mod_ids"] = [
                 canonical(item) for item in (normalized.get("mod_ids") or [])
             ]
+            normalized["items"] = [
+                {**item, "mod_id": canonical(item.get("mod_id"))}
+                if isinstance(item, dict) else item
+                for item in (normalized.get("items") or [])
+            ]
         elif name == "batch_download":
             normalized["mods"] = [
                 {**item, "mod_id": canonical(item.get("mod_id"))}
@@ -453,10 +468,262 @@ class Agent:
             ]
         return normalized
 
+    @staticmethod
+    def _normalize_selection_rows(
+        recommendation_selection: list[dict] | None,
+    ) -> list[dict]:
+        """Keep only the stable fields that identify the user's exact choice."""
+        rows: list[dict] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for raw in recommendation_selection or []:
+            if not isinstance(raw, dict):
+                continue
+            source = str(raw.get("source") or "").strip().casefold()
+            mod_id = str(raw.get("mod_id") or raw.get("source_id") or "").strip()
+            if not source or not mod_id:
+                continue
+            row = {
+                "source": source,
+                "mod_id": mod_id,
+                "mod_name": str(
+                    raw.get("mod_name")
+                    or raw.get("localized_name")
+                    or raw.get("name")
+                    or ""
+                ).strip(),
+                "selection_key": str(raw.get("selection_key") or "").strip(),
+                "file_id": str(raw.get("file_id") or "").strip(),
+                "variant_id": str(
+                    raw.get("selected_variant_id")
+                    or raw.get("variant_id")
+                    or ""
+                ).strip(),
+                "variant_name": str(raw.get("variant_name") or "").strip(),
+                "file_name": str(raw.get("file_name") or "").strip(),
+                "target_slot": str(raw.get("target_slot") or "").strip(),
+                "version": str(raw.get("version") or "").strip(),
+            }
+            identity = (
+                source,
+                mod_id,
+                row["file_id"],
+                row["variant_id"],
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _selection_row_identity(row: dict) -> tuple[str, str, str]:
+        return (
+            str(row.get("mod_id") or ""),
+            str(row.get("file_id") or ""),
+            str(row.get("variant_id") or ""),
+        )
+
+    def _strict_selection_result(self, name: str, args: dict) -> str | None:
+        """Enforce one exact download -> one exact install for Nexus selections."""
+        if not (
+            self._selection_action == "confirm"
+            and self._selection_strict_nexus
+            and self._selection_confirm_rows
+        ):
+            return None
+        if name in {
+            "mod_download",
+            "download_from_url",
+            "mod_install",
+            "mod_install_custom",
+        }:
+            return json.dumps({
+                "error": "selection_execution_mode_blocked",
+                "status": "exact_batch_required",
+                "tool": name,
+                "install_blocked": True,
+                "message": (
+                    "本次确认包含结构化精确文件，必须一次性使用 batch_download "
+                    "下载全部选中项；全部完成后再使用 mod_install_batch。"
+                    "禁止单项重下、换源或绕过未完成项。"
+                ),
+            }, ensure_ascii=False)
+        if name == "batch_download":
+            if self._selection_batch_download_attempted:
+                try:
+                    prior = json.loads(self._selection_batch_download_result)
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    prior = {"status": "failed"}
+                prior["reused_result"] = True
+                prior["message"] = (
+                    "本轮精确批量下载已经执行过，直接复用结果，未重复下载。"
+                )
+                return json.dumps(prior, ensure_ascii=False)
+            args.clear()
+            args.update({
+                "mods": [dict(row) for row in self._selection_confirm_rows],
+                "require_verified_preflight": True,
+            })
+            return None
+        if name == "mod_install_batch":
+            if self._selection_batch_install_result:
+                try:
+                    prior = json.loads(self._selection_batch_install_result)
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    prior = {"status": "failed"}
+                prior["reused_result"] = True
+                prior["message"] = "本轮精确安装已经执行过，未重复写入游戏目录。"
+                return json.dumps(prior, ensure_ascii=False)
+            if not self._selection_batch_download_complete:
+                return json.dumps({
+                    "status": "download_incomplete",
+                    "install_blocked": True,
+                    "total_selected": len(self._selection_confirm_rows),
+                    "ready": len(self._selection_batch_download_success),
+                    "message": (
+                        "所选文件尚未全部完成下载或仍在等待人工验证；"
+                        "安装未开始，未创建快照，也未写入游戏目录。"
+                    ),
+                }, ensure_ascii=False)
+            # All selected rows may already be installed. No write is needed,
+            # but the confirmation can truthfully finish.
+            if not self._selection_batch_download_success:
+                synthetic = {
+                    "status": "completed",
+                    "total": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "all_selected_installed": True,
+                    "already_installed": len(self._selection_confirm_rows),
+                    "results": [],
+                    "message": "所选 Mod 均已安装，未重复下载或覆盖。",
+                }
+                self._selection_batch_install_result = json.dumps(
+                    synthetic, ensure_ascii=False
+                )
+                self._install_attempted_this_turn = True
+                self._install_completed_this_turn = True
+                return self._selection_batch_install_result
+            args.clear()
+            args.update({
+                "items": [
+                    dict(item)
+                    for item in self._selection_batch_download_success
+                ],
+                "mod_ids": [],
+                "require_verified_preflight": True,
+            })
+        return None
+
+    def _record_strict_selection_result(self, name: str, result: str) -> None:
+        if not self._selection_strict_nexus:
+            return
+        try:
+            parsed = json.loads(result)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            parsed = {}
+        if name == "batch_download":
+            self._selection_batch_download_attempted = True
+            self._selection_batch_download_result = result
+            success = [
+                dict(item) for item in (parsed.get("success") or [])
+                if isinstance(item, dict)
+            ]
+            skipped = [
+                dict(item) for item in (parsed.get("skipped_installed") or [])
+                if isinstance(item, dict)
+            ]
+            expected = {
+                self._selection_row_identity(row)
+                for row in self._selection_confirm_rows
+            }
+            completed: set[tuple[str, str, str]] = set()
+            for item in success:
+                identity = self._selection_row_identity(item)
+                if identity in expected:
+                    completed.add(identity)
+                    continue
+                # Some download providers echo the stable Nexus file_id but
+                # not the UI-only variant_id. Preserve the selected variant.
+                for row in self._selection_confirm_rows:
+                    if (
+                        str(row.get("mod_id") or "")
+                        == str(item.get("mod_id") or "")
+                        and (
+                            not row.get("file_id")
+                            or str(row.get("file_id"))
+                            == str(item.get("file_id") or "")
+                        )
+                    ):
+                        item.update({
+                            "variant_id": row.get("variant_id"),
+                            "variant_name": row.get("variant_name"),
+                            "file_name": row.get("file_name"),
+                            "target_slot": row.get("target_slot"),
+                        })
+                        completed.add(self._selection_row_identity(row))
+                        break
+            for item in skipped:
+                mid = str(item.get("mod_id") or "")
+                completed.update(
+                    identity for identity in expected if identity[0] == mid
+                )
+            self._selection_batch_download_success = success
+            self._selection_batch_download_complete = bool(
+                parsed.get("status") == "completed"
+                and not parsed.get("failed")
+                and not parsed.get("pending_verification")
+                and not parsed.get("blocked_dependencies")
+                and completed == expected
+            )
+        elif name == "mod_install_batch":
+            self._selection_batch_install_result = result
+            self._install_completed_this_turn = bool(
+                parsed.get("status") == "completed"
+                and parsed.get("all_selected_installed") is True
+                and int(parsed.get("failed") or 0) == 0
+            )
+
     def _exec(self, name: str, args: dict) -> str:
         if self._is_cancelled():
             return self._cancelled_tool_result(name)
         args = self._canonicalize_selected_nexus_args(name, args)
+        strict_result = self._strict_selection_result(name, args)
+        if strict_result is not None:
+            return strict_result
+        if self._manual_resume_turn:
+            if name in SEARCH_DISCOVERY_TOOLS or name in {
+                "download_from_url", "batch_download"
+            }:
+                return json.dumps({
+                    "error": "manual_resume_scope_blocked",
+                    "tool": name,
+                    "message": (
+                        "本轮只允许恢复刚才被 Nexus 人机验证暂停的原文件。"
+                        "不得重新搜索、换源或改用通用下载器。"
+                    ),
+                }, ensure_ascii=False)
+            if name == "mod_download" and self._manual_resume_targets:
+                requested = str(args.get("mod_id") or "").strip()
+                allowed = {
+                    str(item.get("mod_id") or "").strip()
+                    for item in self._manual_resume_targets
+                }
+                if len(self._manual_resume_targets) == 1:
+                    target = self._manual_resume_targets[0]
+                    args = {
+                        **args,
+                        "mod_id": target.get("mod_id"),
+                        "file_id": target.get("file_id"),
+                    }
+                elif requested not in allowed:
+                    return json.dumps({
+                        "error": "manual_resume_identity_mismatch",
+                        "tool": name,
+                        "requested_mod_id": requested,
+                        "allowed_mod_ids": sorted(allowed),
+                        "message": "恢复目标与刚才暂停的 Nexus 文件不一致，已拒绝执行。",
+                    }, ensure_ascii=False)
         if (
             self._diagnostic_read_only_turn
             and name in DIAGNOSTIC_SCOPE_BLOCKED_TOOLS
@@ -530,6 +797,11 @@ class Agent:
                         requested_ids.add(target)
                 elif name == "mod_install_batch":
                     requested_ids.update(str(item) for item in (args.get("mod_ids") or []))
+                    requested_ids.update(
+                        str(item.get("mod_id") or "")
+                        for item in (args.get("items") or [])
+                        if isinstance(item, dict) and item.get("mod_id") not in (None, "")
+                    )
                 elif name == "batch_download":
                     requested_ids.update(
                         str(item.get("mod_id") or "")
@@ -762,19 +1034,27 @@ class Agent:
                     self._turn_explicit_download_failure = str(
                         parsed.get("message") or parsed.get("error") or "下载失败"
                     )
+        if name in {"batch_download", "mod_install_batch"}:
+            self._record_strict_selection_result(name, result)
+        if name in {"mod_install", "mod_install_custom", "mod_install_batch"}:
+            self._install_attempted_this_turn = True
         if ok and name in {"mod_install", "mod_install_custom", "mod_install_batch"}:
             try:
                 parsed = json.loads(result)
             except (ValueError, TypeError, json.JSONDecodeError):
                 parsed = {}
+            batch_completed = bool(
+                name == "mod_install_batch"
+                and parsed.get("status") == "completed"
+                and parsed.get("all_selected_installed") is True
+                and int(parsed.get("failed") or 0) == 0
+            )
             if (
-                parsed.get("files_installed")
-                or parsed.get("already_installed")
-                or (
-                    name == "mod_install_batch"
-                    and int(parsed.get("succeeded") or 0) > 0
-                    and int(parsed.get("failed") or 0) == 0
-                )
+                (name != "mod_install_batch" and (
+                    parsed.get("files_installed")
+                    or parsed.get("already_installed")
+                ))
+                or batch_completed
             ):
                 self._install_completed_this_turn = True
         if ok and name == "mod_update":
@@ -825,6 +1105,14 @@ class Agent:
     def _is_error(self, result: str) -> bool:
         try:
             data = json.loads(result)
+            if (
+                isinstance(data, dict)
+                and data.get("status") in {
+                    "manual_action_required",
+                    "partial_manual_action_required",
+                }
+            ):
+                return False
             return isinstance(data, dict) and (
                 "error" in data
                 or bool(data.get("install_blocked"))
@@ -859,6 +1147,110 @@ class Agent:
             or "下载未完成，已停止本轮后续下载。"
         )
 
+    def _pending_manual_download_targets(self) -> list[dict]:
+        """Read the latest resumable Nexus gate from persisted tool history."""
+        for message in reversed(self.history):
+            if message.get("role") != "tool":
+                continue
+            try:
+                data = json.loads(str(message.get("content") or ""))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            status = str(data.get("status") or "")
+            if (
+                data.get("local_path")
+                or status in {"completed", "downloaded", "installed"}
+                or (
+                    isinstance(data.get("success"), list)
+                    and data.get("success")
+                    and not data.get("pending_verification")
+                )
+            ):
+                # A newer successful download closes any older page gate.
+                return []
+            if status == "manual_action_required":
+                target = {
+                    "mod_id": data.get("mod_id"),
+                    "file_id": data.get("file_id"),
+                    "nexus_slug": data.get("nexus_slug"),
+                    "page_url": data.get("page_url"),
+                }
+                return [target] if target["mod_id"] not in (None, "") else []
+            if status == "partial_manual_action_required":
+                return [
+                    {
+                        "mod_id": item.get("mod_id"),
+                        "file_id": item.get("file_id"),
+                        "nexus_slug": item.get("nexus_slug"),
+                        "page_url": item.get("page_url"),
+                    }
+                    for item in (
+                        data.get("pending_verification")
+                        or data.get("manual_action")
+                        or []
+                    )
+                    if isinstance(item, dict)
+                    and item.get("mod_id") not in (None, "")
+                ]
+        return []
+
+    @staticmethod
+    def _is_manual_resume_request(user_msg: str) -> bool:
+        normalized = re.sub(r"[\s，,。.!！?？]+", "", str(user_msg or "")).casefold()
+        if normalized in {"完成了", "已完成", "验证完成", "好了", "搞定了"}:
+            return True
+        return "我已经完成刚才要求的页面操作" in normalized
+
+    @staticmethod
+    def _manual_download_action_message(result: str) -> str:
+        """Return deterministic UI copy for a resumable Nexus page gate."""
+        try:
+            data = json.loads(result)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        status = str(data.get("status") or "")
+        if status == "manual_action_required":
+            action = str(
+                data.get("user_action_required")
+                or "请在已保留的 Nexus 页面完成人机验证。"
+            ).strip()
+            return (
+                "下载已暂停，正在等待你完成 Nexus 人机验证。\n\n"
+                f"{action}\n\n"
+                "页面和当前下载目标都已保留，请不要关闭页面。"
+                "完成后点击下方“完成了”，ModAgent 会继续同一个文件；"
+                "不会重新搜索、换源或重复已经完成的下载。"
+            )
+        if status == "partial_manual_action_required":
+            succeeded = len(data.get("success") or [])
+            pending = data.get("pending_verification") or data.get("manual_action") or []
+            pending = [item for item in pending if isinstance(item, dict)]
+            labels = []
+            for item in pending[:5]:
+                label = str(
+                    item.get("mod_name")
+                    or item.get("name")
+                    or item.get("mod_id")
+                    or ""
+                ).strip()
+                if label:
+                    labels.append(label)
+            target_text = "、".join(labels)
+            waiting = len(pending)
+            return (
+                f"本批次已完成 {succeeded} 项；还有 {waiting} 项正在等待 "
+                "Nexus 人机验证"
+                + (f"（{target_text}）" if target_text else "")
+                + "。\n\n请在已保留的 Nexus 页面完成验证，页面无需关闭。"
+                "完成后点击下方“完成了”，ModAgent 会只继续这些原目标；"
+                "不会重新搜索、换源或重复已经完成的下载。"
+            )
+        return ""
+
     @staticmethod
     def _tool_summary(name: str, result: str, ok: bool) -> str:
         """给普通界面的人类可读阶段摘要；原始 JSON 只留在可展开详情。"""
@@ -876,6 +1268,12 @@ class Agent:
             data = json.loads(result)
         except (ValueError, TypeError):
             data = {}
+        if data.get("status") == "manual_action_required":
+            return "等待 Nexus 人机验证；页面与当前文件已保留"
+        if data.get("status") == "partial_manual_action_required":
+            succeeded = len(data.get("success") or [])
+            waiting = len(data.get("pending_verification") or [])
+            return f"下载完成 {succeeded} 项；等待 Nexus 人机验证 {waiting} 项"
         if not ok:
             message = str(data.get("message") or data.get("error") or "操作未完成")
             if data.get("http_status"):
@@ -932,9 +1330,21 @@ class Agent:
             else:
                 items.append({
                     "mod_id": report.get("mod_id", ""),
-                    "ok": not bool(report.get("error")),
+                    "ok": not bool(
+                        report.get("error")
+                        or report.get("install_blocked")
+                        or str(report.get("status") or "") in {
+                            "failed",
+                            "partial_failure",
+                            "download_incomplete",
+                            "dependency_blocked",
+                            "cancelled",
+                        }
+                    ),
                     "name": report.get("name", ""),
                     "version": report.get("version", ""),
+                    "file_id": report.get("file_id"),
+                    "variant_name": report.get("variant_name", ""),
                     "files": len(report.get("files_installed") or []),
                     "files_installed": report.get("files_installed") or [],
                     "dependencies": report.get("dependencies") or [],
@@ -944,7 +1354,12 @@ class Agent:
                         if report.get("already_installed")
                         else "installed"
                     ),
-                    "error": report.get("error", ""),
+                    "error": (
+                        report.get("message")
+                        or report.get("error")
+                        or report.get("status")
+                        or ""
+                    ),
                 })
         succeeded = sum(1 for item in items if item.get("ok"))
         lines = [
@@ -1149,6 +1564,11 @@ class Agent:
     # ── non-stream ─────────────────────────────────────────────────────────
 
     def chat(self, user_msg: str) -> str:
+        self._manual_resume_targets = self._pending_manual_download_targets()
+        self._manual_resume_turn = bool(
+            self._manual_resume_targets
+            and self._is_manual_resume_request(user_msg)
+        )
         self._current_user_msg = user_msg
         self._prior_assistant_text = next((str(m.get("content") or "") for m in reversed(self.history)
                                            if m.get("role") == "assistant" and m.get("content")), "")
@@ -1169,6 +1589,12 @@ class Agent:
         self._turn_explicit_download_failure = ""
         system = build_prompt(self.cfg)
         tools = build_tools_definitions(self.cfg.tier)
+        if self._manual_resume_turn:
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name")
+                not in SEARCH_DISCOVERY_TOOLS | {"download_from_url", "batch_download"}
+            ]
         if self._update_intent:
             tools = [
                 tool for tool in tools
@@ -1192,6 +1618,17 @@ class Agent:
         messages = [{"role": "system", "content": system}]
         self.history = sanitize_tool_history(self.history)
         messages.extend(self.history)
+        if self._manual_resume_turn:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "用户已经完成刚才的 Nexus 页面验证。本轮只能恢复以下暂停目标："
+                    + json.dumps(self._manual_resume_targets, ensure_ascii=False)
+                    + "。必须先用 mod_download 按原 mod_id 与 file_id 继续；"
+                    "禁止重新搜索、换源、调用 download_from_url 或替换文件。"
+                    "底层会复用已经保留的 Nexus 页面。下载成功后才可继续原安装流程。"
+                ),
+            })
         if self._update_intent:
             messages.append({
                 "role": "system",
@@ -1258,6 +1695,7 @@ class Agent:
                 a_msg = self._assistant_toolcall_msg(msg.content or "", tcd)
                 messages.append(a_msg); persist.append(a_msg)
                 terminal_download_message = ""
+                manual_download_message = ""
                 for tc in msg.tool_calls:
                     try:
                         args = json.loads(tc.function.arguments)
@@ -1270,11 +1708,20 @@ class Agent:
                         terminal_download_message
                         or self._terminal_download_failure_message(result)
                     )
+                    manual_download_message = (
+                        manual_download_message
+                        or self._manual_download_action_message(result)
+                    )
                 if terminal_download_message:
                     reply = (
                         f"下载未完成：{terminal_download_message}"
                         " 本轮已结束，没有继续换源或重复下载。"
                     )
+                    persist.append({"role": "assistant", "content": reply})
+                    self.history.extend(persist)
+                    return reply
+                if manual_download_message:
+                    reply = manual_download_message
                     persist.append({"role": "assistant", "content": reply})
                     self.history.extend(persist)
                     return reply
@@ -1334,6 +1781,11 @@ class Agent:
         selection_action: str = "",
         cancel_check=None,
     ):
+        self._manual_resume_targets = self._pending_manual_download_targets()
+        self._manual_resume_turn = bool(
+            self._manual_resume_targets
+            and self._is_manual_resume_request(user_msg)
+        )
         self._cancel_check = cancel_check
         self._current_user_msg = user_msg
         self._prior_assistant_text = next((str(m.get("content") or "") for m in reversed(self.history)
@@ -1353,6 +1805,17 @@ class Agent:
             selection_action
             if selection_action in {"resolve", "plan", "confirm"}
             else ""
+        )
+        self._selection_confirm_rows = self._normalize_selection_rows(
+            recommendation_selection
+        )
+        self._selection_strict_nexus = bool(
+            self._selection_action == "confirm"
+            and self._selection_confirm_rows
+            and all(
+                row.get("source") == "nexus"
+                for row in self._selection_confirm_rows
+            )
         )
         self._selection_allowed_nexus_ids = {
             str(item.get("mod_id") or item.get("source_id") or "")
@@ -1396,13 +1859,25 @@ class Agent:
             if isinstance(item, dict) and str(item.get("url") or "").strip()
         }
         self._selection_download_paths = set()
+        self._selection_batch_download_attempted = False
+        self._selection_batch_download_result = ""
+        self._selection_batch_download_success = []
+        self._selection_batch_download_complete = False
+        self._selection_batch_install_result = ""
         self._install_completed_this_turn = False
+        self._install_attempted_this_turn = False
         self._status_only_turn = is_status_only_question(user_msg)
         self._turn_result_cache = {}
         self._turn_terminal_download_failures = {}
         self._turn_explicit_download_failure = ""
         system = build_prompt(self.cfg)
         tools = build_tools_definitions(self.cfg.tier)
+        if self._manual_resume_turn:
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name")
+                not in SEARCH_DISCOVERY_TOOLS | {"download_from_url", "batch_download"}
+            ]
         if self._update_intent:
             tools = [
                 tool for tool in tools
@@ -1437,6 +1912,17 @@ class Agent:
         messages = [{"role": "system", "content": system}]
         self.history = sanitize_tool_history(self.history)
         messages.extend(self.history)
+        if self._manual_resume_turn:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "用户已经完成刚才的 Nexus 页面验证。本轮只能恢复以下暂停目标："
+                    + json.dumps(self._manual_resume_targets, ensure_ascii=False)
+                    + "。必须先用 mod_download 按原 mod_id 与 file_id 继续；"
+                    "禁止重新搜索、换源、调用 download_from_url 或替换文件。"
+                    "底层会复用已经保留的 Nexus 页面。下载成功后才可继续原安装流程。"
+                ),
+            })
         if self._update_intent:
             messages.append({
                 "role": "system",
@@ -1537,6 +2023,15 @@ class Agent:
                     "name": str(item.get("name") or "")[:120],
                     "version": str(item.get("version") or "")[:48],
                     "url": str(item.get("url") or "")[:500],
+                    "file_id": item.get("file_id"),
+                    "file_name": str(item.get("file_name") or "")[:240],
+                    "variant_id": str(
+                        item.get("selected_variant_id")
+                        or item.get("variant_id")
+                        or ""
+                    )[:120],
+                    "variant_name": str(item.get("variant_name") or "")[:240],
+                    "target_slot": str(item.get("target_slot") or "")[:120],
                     "dependencies": [
                         str(dep)[:120] for dep in (item.get("dependencies") or [])[:8]
                     ],
@@ -1605,7 +2100,16 @@ class Agent:
                     "mod_id. Never put a display name, localized name, or "
                     "selection_key into a mod_id argument. Do not call "
                     "snapshot_create separately; the verified install tool "
-                    "creates the snapshot after its preflight passes."
+                    "creates the snapshot after its preflight passes. For every "
+                    "selected Nexus row, preserve file_id, variant_id, "
+                    "variant_name, file_name and target_slot exactly. First call "
+                    "batch_download once with those exact structured rows. Only "
+                    "when its status is completed and every selected row appears "
+                    "in success may you call mod_install_batch; pass the success "
+                    "rows verbatim as mod_install_batch.items. Never reconstruct "
+                    "an item from a display name, never retry a failed batch in "
+                    "the same turn, and never continue after cancellation or "
+                    "manual_action_required."
                 )
             messages.append({
                 "role": "system",
@@ -1665,6 +2169,7 @@ class Agent:
 
                     yield self._emit({"tool": [t["function"]["name"] for t in tool_calls_data]})
                     terminal_download_message = ""
+                    manual_download_message = ""
                     for t in tool_calls_data:
                         if self._is_cancelled():
                             break
@@ -1675,12 +2180,9 @@ class Agent:
                         result = self._exec(t["function"]["name"], args)
                         if self._is_cancelled():
                             break
-                        if (
-                            t["function"]["name"] in {
-                                "mod_install", "mod_install_custom", "mod_install_batch"
-                            }
-                            and not self._is_error(result)
-                        ):
+                        if t["function"]["name"] in {
+                            "mod_install", "mod_install_custom", "mod_install_batch"
+                        }:
                             try:
                                 install_result = json.loads(result)
                             except (TypeError, ValueError, json.JSONDecodeError):
@@ -1688,10 +2190,9 @@ class Agent:
                             if (
                                 install_result.get("files_installed")
                                 or install_result.get("already_installed")
-                                or (
-                                    t["function"]["name"] == "mod_install_batch"
-                                    and isinstance(install_result.get("results"), list)
-                                )
+                                or isinstance(install_result.get("results"), list)
+                                or install_result.get("error")
+                                or install_result.get("install_blocked")
                             ):
                                 completed_install_reports.append(install_result)
                                 installed_name = str(
@@ -1757,12 +2258,25 @@ class Agent:
                             terminal_download_message
                             or self._terminal_download_failure_message(result)
                         )
+                        manual_download_message = (
+                            manual_download_message
+                            or self._manual_download_action_message(result)
+                        )
+                        try:
+                            result_meta = json.loads(result)
+                        except (ValueError, TypeError, json.JSONDecodeError):
+                            result_meta = {}
                         yield self._emit({"tool_result": {
                             "name": t["function"]["name"], "ok": not self._is_error(result),
                             "summary": self._tool_summary(
                                 t["function"]["name"], result, not self._is_error(result)
                             ),
                             "preview": (result[:300] if isinstance(result, str) else str(result)[:300]),
+                            "status": str(result_meta.get("status") or ""),
+                            "install_blocked": bool(result_meta.get("install_blocked")),
+                            "all_selected_installed": result_meta.get(
+                                "all_selected_installed"
+                            ),
                         }})
                         if (
                             selection_action == "plan"
@@ -1807,6 +2321,13 @@ class Agent:
                             "role": "assistant", "content": final_text
                         })
                         break
+                    if manual_download_message:
+                        final_text = manual_download_message
+                        yield self._emit({"chunk": final_text})
+                        persist.append({
+                            "role": "assistant", "content": final_text
+                        })
+                        break
                     if recommendation_update.get("items"):
                         promoted = recommendation_update.get("promotion") or {}
                         if promoted.get("installable"):
@@ -1831,7 +2352,7 @@ class Agent:
                         })
                         recommendation_update = {}
                     if (
-                        self._install_completed_this_turn
+                        self._install_attempted_this_turn
                         and (
                             selection_action == "confirm"
                             or is_short_install_confirmation(
@@ -2033,7 +2554,17 @@ class Agent:
             self._selection_nexus_alias_ids = {}
             self._selection_allowed_source_urls = set()
             self._selection_download_paths = set()
+            self._selection_confirm_rows = []
+            self._selection_strict_nexus = False
+            self._selection_batch_download_attempted = False
+            self._selection_batch_download_result = ""
+            self._selection_batch_download_success = []
+            self._selection_batch_download_complete = False
+            self._selection_batch_install_result = ""
             self._install_completed_this_turn = False
+            self._install_attempted_this_turn = False
             self._update_intent = False
             self._update_completed_this_turn = False
+            self._manual_resume_turn = False
+            self._manual_resume_targets = []
             self._cancel_check = None

@@ -37,15 +37,37 @@ export function RecommendationDecisionTable({
   const items = Array.isArray(payload.items) ? payload.items : []
   const selected = new Set(payload.selected_keys || [])
   const wanted = new Set(payload.wanted_keys || [])
+  const selectedVariants = payload.selected_variants || {}
   const requirements = Array.isArray(payload.dependency_requirements)
     ? payload.dependency_requirements : []
   const phase = ['confirm', 'executing', 'completed'].includes(payload.phase)
     ? payload.phase : 'recommendation'
   const isConfirmation = phase !== 'recommendation'
   const locked = phase === 'executing' || phase === 'completed'
-  const selectedItems = items.filter(
-    item => item.installable !== false && selected.has(item.selection_key)
-  )
+  const selectedItems = items
+    .filter(item => item.installable !== false && selected.has(item.selection_key))
+    .map(item => {
+      const variants = Array.isArray(item.variants) ? item.variants : []
+      const selectedVariantId = selectedVariants[item.selection_key]
+        || item.selected_variant_id
+        || variants.find(variant => variant.is_primary)?.variant_id
+        || variants[0]?.variant_id
+        || ''
+      const variant = variants.find(candidate => candidate.variant_id === selectedVariantId)
+        || variants[0]
+      return variant
+        ? {
+            ...item,
+            selected_variant_id: variant.variant_id,
+            variant_id: variant.variant_id,
+            file_id: variant.file_id,
+            file_name: variant.file_name,
+            variant_name: variant.name,
+            target_slot: variant.target_slot,
+            version: variant.version || item.version,
+          }
+        : item
+    })
   const wantedItems = items.filter(
     item => item.installable === false && wanted.has(item.selection_key)
   )
@@ -76,8 +98,23 @@ export function RecommendationDecisionTable({
     ? Math.round((verifiedCount / items.length) * 100)
     : 100
 
-  const update = (keys, wantedKeys = [...wanted]) => {
-    onChange?.([...new Set(keys)], [...new Set(wantedKeys)])
+  const update = (
+    keys,
+    wantedKeys = [...wanted],
+    variantSelections = selectedVariants,
+  ) => {
+    onChange?.(
+      [...new Set(keys)],
+      [...new Set(wantedKeys)],
+      variantSelections,
+    )
+  }
+
+  const chooseVariant = (item, variantId) => {
+    update([...selected], [...wanted], {
+      ...selectedVariants,
+      [item.selection_key]: variantId,
+    })
   }
 
   const selectedTargetNames = keys => {
@@ -325,6 +362,42 @@ export function RecommendationDecisionTable({
                             : '待详情核验'}
                       </span>
                     </div>
+                    {Array.isArray(item.variants) && item.variants.length > 0 && (
+                      <div className="mt-2">
+                        <label
+                          htmlFor={`variant-${item.selection_key}`}
+                          className="mb-1 block text-[10px] text-surface-400"
+                        >
+                          {item.variants.length > 1 ? '安装文件 / 变体' : '安装文件'}
+                        </label>
+                        <select
+                          id={`variant-${item.selection_key}`}
+                          value={
+                            selectedVariants[item.selection_key]
+                            || item.selected_variant_id
+                            || item.variants.find(variant => variant.is_primary)?.variant_id
+                            || item.variants[0]?.variant_id
+                            || ''
+                          }
+                          disabled={disabled || locked}
+                          onChange={event => chooseVariant(item, event.target.value)}
+                          className="w-full rounded border border-surface-600 bg-surface-900 px-2 py-1.5 text-[10px] text-surface-200 outline-none focus:border-cyber-cyan disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {item.variants.map(variant => (
+                            <option key={variant.variant_id} value={variant.variant_id}>
+                              {variant.name}
+                              {variant.version ? ` · v${variant.version}` : ''}
+                              {variant.is_primary ? ' · 推荐' : ''}
+                            </option>
+                          ))}
+                        </select>
+                        {item.variants.length > 1 && (
+                          <p className="mt-1 text-[9px] leading-relaxed text-surface-500">
+                            现在只记录选择；生成计划后才会下载该精确文件。
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-3 align-top">
                     <p className="leading-relaxed text-surface-300">{item.content}</p>

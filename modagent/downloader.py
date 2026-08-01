@@ -1885,6 +1885,7 @@ async def download_mod(
     file_id: Optional[int] = None,
 ) -> dict:
     """完整下载一个 mod 的标准流程（按 SOP）。传入 file_id 可直接下载指定变体。"""
+    _raise_if_download_cancelled()
     # 0. 检查本地缓存 — 命中直接返回，不要求开 Chrome
     cached = find_cached_nexus_download(game_slug, mod_id, file_id)
     if cached:
@@ -1896,6 +1897,7 @@ async def download_mod(
 
     # 1. 前置检查 — 真要下载才需要 Chrome
     ws_url = preflight_check(cdp_port, api_key)
+    _raise_if_download_cancelled()
     if stage_callback:
         stage_callback("preparing", "正在确认 Nexus 文件与下载页面")
 
@@ -1921,11 +1923,15 @@ async def download_mod(
     # 5+6. 下载（每次尝试都生成全新直链以打败 TTL/死链；download_file 跨尝试断点续传；
     #       下完做解压完整性校验，满大小但损坏则删掉重下）
     safe_name = mod_name.replace(" ", "_").replace("/", "_").replace("\\", "_")[:60]
-    filename = f"{mod_id}_{safe_name}_v{version}.zip"
+    # file_id 是 Nexus 文件资产的稳定身份。放进文件名可避免同一 Mod 的
+    # 多个变体互相覆盖，也让后续安装能够证明使用了用户选中的文件。
+    filename = f"{mod_id}_f{file_id}_{safe_name}_v{version}.zip"
     local_path = os.path.join(DOWNLOADS_DIR, game_slug, filename)
 
     last_err = None
-    for attempt in range(6):
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        _raise_if_download_cancelled()
         # 每次都重新生成直链（旧链可能已过期）。先走官方 API；
         # 免费账号被拒时再回落到同一文件页里的 Slow download 流程。
         cdn_url = ""
@@ -1939,6 +1945,7 @@ async def download_mod(
 
         try:
             if not cdn_url:
+                _raise_if_download_cancelled()
                 cdn_url = await get_download_url_filepage(
                     cdp_port, game_slug, mod_id, file_id, game_id,
                     stage_callback=stage_callback,
@@ -1956,10 +1963,13 @@ async def download_mod(
             ) from e
         if not cdn_url or cdn_url == 'None':
             last_err = RuntimeError("获取下载链接失败")
-            await asyncio.sleep(2)
+            if attempt + 1 < max_attempts:
+                _raise_if_download_cancelled()
+                await asyncio.sleep(.5)
             continue
 
         try:
+            _raise_if_download_cancelled()
             parsed_url = urllib.parse.urlparse(cdn_url)
             if parsed_url.scheme.lower() == "file":
                 browser_path = urllib.request.url2pathname(parsed_url.path)
@@ -1979,9 +1989,23 @@ async def download_mod(
                     stage_callback("transferring", "正在接收下载文件")
                 download_file(cdn_url, local_path, progress_callback)  # 内部断点续传 + 字节完整性校验
                 transfer_stage = "direct_download"
+            _raise_if_download_cancelled()
         except Exception as e:
+            if isinstance(e, task_control.TaskCancelled):
+                raise
             last_err = e  # 链接中途失效/断流 → 保留 .part，下次用新链续传
-            await asyncio.sleep(2)
+            kind, retryable, status = _classify_download_error(e)
+            if not retryable:
+                raise DownloadFailure(
+                    f"下载 mod {mod_id} 失败: {e}",
+                    failure_kind=kind,
+                    retryable=False,
+                    attempts=attempt + 1,
+                    http_status=status,
+                ) from e
+            if attempt + 1 < max_attempts:
+                _raise_if_download_cancelled()
+                await asyncio.sleep(.5)
             continue
 
         # 字节完整 → 再验解压完整性（抓"满大小但内部损坏"）
@@ -2004,9 +2028,20 @@ async def download_mod(
                     os.remove(p)
             except Exception:
                 pass
-        await asyncio.sleep(2)
+        if attempt + 1 < max_attempts:
+            _raise_if_download_cancelled()
+            await asyncio.sleep(.5)
 
-    raise RuntimeError(f"下载 mod {mod_id} 失败（已自动重试多次）: {last_err}")
+    kind, retryable, status = _classify_download_error(
+        last_err or RuntimeError("下载结果未通过完整性校验")
+    )
+    raise DownloadFailure(
+        f"下载 mod {mod_id} 失败（自动尝试 {max_attempts} 次）: {last_err}",
+        failure_kind=kind if kind != "unknown" else "retry_exhausted",
+        retryable=retryable,
+        attempts=max_attempts,
+        http_status=status,
+    )
 
 
 def _verify_archive(path: str) -> bool:

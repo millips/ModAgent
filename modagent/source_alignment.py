@@ -188,10 +188,18 @@ def _public_candidate(row: dict, score: float) -> dict:
 
 
 def _complete_binding(binding: dict | None) -> bool:
+    """A usable binding needs both a stable identity and a public maintenance page.
+
+    A legacy workshop row could contain only the Steam item ID.  Treating that
+    as complete inflated the UI count and made the same Mod ineligible for
+    sharing/update navigation.  Keep it pending so one normal alignment pass
+    can repair the row with its canonical URL.
+    """
     return bool(
         binding
         and str(binding.get("source") or "").strip()
         and str(binding.get("source_key") or "").strip()
+        and str(binding.get("source_url") or "").strip()
     )
 
 
@@ -334,14 +342,18 @@ def align_installed_mods(
             notify(mod, "done")
         elif mid.startswith("ws_"):
             workshop_id = mid[3:]
+            url = (
+                "https://steamcommunity.com/sharedfiles/filedetails/"
+                f"?id={workshop_id}"
+            )
             db.upsert_mod_source_binding(
-                slug, mid, "workshop", workshop_id, "", 1, "stable_id", mod.version,
+                slug, mid, "workshop", workshop_id, url, 1, "stable_id", mod.version,
             )
             report["bound"].append({
                 "mod_id": mid, "name": mod.name, "source": "workshop",
                 "source_key": workshop_id, "confidence": 1, "match_method": "stable_id",
                 "current_version": mod.version, "latest_version": "",
-                "url": "",
+                "url": url,
             })
             notify(mod, "done")
         else:

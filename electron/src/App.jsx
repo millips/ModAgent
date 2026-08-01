@@ -4,6 +4,9 @@ import ChatPage from './components/ChatPage'
 import ModsPage from './components/ModsPage'
 import SnapshotsPage from './components/SnapshotsPage'
 import SettingsPage from './components/SettingsPage'
+import PSharePage from './components/PSharePage'
+import ReviewerConsole from './components/ReviewerConsole'
+import PShareActivationOverlay from './components/PShareActivationOverlay'
 import SetupPage from './components/SetupPage'
 import Toast from './components/Toast'
 import DownloadPanel from './components/DownloadPanel'
@@ -15,6 +18,8 @@ const API = typeof exposedApiBase === 'string' ? exposedApiBase : 'http://127.0.
 
 export default function App() {
   const [page, setPage] = useState('chat')
+  const [showPShareActivation, setShowPShareActivation] = useState(false)
+  const [reviewerAccess, setReviewerAccess] = useState({ allowed: false, loading: true })
   const [status, setStatus] = useState({ online: false, game: '', mods: null, snaps: null, game_root: '', game_slug: '', game_instance_id: '', bg: null })
   const [games, setGames] = useState([])
   const [configured, setConfigured] = useState(null)
@@ -72,6 +77,18 @@ export default function App() {
       if (timer) clearTimeout(timer)
     }
   }, [])
+
+  useEffect(() => {
+    let stale = false
+    window.modagent?.getReviewerAccess?.()
+      .then(result => { if (!stale) setReviewerAccess({ allowed: Boolean(result?.allowed), loading: false }) })
+      .catch(() => { if (!stale) setReviewerAccess({ allowed: false, loading: false }) })
+    return () => { stale = true }
+  }, [])
+
+  useEffect(() => {
+    if (page === 'reviewer' && !reviewerAccess.loading && !reviewerAccess.allowed) setPage('chat')
+  }, [page, reviewerAccess])
 
   const [refreshToggle, setRefreshToggle] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
@@ -218,14 +235,24 @@ export default function App() {
         <SetupPage onDone={() => setConfigured(true)} toast={toast} api={API} />
       ) : (
         <>
-          <Sidebar page={page} onNav={setPage} status={status} />
+          <Sidebar page={page} onNav={setPage} status={status} reviewerAllowed={reviewerAccess.allowed} />
           <main className="app-page-stage flex-1 overflow-hidden bg-surface-900">
             {status.online ? (
               <>
                 <div aria-hidden={page !== 'chat'} className={`app-page-layer ${page === 'chat' ? 'is-active' : ''}`}><ChatPage status={status} games={games} onGameChange={onGameChange} onGameImport={onGameImport} onGamesRefresh={refreshGames} toast={toast} api={API} onRefresh={doRefresh} /></div>
                 <div aria-hidden={page !== 'mods'} className={`app-page-layer ${page === 'mods' ? 'is-active' : ''}`}><ModsPage toast={toast} api={API} onRefresh={doRefresh} refreshKey={refreshKey} status={status} /></div>
                 <div aria-hidden={page !== 'snaps'} className={`app-page-layer ${page === 'snaps' ? 'is-active' : ''}`}><SnapshotsPage toast={toast} api={API} status={status} onRefresh={doRefresh} /></div>
-                <div aria-hidden={page !== 'settings'} className={`app-page-layer ${page === 'settings' ? 'is-active' : ''}`}><SettingsPage toast={toast} api={API} /></div>
+                <div aria-hidden={page !== 'settings'} className={`app-page-layer ${page === 'settings' ? 'is-active' : ''}`}><SettingsPage toast={toast} api={API} onStartSharePlan={(request) => {
+                  setPage('chat')
+                  window.dispatchEvent(new CustomEvent('modagent:share-plan', {
+                    detail: typeof request === 'string' ? { share: request } : request,
+                  }))
+                }} onPShareActivated={() => {
+                  setPage('pshare')
+                  setShowPShareActivation(true)
+                }} /></div>
+                <div aria-hidden={page !== 'pshare'} className={`app-page-layer ${page === 'pshare' ? 'is-active' : ''}`}><PSharePage toast={toast} /></div>
+                {reviewerAccess.allowed && <div aria-hidden={page !== 'reviewer'} className={`app-page-layer ${page === 'reviewer' ? 'is-active' : ''}`}><ReviewerConsole toast={toast} /></div>}
                 <div key={page} className={`app-page-atmosphere atmosphere-${page}`} aria-hidden="true" />
               </>
             ) : (
@@ -246,6 +273,7 @@ export default function App() {
         {toasts.map(t => <Toast key={t.id} {...t} />)}
       </div>
       {status.online && <DownloadPanel api={API} />}
+      {showPShareActivation && <PShareActivationOverlay onClose={() => setShowPShareActivation(false)} />}
     </div>
   )
 }

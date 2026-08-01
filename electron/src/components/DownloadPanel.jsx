@@ -75,7 +75,11 @@ export default function DownloadPanel({ api }) {
   }, [api])
 
   const items = state.items || []
-  const recent = items.length > 0 && (Date.now() / 1000 - (state.updated || 0) < 12)
+  // 来源对齐的结论已经在 Mod 管理页的 toast / 歧义确认面板中呈现，
+  // 完成后不再像下载任务一样保留 12 秒，避免右下角出现“已结束”残影。
+  const recent = !['source_align', 'update_check'].includes(state.task_kind)
+    && items.length > 0
+    && (Date.now() / 1000 - (state.updated || 0) < 12)
   if (dismissed || items.length === 0 || (!state.active && !recent)) return null
 
   const done = items.filter(i => ['done', 'cancelled'].includes(i.status)).length

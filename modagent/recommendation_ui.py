@@ -472,6 +472,60 @@ def _dependency_identity_matches(left: str, right: str) -> bool:
     )
 
 
+def _normalize_variants(source: str, item: dict, source_id: Any) -> list[dict]:
+    raw_variants = item.get("variants")
+    if not isinstance(raw_variants, list):
+        raw_variants = []
+    variants = []
+    seen = set()
+    for index, raw in enumerate(raw_variants):
+        if not isinstance(raw, dict):
+            continue
+        file_id = raw.get("file_id")
+        variant_id = _text(
+            raw.get("variant_id"),
+            f"{source}:{source_id}:{file_id if file_id not in (None, '') else index}",
+        )
+        if not variant_id or variant_id in seen:
+            continue
+        seen.add(variant_id)
+        variants.append({
+            "variant_id": variant_id[:180],
+            "file_id": file_id,
+            "name": _text(
+                raw.get("name") or raw.get("label") or raw.get("file_name"),
+                f"文件选项 {index + 1}",
+            )[:160],
+            "file_name": _text(raw.get("file_name"))[:220],
+            "version": _text(raw.get("version"))[:48],
+            "size_kb": raw.get("size_kb") or 0,
+            "description": _plain_detail(
+                raw.get("description"), raw.get("install_notes"),
+            )[:240],
+            "target_slot": _text(raw.get("target_slot"))[:120],
+            "is_primary": bool(raw.get("is_primary")),
+        })
+    if not variants and item.get("file_id") not in (None, ""):
+        variants.append({
+            "variant_id": f"{source}:{source_id}:{item.get('file_id')}",
+            "file_id": item.get("file_id"),
+            "name": _text(
+                item.get("file_name") or item.get("name"), "主文件",
+            )[:160],
+            "file_name": _text(item.get("file_name"))[:220],
+            "version": _text(
+                item.get("version") or item.get("latest_version"),
+            )[:48],
+            "size_kb": item.get("file_size_kb") or 0,
+            "description": "",
+            "target_slot": "",
+            "is_primary": True,
+        })
+    if variants and not any(variant.get("is_primary") for variant in variants):
+        variants[0]["is_primary"] = True
+    return variants
+
+
 def _normalize_item(source: str, item: dict, mod_loader: str = "") -> dict:
     dependencies = []
     for raw_dependencies in (
@@ -562,6 +616,10 @@ def _normalize_item(source: str, item: dict, mod_loader: str = "") -> dict:
         item.get("mod_id") or item.get("id") or item.get("full_name")
         or item.get("url") or ""
     )
+    variants = _normalize_variants(source, item, source_id)
+    selected_variant = next(
+        (variant for variant in variants if variant.get("is_primary")), None,
+    )
     # Keep open-source discovery visible, but only authoritative detail or
     # catalogue evidence may cross into an executable install plan.
     installable = (
@@ -613,6 +671,15 @@ def _normalize_item(source: str, item: dict, mod_loader: str = "") -> dict:
         "source_label": SOURCE_LABELS.get(source, source),
         "source_id": str(source_id),
         "mod_id": item.get("mod_id"),
+        "file_id": (
+            selected_variant.get("file_id") if selected_variant
+            else item.get("file_id")
+        ),
+        "variants": variants,
+        "selected_variant_id": (
+            selected_variant.get("variant_id") if selected_variant else ""
+        ),
+        "variant_selection_required": len(variants) > 1,
         "name": _text(item.get("name") or item.get("full_name"), "未命名 Mod")[:120],
         "localized_name": _text(item.get("localized_name"))[:80],
         "content": _text(content, MISSING_CONTENT_TEXT)[:280],
@@ -1105,6 +1172,10 @@ def normalize_recommendations(
             item["selection_key"] for item in items if item["default_selected"]
         ],
         "wanted_keys": [],
+        "selected_variants": {
+            item["selection_key"]: item.get("selected_variant_id")
+            for item in items if item.get("selected_variant_id")
+        },
         "dependency_requirements": dependency_requirements,
         "sources_failed": payload.get("sources_failed") or {},
         "note": _text(payload.get("note")),
@@ -1208,11 +1279,26 @@ def promote_verified_recommendation(
             wanted_keys.append(promoted_key)
 
     valid_keys = {item.get("selection_key") for item in items}
+    previous_variants = payload.get("selected_variants") or {}
+    selected_variants = {}
+    for item in items:
+        key = item.get("selection_key")
+        variants = item.get("variants") or []
+        valid_variant_ids = {
+            _text(variant.get("variant_id"))
+            for variant in variants if isinstance(variant, dict)
+        }
+        preferred = _text(previous_variants.get(key))
+        if preferred not in valid_variant_ids:
+            preferred = _text(item.get("selected_variant_id"))
+        if preferred in valid_variant_ids:
+            selected_variants[key] = preferred
     result = {
         **payload,
         "items": items,
         "selected_keys": [key for key in selected_keys if key in valid_keys],
         "wanted_keys": [key for key in wanted_keys if key in valid_keys],
+        "selected_variants": selected_variants,
         "dependency_requirements": dependency_requirements,
     }
     result["verification"] = {
@@ -1407,6 +1493,23 @@ def merge_recommendation_resolution(
 
     items.sort(key=lambda item: 0 if item.get("is_prerequisite") else 1)
     valid_keys = {item.get("selection_key") for item in items}
+    previous_variants = payload.get("selected_variants") or {}
+    incoming_variants = resolved_payload.get("selected_variants") or {}
+    selected_variants = {}
+    for item in items:
+        key = item.get("selection_key")
+        variants = item.get("variants") or []
+        valid_variant_ids = {
+            _text(variant.get("variant_id"))
+            for variant in variants if isinstance(variant, dict)
+        }
+        preferred = _text(
+            incoming_variants.get(key) or previous_variants.get(key)
+        )
+        if preferred not in valid_variant_ids:
+            preferred = _text(item.get("selected_variant_id"))
+        if preferred in valid_variant_ids:
+            selected_variants[key] = preferred
     result = {
         **payload,
         "items": items,
@@ -1416,6 +1519,7 @@ def merge_recommendation_resolution(
         "wanted_keys": [
             key for key in wanted_keys if key in valid_keys
         ],
+        "selected_variants": selected_variants,
         "dependency_requirements": requirements,
         "planned_dependency_keys": sorted(planned_keys),
         "resolution_refresh": {

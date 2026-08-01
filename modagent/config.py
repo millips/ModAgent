@@ -66,6 +66,9 @@ class Config:
     tavily_api_key: str = ""
     workshop_dir: str = ""
     recommendation_limit: int = 10
+    # GitHub Raw index for reviewed ma-xxxxxx collections. Kept configurable
+    # for a future repository move without changing shipped clients.
+    official_share_index_url: str = "https://raw.githubusercontent.com/millips/ModAgent-Share/main/index.json"
     manual_games: list[dict] = field(default_factory=list)
     # Per-game Vortex/MO2/Fluffy/custom mod roots.
     manual_mod_dirs: dict[str, list[str]] = field(default_factory=dict)

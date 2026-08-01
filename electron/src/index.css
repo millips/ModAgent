@@ -3514,3 +3514,62 @@ body[data-ma-theme="tactical"] .pro-recommendation-header::after {
     display: none;
   }
 }
+
+/* P Share creator activation: fixed, self-contained, and intentionally independent
+   of the regular page grid so a narrow or restored window never crops the ceremony. */
+.p-share-activation-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 110;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: clamp(16px, 4vw, 48px);
+  background: radial-gradient(circle at 50% 26%, rgba(0, 212, 255, .18), transparent 38%), rgba(3, 9, 18, .91);
+  backdrop-filter: blur(14px);
+}
+.p-share-activation-panel {
+  width: min(92vw, 660px);
+  max-height: min(90vh, 720px);
+  overflow: auto;
+  padding: clamp(24px, 5vw, 48px);
+  text-align: center;
+  border: 1px solid rgba(70, 220, 255, .36);
+  border-radius: 28px;
+  background: linear-gradient(145deg, rgba(11, 28, 50, .98), rgba(5, 13, 27, .98));
+  box-shadow: 0 0 0 1px rgba(255,255,255,.04) inset, 0 28px 90px rgba(0,0,0,.54), 0 0 80px rgba(0, 212, 255, .14);
+}
+.p-share-core {
+  position: relative;
+  width: clamp(146px, 28vw, 236px);
+  aspect-ratio: 1;
+  margin: 0 auto 26px;
+  display: grid;
+  place-items: center;
+}
+.p-share-core::before {
+  content: '';
+  position: absolute;
+  inset: 26%;
+  border-radius: 50%;
+  background: radial-gradient(circle, #c9f8ff 0, #3bddff 18%, #1175d1 47%, rgba(11, 53, 114, .12) 70%, transparent 72%);
+  box-shadow: 0 0 24px #00d4ff, 0 0 70px rgba(0,212,255,.7);
+  animation: p-share-pulse 2.5s ease-in-out infinite;
+}
+.p-share-core-ring { position: absolute; inset: 5%; border: 1px solid rgba(103,232,249,.68); border-radius: 50%; }
+.p-share-core-ring-a { border-left-color: transparent; border-right-color: transparent; transform: rotate(-22deg) scaleX(1.35); animation: p-share-orbit 6s linear infinite; }
+.p-share-core-ring-b { inset: 16%; border-top-color: transparent; transform: rotate(58deg) scaleY(.62); animation: p-share-orbit 4.2s linear infinite reverse; }
+.p-share-core-star { position: absolute; width: 8px; height: 8px; border-radius: 99px; background: #dffcff; box-shadow: 0 0 13px 4px #3be7ff; }
+.p-share-core-star-a { top: 11%; left: 20%; animation: p-share-float 1.8s ease-in-out infinite; }
+.p-share-core-star-b { right: 16%; bottom: 18%; animation: p-share-float 2.1s ease-in-out .4s infinite reverse; }
+.p-share-core-nucleus { position: relative; z-index: 1; color: #062f56; filter: drop-shadow(0 0 8px white); }
+.p-share-kicker { color: #55e6ff; font-size: 11px; letter-spacing: .28em; font-weight: 700; }
+.p-share-activation-copy h2 { margin: 9px 0; color: #fff; font-size: clamp(24px, 4vw, 34px); font-weight: 700; }
+.p-share-activation-copy p { margin: 0 auto; max-width: 450px; color: #9eb3c7; font-size: 14px; line-height: 1.75; }
+.p-share-activation-safe { display: inline-flex; align-items: center; gap: 7px; margin-top: 18px; color: #a8dce4; font-size: 12px; }
+.p-share-enter { margin-top: 28px; min-width: min(100%, 260px); display: inline-flex; justify-content: center; align-items: center; gap: 8px; }
+@keyframes p-share-orbit { to { transform: rotate(338deg) scaleX(1.35); } }
+@keyframes p-share-pulse { 50% { transform: scale(1.13); filter: brightness(1.22); } }
+@keyframes p-share-float { 50% { transform: translateY(-9px) scale(1.25); opacity: .72; } }
+@media (max-height: 600px) { .p-share-activation-panel { padding: 20px; } .p-share-core { width: 132px; margin-bottom: 14px; } .p-share-enter { margin-top: 18px; } }
+@media (prefers-reduced-motion: reduce) { .p-share-core::before, .p-share-core-ring, .p-share-core-star { animation: none !important; } }

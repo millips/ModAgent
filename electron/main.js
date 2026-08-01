@@ -5,6 +5,7 @@ const {
 const { spawn, exec } = require('child_process');
 const path = require('path');
 const http = require('http');
+const https = require('https');
 const crypto = require('crypto');
 const os = require('os');
 const fs = require('fs');
@@ -24,7 +25,10 @@ const IS_SMOKE_TEST = process.argv.includes('--smoke-test');
 // created, which is unrelated to the packaged app's backend/renderer health.
 // Keep normal launches hardware accelerated and make only smoke mode headless-
 // environment safe.
-if (IS_SMOKE_TEST) app.disableHardwareAcceleration();
+if (IS_SMOKE_TEST) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch('disable-gpu');
+}
 // ModAgent's startup cue is part of the desktop shell, not page media. Allow it
 // to begin as soon as the renderer is ready; the renderer still retries safely
 // on the first gesture if a device is temporarily unavailable.
@@ -37,6 +41,14 @@ const APP_USER_DATA = IS_SMOKE_TEST && process.env.MODAGENT_USER_DATA_DIR
   : path.join(app.getPath('appData'), IDENTITY.userDataFolder);
 const TRUSTED_EXTERNAL_HOSTS = new Set([
   'www.nexusmods.com',
+  'steamcommunity.com',
+  'www.steamcommunity.com',
+  'thunderstore.io',
+  'www.thunderstore.io',
+  'gamebanana.com',
+  'www.gamebanana.com',
+  'moddb.com',
+  'www.moddb.com',
   'app.tavily.com',
   'platform.deepseek.com',
   'platform.openai.com',
@@ -47,6 +59,7 @@ const TRUSTED_EXTERNAL_HOSTS = new Set([
   'ifdian.net',
   'www.ifdian.net',
 ]);
+const REVIEWER_LOGINS = new Set(['millips']);
 
 async function openTrustedExternal(rawUrl) {
   try {
@@ -113,6 +126,62 @@ const gotSingleInstanceLock = app.requestSingleInstanceLock({ edition: APP_EDITI
 if (!gotSingleInstanceLock) {
   if (IS_SMOKE_TEST) process.exitCode = 1;
   app.quit();
+}
+
+function getReviewerAccess() {
+  if (APP_EDITION !== 'subscription') {
+    return Promise.resolve({ allowed: false, reason: 'reviewer_requires_p_edition' });
+  }
+  return new Promise(resolve => {
+    const child = spawn('gh', ['api', 'user', '--jq', '.login'], { windowsHide: true });
+    let stdout = '';
+    const timeout = setTimeout(() => {
+      try { child.kill(); } catch (_) {}
+    }, 5000);
+    child.stdout.on('data', value => { stdout = (stdout + String(value || '')).slice(-256); });
+    child.on('error', () => {
+      clearTimeout(timeout);
+      resolve({ allowed: false, reason: 'github_cli_unavailable' });
+    });
+    child.on('close', code => {
+      clearTimeout(timeout);
+      const login = String(stdout || '').trim().toLowerCase();
+      resolve({
+        allowed: code === 0 && REVIEWER_LOGINS.has(login),
+        login: login || '',
+        reason: code === 0 ? 'not_an_authorized_reviewer' : 'github_login_required',
+      });
+    });
+  });
+}
+
+function fetchPublicGitHubIssue(issueNumber) {
+  return new Promise((resolve, reject) => {
+    const request = https.get({
+      hostname: 'api.github.com',
+      path: `/repos/millips/ModAgent-Share/issues/${issueNumber}`,
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': `${IDENTITY.productName} p-share-status`,
+      },
+    }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', value => { body = (body + value).slice(-512000); });
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          try { resolve(JSON.parse(body)); } catch (_) { reject(new Error('GitHub 返回了无法解析的 Issue 数据')); }
+          return;
+        }
+        const hint = response.statusCode === 403
+          ? 'GitHub 403：公开 API 可能限流，请稍后重试或直接打开 Issue 查看。'
+          : `GitHub ${response.statusCode || '请求失败'}`;
+        reject(new Error(hint));
+      });
+    });
+    request.setTimeout(15000, () => request.destroy(new Error('GitHub 请求超时，请稍后重试。')));
+    request.on('error', error => reject(error));
+  });
 }
 
 function findAvailableApiPort(preferredPort) {
@@ -485,6 +554,28 @@ ipcMain.handle('activate-p-license', (_, code) => {
   }
 });
 ipcMain.handle('open-external', (_, url) => openTrustedExternal(url));
+ipcMain.handle('read-submission-issue-from-clipboard', () => {
+  const text = String(clipboard.readText() || '').trim();
+  const match = text.match(/^https:\/\/github\.com\/millips\/ModAgent-Share\/issues\/(\d+)\/?$/i);
+  if (!match) {
+    return {
+      ok: false,
+      error: '剪贴板中没有 ModAgent-Share 的 Issue 地址。请在浏览器地址栏按 Ctrl+L、Ctrl+C 后重试。',
+    };
+  }
+  return { ok: true, url: `https://github.com/millips/ModAgent-Share/issues/${match[1]}` };
+});
+ipcMain.handle('get-reviewer-access', async () => getReviewerAccess());
+ipcMain.handle('sync-p-share-issue', async (_, rawUrl) => {
+  const match = String(rawUrl || '').trim().match(/^https:\/\/github\.com\/millips\/ModAgent-Share\/issues\/(\d+)\/?$/i);
+  if (!match) return { ok: false, error: '投稿链接必须是 ModAgent-Share 的 GitHub Issue 地址。' };
+  try {
+    const issue = await fetchPublicGitHubIssue(match[1]);
+    return { ok: true, issue };
+  } catch (error) {
+    return { ok: false, error: error.message || '无法读取 GitHub Issue。' };
+  }
+});
 ipcMain.handle('notify-reply-complete', () => {
   const licenseStatus = pLicenseStore.status();
   if (!canUsePBenefits(licenseStatus)) {
@@ -533,6 +624,143 @@ ipcMain.handle('select-mod-directory', async () => {
   });
   if (result.canceled || !result.filePaths.length) return null;
   return { path: path.resolve(result.filePaths[0]) };
+});
+ipcMain.handle('select-reviewer-repository', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择 ModAgent-Share 官方仓库的本地克隆目录',
+    properties: ['openDirectory'],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  const selected = path.resolve(result.filePaths[0]);
+  const publisher = path.join(selected, 'scripts', 'publish_collection.py');
+  const index = path.join(selected, 'index.json');
+  if (!fs.existsSync(publisher) || !fs.existsSync(index)) {
+    return { error: '所选目录不是包含 scripts/publish_collection.py 和 index.json 的 ModAgent-Share 仓库。' };
+  }
+  return { path: selected };
+});
+ipcMain.handle('select-reviewer-submission', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择已下载的 ModAgent 投稿 JSON',
+    filters: [{ name: 'ModAgent JSON', extensions: ['json'] }],
+    properties: ['openFile'],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  const selected = path.resolve(result.filePaths[0]);
+  try {
+    const stat = fs.statSync(selected);
+    if (stat.size > 1024 * 1024) return { error: '投稿 JSON 超过 1 MiB，已拒绝读取。' };
+    const text = fs.readFileSync(selected, 'utf8');
+    const manifest = JSON.parse(text);
+    return { path: selected, manifest };
+  } catch (error) {
+    return { error: `无法读取投稿 JSON：${error.message || String(error)}` };
+  }
+});
+ipcMain.handle('load-reviewer-issues', async () => {
+  const access = await getReviewerAccess();
+  if (!access.allowed) return { ok: false, error: '审核台仅对已登录的授权审核员开放。' };
+  const apiPath = '/repos/millips/ModAgent-Share/issues?state=open&per_page=100';
+  const parseIssues = (raw) => {
+    const issues = JSON.parse(String(raw || '[]'));
+    if (!Array.isArray(issues)) throw new Error('GitHub 返回的审核队列格式无效。');
+    return issues.filter(item => !item.pull_request);
+  };
+  const fromGhCli = () => new Promise((resolve, reject) => {
+    // Official reviewers normally already use `gh auth login`.  Going through
+    // gh keeps the OAuth token inside GitHub CLI instead of exposing it to the
+    // renderer or saving another secret in ModAgent.
+    const child = spawn('gh', ['api', '-H', 'Accept: application/vnd.github+json', apiPath], {
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', value => { stdout = (stdout + String(value || '')).slice(-512000); });
+    child.stderr.on('data', value => { stderr = (stderr + String(value || '')).slice(-8000); });
+    child.on('error', error => reject(new Error(`无法调用 GitHub CLI：${error.message || String(error)}`)));
+    child.on('close', code => {
+      if (code === 0) {
+        try { resolve(parseIssues(stdout)); } catch (error) { reject(error); }
+        return;
+      }
+      reject(new Error(stderr.trim() || `GitHub CLI 退出码 ${code}`));
+    });
+  });
+  const fromPublicApi = () => new Promise((resolve, reject) => {
+    const request = https.get({
+      hostname: 'api.github.com',
+      path: apiPath,
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': `${IDENTITY.productName} official-reviewer`,
+      },
+    }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', value => { body = (body + value).slice(-512000); });
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          try { resolve(parseIssues(body)); } catch (error) { reject(error); }
+          return;
+        }
+        const isRateLimited = response.statusCode === 403 && String(response.headers['x-ratelimit-remaining'] || '') === '0';
+        reject(new Error(isRateLimited
+          ? 'GitHub 公共 API 额度已用尽；请在本机完成一次 `gh auth login` 后重试。'
+          : `GitHub ${response.statusCode || '网络请求失败'}`));
+      });
+    });
+    request.setTimeout(15000, () => request.destroy(new Error('GitHub 请求超时')));
+    request.on('error', error => reject(new Error(`GitHub 网络请求失败：${error.message || String(error)}`)));
+  });
+  try {
+    return { ok: true, issues: await fromGhCli(), auth: 'gh' };
+  } catch (cliError) {
+    try {
+      return { ok: true, issues: await fromPublicApi(), auth: 'public' };
+    } catch (publicError) {
+      return {
+        ok: false,
+        error: `${publicError.message || String(publicError)}（CLI 回退信息：${cliError.message || String(cliError)}）`,
+      };
+    }
+  }
+});
+ipcMain.handle('reviewer-publish-collection', async (_, payload = {}) => {
+  const access = await getReviewerAccess();
+  if (!access.allowed) return { ok: false, error: '审核台仅对已登录的授权审核员开放。' };
+  const repository = path.resolve(String(payload.repository || ''));
+  const submission = path.resolve(String(payload.submissionPath || ''));
+  const issueUrl = String(payload.issueUrl || '').trim();
+  const publisher = path.join(repository, 'scripts', 'publish_collection.py');
+  if (!fs.existsSync(publisher) || !fs.existsSync(path.join(repository, 'index.json'))) {
+    return { ok: false, error: '审核仓库路径无效。请重新选择 ModAgent-Share 本地克隆目录。' };
+  }
+  if (!submission.toLowerCase().endsWith('.json') || !fs.existsSync(submission)) {
+    return { ok: false, error: '投稿 JSON 路径无效。' };
+  }
+  if (!/^https:\/\/github\.com\/millips\/ModAgent-Share\/issues\/\d+\/?$/i.test(issueUrl)) {
+    return { ok: false, error: 'Issue 链接必须属于 millips/ModAgent-Share。' };
+  }
+  const args = [publisher, '--submission', submission, '--issue-url', issueUrl];
+  if (payload.publish === true) args.push('--publish');
+  return await new Promise(resolve => {
+    const child = spawn('python', args, { cwd: repository, windowsHide: true });
+    let output = '';
+    const append = value => { output = (output + String(value || '')).slice(-64000); };
+    child.stdout.on('data', append);
+    child.stderr.on('data', append);
+    const timeout = setTimeout(() => {
+      try { child.kill(); } catch (_) {}
+    }, 120000);
+    child.on('error', error => {
+      clearTimeout(timeout);
+      resolve({ ok: false, error: `无法启动审核工具：${error.message || String(error)}` });
+    });
+    child.on('close', code => {
+      clearTimeout(timeout);
+      resolve({ ok: code === 0, code, output, error: code === 0 ? '' : '审核工具未通过校验或未能完成入库。' });
+    });
+  });
 });
 ipcMain.handle('select-game-executable', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {

@@ -127,6 +127,10 @@ def build_prompt(cfg):
     # appended so packaged fixes remain effective even when prompt.md was
     # created by an older release.
     body += RUNTIME_EXECUTION_POLICY
+    body += """
+30. **Official collection codes are a separate reviewed path.** When the user provides an `ma-xxxxxx` ModAgent collection code or asks to browse official collections, call `official_share_catalog` or `official_share_import` first. Explain the returned collection, already-installed matches, missing source/dependency items, warnings, and next action in a compact plan. If `host_dependency_requirements` contains any item, state that the prerequisite is pending host verification; never call the plan risk-free, fully closed, or action-free until that check has passed. Never substitute a broad recommendation search, never treat an official collection as already installed, and never install it without the normal confirmation and preflight checks.
+31. **Player share imports are also previews.** When a pasted ModAgent JSON/data/GitHub Raw/Gist share is provided, call `share_import` before searching. Preserve the share's explicit target list; do not add unrelated recommendations. Source resolution, dependencies, loader compatibility, conflicts, and duplicate detection still need verification before installation.
+"""
 
     # 把"当前游戏"做成对话的强制前提，放在最顶部
     if not cfg.game_root:

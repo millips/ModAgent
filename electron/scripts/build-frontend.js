@@ -36,6 +36,10 @@ function run() {
       env: {
         ...process.env,
         MODAGENT_EDITION: policy.edition,
+        // Keep the renderer marker in lockstep with electron-builder.  Without
+        // this, a beta build silently produced a stable dist and the identity
+        // guard correctly rejected the package as mixed-edition output.
+        MODAGENT_CHANNEL: process.env.MODAGENT_CHANNEL || 'stable',
       },
       stdio: 'inherit',
     })

@@ -37,11 +37,21 @@ cfg = types.SimpleNamespace(nexus_api_key="", game_slug="phasmophobia", game_id=
                             game_root=G, tier="free", chrome_cdp_port=18888)
 
 r = json.loads(tools.execute("mod_install_batch", {"mod_ids": ["101", "999", "102"]}, cfg))
-check("1 batch ran", r.get("total") == 3)
-check("1 2 ok 1 fail", r.get("succeeded") == 2 and r.get("failed") == 1)
-check("1 failure identified", any(x["mod_id"] == "999" and not x["ok"] for x in r["results"]))
+check("1 partial download blocks install",
+      r.get("status") == "download_incomplete" and r.get("install_blocked") is True)
+check("1 missing target identified",
+      r.get("total_selected") == 3
+      and r.get("ready") == 2
+      and any(x.get("mod_id") == "999" for x in r.get("missing", [])))
+check("1 no partial files landed",
+      not os.path.exists(os.path.join(G, "Mods", "ModA.dll"))
+      and not os.path.exists(os.path.join(G, "Mods", "ModB.dll")))
+check("1 no snapshot on blocked batch", len(db.list_snapshots("phasmophobia")) == 0)
 
-# 2. 文件真实落位
+# 2. 所有选中项都具备下载包后才允许一次性安装
+r = json.loads(tools.execute("mod_install_batch", {"mod_ids": ["101", "102"]}, cfg))
+check("2 batch ran", r.get("total") == 2)
+check("2 all installed", r.get("succeeded") == 2 and r.get("failed") == 0)
 check("2 files landed", os.path.exists(os.path.join(G, "Mods", "ModA.dll"))
       and os.path.exists(os.path.join(G, "Mods", "ModB.dll")))
 

@@ -1,6 +1,8 @@
 import React from 'react'
-import { MessageSquare, Package, Camera, Settings, Wifi, WifiOff, RefreshCw } from 'lucide-react'
+import { MessageSquare, Package, Camera, Settings, Sparkles, ShieldCheck, Wifi, WifiOff, RefreshCw } from 'lucide-react'
 import { SidebarEditionAddon, SidebarNavArtwork } from '@edition'
+import { usePLicenseStatus, isPAccessEnabled } from '../license/pLicense'
+import { usePShareProfile } from '../pshare/pShareStore'
 
 const NAV = [
   { id: 'chat', label: '对话', icon: MessageSquare },
@@ -9,7 +11,12 @@ const NAV = [
   { id: 'settings', label: '设置', icon: Settings },
 ]
 
-export default function Sidebar({ page, onNav, status }) {
+export default function Sidebar({ page, onNav, status, reviewerAllowed = false }) {
+  const pLicense = usePLicenseStatus()
+  const pShareProfile = usePShareProfile()
+  const navItems = __MODAGENT_SUBSCRIPTION__ && isPAccessEnabled(pLicense) && pShareProfile
+    ? [...NAV, { id: 'pshare', label: 'P Share', icon: Sparkles }, ...(reviewerAllowed ? [{ id: 'reviewer', label: '审核台', icon: ShieldCheck }] : [])]
+    : NAV
   const connecting = !status.online && status.mods == null && status.snaps == null
   return (
     <aside className="app-sidebar w-52 min-w-[208px] bg-surface-800 border-r border-surface-600 flex flex-col">
@@ -22,10 +29,11 @@ export default function Sidebar({ page, onNav, status }) {
       </div>
 
       <nav className="flex-1 p-2 flex flex-col gap-0.5">
-        {NAV.map(n => (
+        {navItems.map(n => (
           <button
             key={n.id}
             onClick={() => onNav(n.id)}
+            title={n.label}
             className={`nav-item flex items-center gap-3 px-3 py-2.5 rounded-md text-sm transition-all duration-150
               ${page === n.id
                 ? 'nav-item-active bg-cyber-blue/15 text-cyber-cyan border border-cyber-cyan/20'

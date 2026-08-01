@@ -75,6 +75,8 @@ PROMPT_REFERENCED_TOOLS = {
     "snapshot_create", "snapshot_restore", "snapshot_list", "snapshot_delete", "conflict_check",
     "list_local_mods", "tool_extract",
     "get_installed", "read_readme", "game_diagnose", "game_file_check",
+    "share_export", "share_import",
+    "official_share_catalog", "official_share_import",
     "stardew_smapi_status", "mod_patch", "game_config_write",
     "scan_games", "scan_existing_mods", "import_existing_mods",
     "collection_view", "download_from_url", "thunderstore_search",
@@ -612,6 +614,7 @@ def list_mods(game_slug: str = ""):
         "source_url": (bindings.get(str(m.id)) or {}).get("source_url", ""),
         "source_match_method": (bindings.get(str(m.id)) or {}).get("match_method", ""),
         "source_confidence": (bindings.get(str(m.id)) or {}).get("confidence", 0),
+        "dependencies": db.parse_dependencies(m.dependencies),
         **package_shape(m),
     } for m in mods]
 

@@ -1,11 +1,12 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, RotateCcw, Search, RefreshCw, Zap, Shield, AlertTriangle, Plus, Trash2, PenLine, MessageSquare, PanelLeftClose, PanelLeft, Copy, Undo2, Square, Reply, Check, X, Bug, FolderPlus, FolderOpen, FileType2, Clock3 } from 'lucide-react'
+import { Send, RotateCcw, Search, RefreshCw, Zap, Shield, AlertTriangle, Plus, Trash2, PenLine, MessageSquare, PanelLeftClose, PanelLeft, Copy, Undo2, Square, Reply, Check, X, Bug, FolderPlus, FolderOpen, FileType2, Clock3, Download } from 'lucide-react'
 import PlanCard from './PlanCard'
 import DebugPanel from './DebugPanel'
 import { getManualActionQuickReply } from './chatQuickReplies.mjs'
 import { hasSameRecommendation } from './recommendationRecovery.mjs'
 import { emitFeedback, emitToolFeedback, emitToolStartFeedback } from '../feedback/feedbackBus'
 import { ChatEditionMessage } from '@edition'
+import CommunityImportDialog from './CommunityImportDialog'
 
 // 有副作用的工具(装/卸/下/改文件/动快照)。重新生成时把已完成项传给后端；
 // 后端强制只读生成，副作用不重放、也不撤销。
@@ -377,6 +378,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     game_slug: '',
   })
   const [devOpen, setDevOpen] = useState(false)
+  const [communityImportOpen, setCommunityImportOpen] = useState(false)
   const bottomRef = useRef(null)
   const autoScrollSignatureRef = useRef('')
   const abortRef = useRef(null)
@@ -396,6 +398,26 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     query.addEventListener('change', handleCompactChange)
     return () => query.removeEventListener('change', handleCompactChange)
   }, [])
+
+  useEffect(() => {
+    const handleSharePlanRequest = event => {
+      const share = String(event.detail?.share || '').trim()
+      const officialCode = String(event.detail?.shareId || '').trim()
+      if (officialCode) {
+        setInput(
+          `请读取并核验官方 ModAgent 合集 ${officialCode}，先输出明确的安装计划、已安装项、缺失依赖和风险；不要直接安装。`
+        )
+        toast('官方合集已带入聊天，请确认后发送以生成安装计划。')
+      } else if (share) {
+        setInput(
+          '请导入并核验以下 ModAgent 分享配置，先输出明确的安装计划、已安装项、缺失依赖和风险；不要直接安装：\n' + share
+        )
+        toast('分享配置已带入聊天，请确认后发送以生成安装计划。')
+      }
+    }
+    window.addEventListener('modagent:share-plan', handleSharePlanRequest)
+    return () => window.removeEventListener('modagent:share-plan', handleSharePlanRequest)
+  }, [toast])
 
   const mkId = () => `m${Date.now()}_${++idRef.current}`
 
@@ -811,11 +833,17 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     }
   }
 
-  const updateEditionSelection = (message, selectedKeys, wantedKeys = message.payload.wanted_keys || []) => {
+  const updateEditionSelection = (
+    message,
+    selectedKeys,
+    wantedKeys = message.payload.wanted_keys || [],
+    selectedVariants = message.payload.selected_variants || {},
+  ) => {
     const payload = {
       ...message.payload,
       selected_keys: selectedKeys,
       wanted_keys: wantedKeys,
+      selected_variants: selectedVariants,
     }
     setMessages(prev => prev.map(item => item.id === message.id ? { ...item, payload } : item))
     persistEditionState(activeSession, payload)
@@ -1023,13 +1051,35 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             if (data.tool_result) {
               curAgentId = null
               const tr = data.tool_result
+              const terminalSelectionStatuses = new Set([
+                'manual_action_required',
+                'partial_manual_action_required',
+                'partial_failure',
+                'failed',
+                'cancelled',
+                'dependency_blocked',
+                'missing_dependencies',
+                'download_incomplete',
+                'variant_selection_required',
+                'invalid_request',
+                'exact_batch_required',
+              ])
               if (tr.ok && REFRESH_AFTER_SUCCESS_TOOLS.has(tr.name)) {
                 onRefresh?.()
               }
               if (
                 options.selectionAction === 'confirm'
                 && ['mod_download', 'batch_download', 'mod_install', 'mod_install_batch', 'mod_install_custom'].includes(tr.name)
-                && !tr.ok
+                && (
+                  !tr.ok
+                  || tr.install_blocked
+                  || terminalSelectionStatuses.has(tr.status)
+                  || (
+                    tr.name === 'mod_install_batch'
+                    && tr.status === 'completed'
+                    && tr.all_selected_installed !== true
+                  )
+                )
               ) {
                 executionFailed = true
               }
@@ -1196,7 +1246,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           <ChatEditionMessage
             message={msg}
             disabled={loading}
-            onChange={(selectedKeys, wantedKeys) => updateEditionSelection(msg, selectedKeys, wantedKeys)}
+            onChange={(selectedKeys, wantedKeys, selectedVariants) => (
+              updateEditionSelection(msg, selectedKeys, wantedKeys, selectedVariants)
+            )}
             onSubmit={selectedItems => submitEditionSelection(msg, selectedItems)}
             onResolve={(item, action) => resolveEditionItem(msg, item, action)}
             onResolveWanted={items => resolveWantedItems(msg, items)}
@@ -1759,8 +1811,34 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             else { emitFeedback('snapshot-complete', { snapshotId: data.snapshot_id }); toast('快照已创建: ' + (data.snapshot_id || '')); onRefresh?.() }
           } catch (e) { emitFeedback('error', { source: 'snapshot' }); toast('快照失败', 'error') }
         }}><Shield size={14}/> 创建快照</button>
+        <button
+          disabled={!status.online || loading}
+          className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait"
+          onClick={() => setCommunityImportOpen(true)}
+          title="输入审核通过的 ma 合集码，或粘贴私人分享 JSON；会先核验而不会自动安装"
+        ><Download size={14}/> 导入社区合集</button>
       </div>
       <DebugPanel api={api} open={devOpen} onClose={() => setDevOpen(false)} />
+
+      {communityImportOpen && (
+        <CommunityImportDialog
+          api={api}
+          toast={toast}
+          onClose={() => setCommunityImportOpen(false)}
+          onPlan={request => {
+            const prerequisiteOnly = request.action === 'prerequisite_plan'
+            const prompt = request.type === 'official'
+              ? prerequisiteOnly
+                ? `请读取官方 ModAgent 合集 ${request.shareId}，只检查并补齐其未确认的基础环境/外部前置：先核验本机是否存在、版本是否满足；缺失时说明用途、来源和补齐方案，生成可确认的前置安装计划。不得安装主体 Mod，不得给出无风险或依赖已闭环的结论。`
+                : `请读取官方 ModAgent 合集 ${request.shareId}，直接生成主体 Mod 的可确认安装计划：保留合集目标，不得搜索或推荐额外 Mod；清楚列出已安装项、更新项、冲突、风险和最终需要写入的项目；不要直接安装。`
+              : prerequisiteOnly
+                ? `请导入以下 ModAgent 分享配置，只检查并补齐其未确认的基础环境/外部前置；不得安装主体 Mod：\n${request.share}`
+                : `请导入以下 ModAgent 分享配置，直接生成主体 Mod 的可确认安装计划；不要搜索或推荐额外 Mod，也不要直接安装：\n${request.share}`
+            toast(prerequisiteOnly ? '正在检查前置并生成补齐计划。' : '正在生成安装计划。')
+            sendMsg(prompt)
+          }}
+        />
+      )}
 
       {gameImportOpen && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[70]" onClick={() => !gameImportBusy && setGameImportOpen(false)}>

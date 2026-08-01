@@ -56,6 +56,17 @@ try {
   const log = fs.readFileSync(logPath, 'utf8')
   assert(log.includes('ModAgent API ready'), 'Backend health check was not observed')
   assert(log.includes('Packaged smoke test passed'), 'Smoke-test success marker missing')
+  // `did-finish-load` can still fire after a top-level React exception, leaving a
+  // visually blank window. Treat renderer console errors as a failed package.
+  const rendererErrors = log
+    .split(/\r?\n/)
+    .filter(line => line.includes('Renderer console'))
+    .filter(line => /\b(?:Uncaught|ReferenceError|TypeError|SyntaxError)\b/.test(line))
+  assert.strictEqual(
+    rendererErrors.length,
+    0,
+    `Renderer emitted console errors during packaged smoke test:\n${rendererErrors.join('\n')}`,
+  )
   const invalidUtf8Lines = log
     .split(/\r?\n/)
     .filter(line => line.includes('\uFFFD'))

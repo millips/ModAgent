@@ -35,6 +35,7 @@ def add(mid, name, version="unknown", files=None):
 add("local_repolib", "REPOLib")
 add("local_pickup", "PickupSound", "1.0.3")
 add("local_map", "Map Value Tracker Plus", "1.0.3")
+add("ws_123456789", "Workshop Sample", "2.0")
 
 packages = [
     {
@@ -82,9 +83,14 @@ cfg = types.SimpleNamespace(
 try:
     aligned = source_alignment.align_installed_mods(cfg)
     bound_ids = {item["mod_id"] for item in aligned["bound"]}
-    assert {"local_repolib", "local_pickup"} <= bound_ids
+    assert {"local_repolib", "local_pickup", "ws_123456789"} <= bound_ids
     assert db.get_mod_source_binding("local_repolib", "repo")["source_key"] == "Zehs-REPOLib"
     assert db.get_mod_source_binding("local_pickup", "repo")["latest_version"] == "1.0.4"
+    workshop_binding = db.get_mod_source_binding("ws_123456789", "repo")
+    assert workshop_binding["source_url"] == (
+        "https://steamcommunity.com/sharedfiles/filedetails/?id=123456789"
+    )
+    assert source_alignment.alignment_pending_mods(cfg, mod_ids=["ws_123456789"]) == []
 
     candidate = {
         "source_key": "Tansinator-MapValueTracker",

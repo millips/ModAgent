@@ -23,6 +23,8 @@ from . import stardew
 from . import web_agent
 from .inventory_match import find_installed_duplicate
 from . import task_control
+from . import share_config
+from . import official_shares
 
 
 _DOWNLOAD_PHASE_LABELS = {
@@ -422,16 +424,26 @@ def build_tools_definitions(tier: str) -> list[dict]:
             "nexus_slug": {"type": "string", "description": "可选；使用 nexus_search 返回的来源 slug，例如 site"},
             "file_id": {"type": "integer", "description": "可选。当 mod 有多个 MAIN 变体时，指定要下载的变体 file_id"}},
            ["mod_id"]),
-        _t("batch_download", "批量下载多个 Mod，顺序执行逐一回报进度。",
+        _t("batch_download", "批量下载多个 Mod，按用户已选的精确文件顺序执行并逐一回报进度；同一 file_id/variant_id 只执行一次。",
            {"mods": {"type": "array", "items": {"type": "object", "properties": {
                "mod_id": {"type": "integer"}, "file_id": {"type": "integer"},
+               "variant_id": {"type": "string"}, "variant_name": {"type": "string"},
+               "file_name": {"type": "string"}, "target_slot": {"type": "string"},
                "mod_name": {"type": "string"}, "version": {"type": "string"}},
-               "required": ["mod_id", "file_id", "mod_name", "version"]}}},
+               "required": ["mod_id"]}}},
            ["mods"]),
-        _t("mod_install_batch", "批量安装多个已下载的 Mod(整批共享一张安装前快照,单个失败不影响其余)。要装多个 mod 时【必须】用本工具而不是连续调用 mod_install——单轮工具调用有次数上限,连发会被截断。",
-           {"mod_ids": {"type": "array", "items": {"type": "string"},
-                        "description": "要安装的 mod id 列表(与 mod_install 的 mod_id 同规则)"}},
-           ["mod_ids"]),
+        _t("mod_install_batch", "批量安装已精确下载的 Mod。优先传 items（含 mod_id/file_id/variant_id/local_path）；只有所有选中项的压缩包都存在时才创建共享快照并安装。单个失败不伪报整批成功。",
+           {
+               "items": {"type": "array", "items": {"type": "object", "properties": {
+                   "mod_id": {"type": "string"}, "file_id": {"type": "integer"},
+                   "variant_id": {"type": "string"}, "variant_name": {"type": "string"},
+                   "file_name": {"type": "string"}, "target_slot": {"type": "string"},
+                   "local_path": {"type": "string"},
+               }, "required": ["mod_id"]}},
+               "mod_ids": {"type": "array", "items": {"type": "string"},
+                           "description": "兼容旧调用；新流程请传 items"},
+           },
+           []),
         _t("mod_install", "安装已下载的 Mod 到游戏目录。先走游戏特化规则，再走可识别的通用加载器规则；若两者都无法安全落位，会返回 installation_guidance_required，并附包内文件树、README/INSTALL 和来源页证据，供你生成显式 mapping 后改用 mod_install_custom，禁止原样盲目重试。只需 mod_id：local_path 不传会自动按 mod_id 找已下载的压缩包，snapshot_id 不传会自动建安装前快照。安装多个请改用 mod_install_batch。",
            {"mod_id": {"type": "integer"},
             "local_path": {"type": "string", "description": "可选，已下载的 zip 路径；不传则自动按 mod_id 查找"},
@@ -583,6 +595,23 @@ def build_tools_definitions(tier: str) -> list[dict]:
            {}, []),
         _t("get_installed", "列出当前游戏已安装的所有 Mod。",
            {}, []),
+        _t("share_export", "Export selected installed Mods as a privacy-safe creator submission JSON. It can contain a title, description, warning, anonymous display name, stable verified source references, dependency IDs, enabled state and load order. Never exports game paths, installed file paths, API keys, or config file contents. When require_verified_sources is true, refuse a submission with unaligned Mods.",
+           {"selected_mod_ids": {"type": "array", "description": "Optional local Mod IDs to export; omit only for a private full-inventory backup."},
+            "title": {"type": "string", "description": "Creator-facing collection title."},
+            "description": {"type": "string", "description": "Creator-facing collection description."},
+            "warning": {"type": "string", "description": "Optional compatibility or safety warning."},
+            "author_name": {"type": "string", "description": "Optional public display name; never use a License ID."},
+            "require_verified_sources": {"type": "boolean", "description": "Refuse export unless every selected Mod has a verified source binding."},
+            "author_note": {"type": "string", "description": "Optional note shown to recipients."},
+            "include_snapshots": {"type": "boolean", "description": "Include snapshot metadata only; never include snapshot files."},
+            "include_config_metadata": {"type": "boolean", "description": "Reserve configuration metadata; config contents are never exported automatically."}}, []),
+        _t("share_import", "Parse a pasted ModAgent share JSON, offline share link, GitHub Raw link, or Gist Raw link and return a reviewable installation preview. This tool NEVER installs, writes files, changes enabled state, or trusts dependencies without normal verification. Use it before preparing the normal installation plan.",
+           {"share": {"type": "string", "description": "Pasted JSON, data: offline link, raw.githubusercontent.com link, or gist.githubusercontent.com link."}}, ["share"]),
+        _t("official_share_catalog", "Browse/search the reviewed official ModAgent collection library. Official collections have stable ma-xxxxxx IDs and are loaded from the project's GitHub Raw index. The list is read-only and does not install anything.",
+           {"query": {"type": "string", "description": "Optional title, tag, or collection ID search."},
+            "all_games": {"type": "boolean", "description": "When true, do not filter by the currently selected game."}}, []),
+        _t("official_share_import", "Open a reviewed official ma-xxxxxx collection and return its verification/install-plan preview. This NEVER installs automatically; normal source, dependency, conflict, loader, duplicate, and game compatibility checks remain mandatory.",
+           {"share_id": {"type": "string", "description": "Official collection code, for example ma-repo-000001."}}, ["share_id"]),
         _t("game_file_check", "只读诊断:检查游戏目录内某文件/文件夹是否存在,返回大小与修改时间;"
            "对文本文件可读取末尾若干行(如查看 SB/Binaries/Win64/ue4ss/UE4SS.log 判断 UE4SS 是否被游戏加载)。"
            "path 为相对游戏根目录的路径,禁止越界。",
@@ -1779,6 +1808,8 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     if human_gate else "retryable_automation_error"
                 ),
                 "mod_id": _mid,
+                "file_id": args.get("file_id"),
+                "nexus_slug": nexus_slug,
                 "page_url": e.page_url,
                 "message": str(e),
                 "observed_reason": e.reason,
@@ -1817,6 +1848,37 @@ def execute(name: str, args: dict, cfg: Config) -> str:
     # T05
     elif name == "batch_download":
         requested_mods = args.get("mods", [])
+        if not isinstance(requested_mods, list) or not requested_mods:
+            return json.dumps({
+                "error": "请提供 mods 列表",
+                "status": "invalid_request",
+            }, ensure_ascii=False)
+        # 用户选择的是“精确文件”，而不是模糊的 Mod 名称。同一稳定身份
+        # 在一轮中只能执行一次，避免批量链和模型重排产生重复下载。
+        mods_deduped = []
+        duplicate_requests = []
+        seen_downloads = set()
+        for raw in requested_mods:
+            if not isinstance(raw, dict) or raw.get("mod_id") in (None, ""):
+                continue
+            item = dict(raw)
+            item["mod_id"] = str(item["mod_id"])
+            identity = (
+                item["mod_id"],
+                str(item.get("file_id") or ""),
+                str(item.get("variant_id") or ""),
+            )
+            if identity in seen_downloads:
+                duplicate_requests.append({
+                    "mod_id": item["mod_id"],
+                    "file_id": item.get("file_id"),
+                    "variant_id": item.get("variant_id"),
+                    "reason": "duplicate_stable_identity",
+                })
+                continue
+            seen_downloads.add(identity)
+            mods_deduped.append(item)
+        requested_mods = mods_deduped
         preflight = _refresh_local_inventory(cfg)
         skipped_installed = []
         blocked_dependencies = []
@@ -1868,84 +1930,114 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         } for m in mods])
 
         manual_action = []
+        cancelled = False
 
         async def _batch():
+            nonlocal cancelled
             for m in mods:
+                try:
+                    task_control.raise_if_cancelled()
+                    if progress.is_cancel_requested():
+                        raise task_control.TaskCancelled("用户已停止本轮批量下载")
+                except task_control.TaskCancelled as exc:
+                    cancelled = True
+                    failed.append({
+                        "mod_id": m.get("mod_id"),
+                        "status": "cancelled",
+                        "error": str(exc),
+                        "retryable": False,
+                    })
+                    break
                 mid = m["mod_id"]
                 _publish_download_phase(mid, "preparing")
-                for attempt in range(2):
-                    try:
-                        downloaded = await downloader.download_mod(
-                            mod_id=mid, game_slug=nexus_slug, game_id=nexus_gid,
-                            api_key=api_key, cdp_port=cfg.chrome_cdp_port,
-                            file_id=m.get("file_id"),
-                            progress_callback=lambda f, _m=mid: progress.set_pct(_m, int(f * 100)),
-                            stage_callback=lambda phase, detail="", _m=mid: _publish_download_phase(
-                                _m, phase, detail
-                            ))
-                        progress.set_status(mid, "done")
-                        success.append({
-                            "mod_id": mid,
-                            "file_id": downloaded.get("file_id"),
-                            "local_path": os.path.abspath(downloaded.get("local_path", "")),
-                            "cached": bool(downloaded.get("cached")),
-                            "mod_name": downloaded.get("mod_name", ""),
-                            "version": downloaded.get("version", ""),
-                            "download_stage": downloaded.get("download_stage", ""),
-                        })
-                        break
-                    except downloader.NexusManualDownloadRequired as e:
-                        diagnostics = e.diagnostics or {}
-                        human_gate = any(token in e.reason for token in (
-                            "尚未登录", "成人内容", "人机验证",
+                try:
+                    downloaded = await downloader.download_mod(
+                        mod_id=int(mid), game_slug=nexus_slug, game_id=nexus_gid,
+                        api_key=api_key, cdp_port=cfg.chrome_cdp_port,
+                        file_id=m.get("file_id"),
+                        progress_callback=lambda f, _m=mid: progress.set_pct(_m, int(f * 100)),
+                        stage_callback=lambda phase, detail="", _m=mid: _publish_download_phase(
+                            _m, phase, detail
                         ))
-                        site_error = bool(diagnostics.get("site_download_error"))
-                        # Page automation stalls and Nexus-side link generation
-                        # failures are bounded retry states, not user chores.
-                        if not human_gate and attempt == 0:
-                            progress.set_status(
-                                mid, "processing",
-                                "页面流程未推进，正在自动重试一次",
-                            )
-                            await asyncio.sleep(.5)
-                            continue
-                        if human_gate:
-                            progress.set_status(
-                                mid,
-                                "waiting_verification",
-                                "等待 Nexus 登录、内容确认或人机验证；其他项继续",
-                            )
-                            manual_action.append({
-                                "mod_id": mid,
-                                "page_url": e.page_url,
-                                "message": str(e),
-                                "observed_reason": e.reason,
-                                "diagnostics": diagnostics,
-                            })
-                        else:
-                            progress.set_status(
-                                mid, "failed",
-                                "页面自动流程连续两次未推进，已跳过当前项",
-                            )
-                            failed.append({
-                                "mod_id": mid,
-                                "status": (
-                                    "retryable_site_error"
-                                    if site_error else "retryable_automation_error"
-                                ),
-                                "error": str(e),
-                                "observed_reason": e.reason,
-                                "attempts": attempt + 1,
-                                "page_url": e.page_url,
-                                "diagnostics": diagnostics,
-                                "automatic_retry_exhausted": True,
-                                "user_action_required": False,
-                            })
-                        break
-                    except Exception as e:
-                        progress.set_status(mid, "failed", str(e))
-                        failed.append({"mod_id": mid, "error": str(e)})
-                        break
+                    if downloaded.get("variants"):
+                        progress.set_status(mid, "failed", "该项仍需选择精确变体")
+                        failed.append({
+                            "mod_id": mid,
+                            "status": "variant_selection_required",
+                            "variants": downloaded.get("variants") or [],
+                            "error": "未提供精确 file_id，下载未开始",
+                        })
+                        continue
+                    progress.set_status(mid, "done")
+                    success.append({
+                        "mod_id": mid,
+                        "file_id": downloaded.get("file_id"),
+                        "variant_id": m.get("variant_id"),
+                        "variant_name": m.get("variant_name"),
+                        "file_name": m.get("file_name"),
+                        "target_slot": m.get("target_slot"),
+                        "local_path": os.path.abspath(downloaded.get("local_path", "")),
+                        "cached": bool(downloaded.get("cached")),
+                        "mod_name": downloaded.get("mod_name", ""),
+                        "version": downloaded.get("version", ""),
+                        "download_stage": downloaded.get("download_stage", ""),
+                    })
+                except task_control.TaskCancelled as e:
+                    cancelled = True
+                    progress.set_status(mid, "cancelled", str(e))
+                    failed.append({
+                        "mod_id": mid, "status": "cancelled",
+                        "error": str(e), "retryable": False,
+                    })
+                    break
+                except downloader.NexusManualDownloadRequired as e:
+                    diagnostics = e.diagnostics or {}
+                    human_gate = any(token in e.reason for token in (
+                        "尚未登录", "成人内容", "人机验证",
+                    ))
+                    site_error = bool(diagnostics.get("site_download_error"))
+                    if human_gate:
+                        progress.set_status(
+                            mid,
+                            "waiting_verification",
+                            "等待 Nexus 登录、内容确认或人机验证；完成后由用户明确继续",
+                        )
+                        manual_action.append({
+                            "mod_id": mid,
+                            "file_id": m.get("file_id"),
+                            "variant_id": m.get("variant_id"),
+                            "nexus_slug": nexus_slug,
+                            "mod_name": m.get("mod_name", ""),
+                            "page_url": e.page_url,
+                            "message": str(e),
+                            "observed_reason": e.reason,
+                            "diagnostics": diagnostics,
+                        })
+                    else:
+                        progress.set_status(mid, "failed", "页面流程未推进，已跳过当前项")
+                        failed.append({
+                            "mod_id": mid,
+                            "file_id": m.get("file_id"),
+                            "variant_id": m.get("variant_id"),
+                            "status": (
+                                "retryable_site_error"
+                                if site_error else "retryable_automation_error"
+                            ),
+                            "error": str(e),
+                            "observed_reason": e.reason,
+                            "page_url": e.page_url,
+                            "diagnostics": diagnostics,
+                            "automatic_retry_exhausted": True,
+                            "user_action_required": False,
+                        })
+                except Exception as e:
+                    progress.set_status(mid, "failed", str(e))
+                    failed.append({
+                        "mod_id": mid,
+                        "file_id": m.get("file_id"),
+                        "variant_id": m.get("variant_id"),
+                        **_download_failure_payload(e, "batch_download"),
+                    })
 
         asyncio.run(_batch())
         progress.finish()
@@ -1956,40 +2048,118 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "blocked_dependencies": blocked_dependencies,
             "skipped_installed": skipped_installed,
             "preflight_detected": preflight.get("detected", 0),
+            "duplicate_requests": duplicate_requests,
             "status": (
+                "cancelled" if cancelled else
                 "partial_manual_action_required" if manual_action else
+                "partial_failure" if success and failed else
+                "failed" if failed else
                 "dependency_blocked" if blocked_dependencies else
                 "completed"
             ),
             "install_blocked": bool(blocked_dependencies),
             "manual_action": manual_action,
-            "stop_further_downloads": False,
-            "remaining_items_processed": True,
+            "stop_further_downloads": bool(cancelled),
+            "remaining_items_processed": not cancelled,
         }, ensure_ascii=False)
 
     # T06
     elif name == "mod_install_batch":
         if not Tier.can(cfg.tier, "install"):
             return json.dumps({"error": "当前层级不支持安装"}, ensure_ascii=False)
-        ids = args.get("mod_ids") or []
-        if not isinstance(ids, list) or not ids:
-            return json.dumps({"error": "请提供 mod_ids 列表"}, ensure_ascii=False)
-        if len(ids) > 30:
-            return json.dumps({"error": f"单批最多 30 个(收到 {len(ids)}),请分批"}, ensure_ascii=False)
+        raw_items = args.get("items")
+        if isinstance(raw_items, list) and raw_items:
+            install_items = [
+                dict(item) for item in raw_items
+                if isinstance(item, dict) and item.get("mod_id") not in (None, "")
+            ]
+        else:
+            ids = args.get("mod_ids") or []
+            install_items = (
+                [{"mod_id": str(mid)} for mid in ids]
+                if isinstance(ids, list) else []
+            )
+        if not install_items:
+            return json.dumps({
+                "error": "请提供 items（推荐）或 mod_ids 列表",
+                "status": "invalid_request",
+            }, ensure_ascii=False)
+        if len(install_items) > 30:
+            return json.dumps({
+                "error": f"单批最多 30 个(收到 {len(install_items)}),请分批",
+                "status": "invalid_request",
+            }, ensure_ascii=False)
+
+        # 先把每个选中项解析到唯一压缩包。任何一个缺失都不允许创建快照
+        # 或进入安装，避免“下载 6/9 却安装结果 6/9”被误解成全部完成。
+        resolved_items = []
+        missing_archives = []
+        seen_archives = set()
+        for item in install_items:
+            task_control.raise_if_cancelled()
+            mid = str(item.get("mod_id"))
+            file_id = item.get("file_id")
+            local_path = str(item.get("local_path") or "").strip()
+            if local_path:
+                local_path = os.path.abspath(local_path)
+            else:
+                local_path = find_download(mid, file_id)
+            identity = (
+                mid,
+                str(file_id or ""),
+                str(item.get("variant_id") or ""),
+                os.path.normcase(os.path.abspath(local_path)) if local_path else "",
+            )
+            if identity in seen_archives:
+                continue
+            seen_archives.add(identity)
+            resolved = {
+                **item,
+                "mod_id": mid,
+                "local_path": os.path.abspath(local_path) if local_path else "",
+            }
+            if not local_path or not os.path.isfile(local_path):
+                missing_archives.append({
+                    "mod_id": mid,
+                    "file_id": file_id,
+                    "variant_id": item.get("variant_id"),
+                    "variant_name": item.get("variant_name"),
+                    "status": "download_missing",
+                })
+            else:
+                resolved_items.append(resolved)
+        if missing_archives:
+            return json.dumps({
+                "status": "download_incomplete",
+                "install_blocked": True,
+                "total_selected": len(install_items),
+                "ready": len(resolved_items),
+                "missing": missing_archives,
+                "message": (
+                    "所选项尚未全部下载并校验，安装未开始；"
+                    "未创建快照，也未写入游戏目录。"
+                ),
+            }, ensure_ascii=False, indent=2)
+
         dependency_blocks = []
         if args.get("require_verified_preflight"):
-            for mid in ids:
-                local_path = find_download(mid)
+            for item in resolved_items:
+                mid = item["mod_id"]
+                local_path = item["local_path"]
                 if not local_path or not str(mid).isdigit():
                     continue
                 checked = nexus_install_preflight(mid)
                 if checked.get("install_blocked"):
-                    dependency_blocks.append({"mod_id": str(mid), **checked})
+                    dependency_blocks.append({
+                        "mod_id": str(mid),
+                        "file_id": item.get("file_id"),
+                        "variant_id": item.get("variant_id"),
+                        **checked,
+                    })
         if stardew.is_stardew(getattr(cfg, "game_name", ""), slug, root):
-            for mid in ids:
-                local_path = find_download(mid)
-                if not local_path:
-                    continue
+            for item in resolved_items:
+                mid = item["mod_id"]
+                local_path = item["local_path"]
                 try:
                     checked = stardew.archive_dependency_preflight(
                         local_path, root, getattr(cfg, "game_name", ""), slug
@@ -2014,19 +2184,27 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         # 整批共享一张安装前快照(治 22 连发时每装一个拍一张的浪费)
         try:
             batch_snap = snapshot.snapshot_create(root, slug,
-                                                  trigger_mod_name=f"批量安装 {len(ids)} 个前")
+                                                  trigger_mod_name=f"批量安装 {len(resolved_items)} 个前")
         except (ValueError, FileNotFoundError, RuntimeError) as e:
             return json.dumps({"error": f"批量安装前快照失败,安装未开始: {e}"}, ensure_ascii=False)
         results = []
-        for mid in ids:
-            local_path = find_download(mid)
-            call_args = {"mod_id": mid, "snapshot_id": batch_snap}
-            if local_path:
-                call_args["local_path"] = local_path
+        for item in resolved_items:
+            task_control.raise_if_cancelled()
+            mid = item["mod_id"]
+            local_path = item["local_path"]
+            call_args = {
+                "mod_id": mid,
+                "snapshot_id": batch_snap,
+                "local_path": local_path,
+            }
             r = json.loads(execute("mod_install", call_args, cfg))
             if "error" in r or r.get("status") == "installation_guidance_required":
                 results.append({
                     "mod_id": mid,
+                    "file_id": item.get("file_id"),
+                    "variant_id": item.get("variant_id"),
+                    "variant_name": item.get("variant_name"),
+                    "target_slot": item.get("target_slot"),
                     "ok": False,
                     "status": r.get("status", "failed"),
                     "error": r.get("error") or r.get("message") or "安装未完成",
@@ -2039,6 +2217,10 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 verification = r.get("verification_report") or {}
                 results.append({
                     "mod_id": mid,
+                    "file_id": item.get("file_id"),
+                    "variant_id": item.get("variant_id"),
+                    "variant_name": item.get("variant_name"),
+                    "target_slot": item.get("target_slot"),
                     "ok": True,
                     "name": r.get("name", ""),
                     "version": r.get("version", ""),
@@ -2058,8 +2240,18 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     "status": r.get("status", "installed"),
                 })
         ok_n = sum(1 for r in results if r["ok"])
-        return json.dumps({"snapshot_id": batch_snap, "total": len(ids), "succeeded": ok_n,
-                           "failed": len(ids) - ok_n, "results": results},
+        failed_n = len(results) - ok_n
+        return json.dumps({
+                           "status": (
+                               "completed" if failed_n == 0 else
+                               "partial_failure" if ok_n else
+                               "failed"
+                           ),
+                           "snapshot_id": batch_snap,
+                           "total": len(results), "succeeded": ok_n,
+                           "failed": failed_n,
+                           "all_selected_installed": failed_n == 0,
+                           "results": results},
                           ensure_ascii=False, indent=1)
 
     elif name == "mod_install":
@@ -3662,6 +3854,79 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             tag = "" if m.installed_by == "modagent" else f" [{m.installed_by}]"
             lines.append(f"{i+1}. [{m.name}] v{m.version}{tag} (ID:{m.id}, LO:{m.load_order})")
         return f"当前游戏({slug})已安装 {len(mods)} 个 Mod:\n" + "\n".join(lines) + hint
+
+    elif name == "share_export":
+        try:
+            payload = share_config.build_share_payload(
+                cfg,
+                author_note=str(args.get("author_note") or ""),
+                title=str(args.get("title") or ""),
+                description=str(args.get("description") or ""),
+                warning=str(args.get("warning") or ""),
+                author_name=str(args.get("author_name") or ""),
+                source_evidence=str(args.get("source_evidence") or ""),
+                compatibility=str(args.get("compatibility") or ""),
+                selected_mod_ids=list(args.get("selected_mod_ids") or []),
+                require_verified_sources=bool(args.get("require_verified_sources", False)),
+                include_snapshots=bool(args.get("include_snapshots", False)),
+                include_config_metadata=bool(args.get("include_config_metadata", False)),
+            )
+        except share_config.ShareError as exc:
+            return json.dumps({
+                "kind": "share_export_error",
+                "error": str(exc),
+                "safe_to_publish": False,
+            }, indent=2, ensure_ascii=False)
+        manifest = share_config.serialize_share(payload)
+        return json.dumps({
+            "kind": "share_export",
+            "schema": share_config.SCHEMA,
+            "manifest": payload,
+            "share_json": manifest,
+            "offline_share_link": share_config.make_offline_share_link(payload),
+            "privacy_note": (
+                "The exported manifest contains no API keys, game paths, installed file paths, "
+                "or config file contents. Upload share_json to a GitHub Gist/Raw file for a short link."
+            ),
+        }, indent=2, ensure_ascii=False)
+
+    elif name == "share_import":
+        try:
+            payload, input_kind = share_config.load_share_input(args.get("share", ""))
+            result = share_config.inspect_share_import(payload, cfg)
+            result["input_kind"] = input_kind
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        except share_config.ShareError as exc:
+            return json.dumps({
+                "kind": "share_import_error",
+                "error": str(exc),
+                "safe_to_auto_install": False,
+                "next_step": "Ask the user for a valid JSON manifest, offline link, GitHub Raw link, or Gist Raw link.",
+            }, indent=2, ensure_ascii=False)
+
+    elif name == "official_share_catalog":
+        try:
+            return json.dumps(official_shares.load_catalog(
+                cfg,
+                query=str(args.get("query") or ""),
+                game_slug="" if args.get("all_games") else None,
+            ), indent=2, ensure_ascii=False)
+        except official_shares.OfficialShareError as exc:
+            return json.dumps({"kind": "official_share_catalog_error", "error": str(exc)}, indent=2, ensure_ascii=False)
+
+    elif name == "official_share_import":
+        try:
+            return json.dumps(
+                official_shares.inspect_official_collection(cfg, args.get("share_id", "")),
+                indent=2, ensure_ascii=False,
+            )
+        except official_shares.OfficialShareError as exc:
+            return json.dumps({
+                "kind": "official_share_import_error",
+                "error": str(exc),
+                "safe_to_auto_install": False,
+                "next_step": "Check the ma-xxxxxx code, selected game, and network connection; no local changes were made.",
+            }, indent=2, ensure_ascii=False)
 
     elif name == "mod_dependency_set":
         mod = db.get_mod(args["mod_id"], slug)

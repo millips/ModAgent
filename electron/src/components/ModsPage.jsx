@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput, Link2, Sparkles } from 'lucide-react'
+import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput, Link2, Sparkles, Share2 } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
+import { isPAccessEnabled, usePLicenseStatus } from '../license/pLicense'
+import { usePShareProfile } from '../pshare/pShareStore'
+import ShareExportDialog from './ShareExportDialog'
 
 const MOCK_MODS = [
   { id: '107', name: 'Cyber Engine Tweaks', name_cn: 'CET 脚本框架', version: '1.32.2', latest: null, category: '框架', desc: '所有脚本 mod 的前置依赖', size: '2.3MB', hasConflict: false, disabled: false },
@@ -20,6 +23,10 @@ const MOCK_MODS = [
 const FILTERS = ['全部', '可更新', '已禁用']
 
 export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) {
+  const pLicense = usePLicenseStatus()
+  const pShareProfile = usePShareProfile()
+  const canCreateShare = isPAccessEnabled(pLicense) && Boolean(pShareProfile)
+  const canEnrollShare = isPAccessEnabled(pLicense) && !pShareProfile
   const [mods, setMods] = useState([])
   const [search, setSearch] = useState('')
   const [catFilter, setCatFilter] = useState('全部')
@@ -43,6 +50,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const [bindingProgress, setBindingProgress] = useState(null)
   const [alignmentReview, setAlignmentReview] = useState(null)
   const [enriching, setEnriching] = useState(false)
+  const [showShareExport, setShowShareExport] = useState(false)
   const bindingAbortRef = useRef(null)
   const updateAbortRef = useRef(null)
 
@@ -64,9 +72,11 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
         sourceKey: m.source_key || '',
         sourceMatchMethod: m.source_match_method || '',
         sourceConfidence: Number(m.source_confidence) || 0,
+        dependencies: Array.isArray(m.dependencies) ? m.dependencies : [],
         fileCount: Number(m.file_count) || 0,
         variantCount: Number(m.variant_count) || 0,
         managementUnit: m.management_unit || 'package',
+        hasVerifiedSource: Boolean(m.source_key && m.source_url),
         size: '',
         hasConflict: false, disabled: !!m.disabled,
       }))
@@ -217,7 +227,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       if (pollTimer) window.clearInterval(pollTimer)
       updateAbortRef.current = null
       setChecking(false)
-      window.setTimeout(() => setUpdateProgress(null), 1500)
+      setUpdateProgress(null)
     }
   }
 
@@ -259,7 +269,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const runAlignment = async (targetMods = null) => {
     const targets = Array.isArray(targetMods)
       ? targetMods
-      : mods.filter(mod => !mod.sourceKey)
+      : mods.filter(mod => !mod.hasVerifiedSource)
     if (!targets.length) {
       toast('全部 Mod 都已有维护来源，无需重复绑定')
       return
@@ -326,7 +336,8 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       if (pollTimer) window.clearInterval(pollTimer)
       bindingAbortRef.current = null
       setBinding(false)
-      window.setTimeout(() => setBindingProgress(null), 1500)
+      // 对齐结果已通过 toast / 歧义面板交代；不要让右下角“已结束”进度卡再滞留。
+      setBindingProgress(null)
     }
   }
 
@@ -598,8 +609,21 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     const unit = m.size.includes('GB') ? 1024 : m.size.includes('MB') ? 1 : 0.001
     return sum + num * unit
   }, 0)
-  const boundCount = mods.filter(mod => mod.sourceKey).length
+  const boundCount = mods.filter(mod => mod.hasVerifiedSource).length
   const unboundCount = Math.max(0, mods.length - boundCount)
+  const selectedMods = mods.filter(mod => selected.has(mod.id))
+  const selectedUnalignedCount = selectedMods.filter(mod => !mod.hasVerifiedSource).length
+  // 分享包会把来源链接交给接收者；任何一个来源不明的条目都不能混入。
+  // 因此入口只在「所选全部已对齐」时出现，而不是等导出时才给用户一个失败提示。
+  const canExportSelectedShare = canCreateShare
+    && selectedMods.length > 0
+    && selectedMods.every(mod => mod.hasVerifiedSource)
+
+  const openSourcePage = async mod => {
+    if (!mod?.hasVerifiedSource || !mod.sourceUrl) return
+    const result = await window.modagent?.openExternal?.(mod.sourceUrl)
+    if (!result?.ok) toast('无法打开已对齐的原始发布页', 'error')
+  }
 
   return (
     <div className="flex flex-col flex-1 overflow-hidden">
@@ -647,7 +671,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               onClick={bindRecognized}
               disabled={checking || (!binding && !unboundCount)}
               title={unboundCount
-                ? `仅处理 ${unboundCount} 个尚未绑定项；已有 ${boundCount} 个不会重复查询`
+                ? `仅处理 ${unboundCount} 个尚未完成来源核验的项；已有 ${boundCount} 个不会重复查询`
                 : '全部 Mod 都已有维护来源'}>
               {binding ? <XCircle size={14} /> : <Link2 size={14} />}
               {binding
@@ -804,13 +828,31 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
 
             {/* Tags */}
             <div className="flex items-center gap-1.5 shrink-0">
-              <span className="badge-cyan text-[10px]">{mod.category}</span>
+              <span
+                className="badge-cyan text-[10px]"
+                title={mod.hasVerifiedSource
+                  ? `维护来源：${mod.category}`
+                  : `安装渠道：${mod.category}。尚未完成维护来源对齐，不能用于分享或自动更新。`}
+              >{mod.category}</span>
+              {!mod.hasVerifiedSource && (
+                <span className="text-[9px] text-cyber-yellow" title="这是安装渠道，不等于已核验的原始发布来源">待对齐</span>
+              )}
+              {mod.hasVerifiedSource && (
+                <button
+                  type="button"
+                  onClick={() => openSourcePage(mod)}
+                  className="rounded-full border border-cyber-cyan/30 bg-cyber-cyan/10 px-2 py-0.5 text-[10px] text-cyber-cyan hover:bg-cyber-cyan/20"
+                  title="打开已对齐的原始发布页；不会搜索或猜测未验证来源"
+                >
+                  ↗ 原始页
+                </button>
+              )}
               <span className="text-[10px] text-surface-500">{mod.size}</span>
             </div>
 
             {/* Actions - show on hover */}
-            <div className={`flex items-center gap-1 shrink-0 transition-opacity duration-75 ${hovered === mod.id || mod.disabled || !mod.sourceKey ? 'opacity-100' : 'opacity-0'}`}>
-              {!mod.sourceKey && (
+            <div className={`flex items-center gap-1 shrink-0 transition-opacity duration-75 ${hovered === mod.id || mod.disabled || !mod.hasVerifiedSource ? 'opacity-100' : 'opacity-0'}`}>
+              {!mod.hasVerifiedSource && (
                 <button
                   disabled={binding || actionLock === `align:${mod.id}`}
                   onClick={() => runAlignment([mod])}
@@ -873,11 +915,38 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
         <span>已选 {selected.size} 个</span>
         <span>共 {mods.length} 个 Mod · 占用 {totalSize > 1024 ? (totalSize / 1024).toFixed(1) + 'GB' : totalSize.toFixed(0) + 'MB'}</span>
         {selected.size > 0 && (
-          <button onClick={previewBatchDelete} disabled={batchBusy} className="btn-ghost text-cyber-red flex items-center gap-1">
-            {batchBusy ? <RefreshCw size={12} className="animate-spin" /> : <Trash2 size={12} />} 批量删除
-          </button>
+          <div className="flex items-center gap-2">
+            {canExportSelectedShare && (
+              <button onClick={() => setShowShareExport(true)} disabled={batchBusy} className="btn-ghost text-cyber-cyan flex items-center gap-1" title="P 创作者功能：把已选 Mod 导出为待审核的分享投稿包">
+                <Share2 size={12} /> 导出分享配置
+              </button>
+            )}
+            {canCreateShare && selectedUnalignedCount > 0 && (
+              <span
+                className="text-[10px] text-cyber-yellow"
+                title="未对齐项没有可复核的原始发布链接，不能纳入分享包。请逐项点击“对齐”并确认候选来源。"
+              >
+                {selectedUnalignedCount} 个来源待对齐后才能分享
+              </span>
+            )}
+            {canEnrollShare && <span className="text-[10px] text-surface-400">请先在设置中开通 P Share 创作者计划</span>}
+            <button onClick={previewBatchDelete} disabled={batchBusy} className="btn-ghost text-cyber-red flex items-center gap-1">
+              {batchBusy ? <RefreshCw size={12} className="animate-spin" /> : <Trash2 size={12} />} 批量删除
+            </button>
+          </div>
         )}
       </div>
+
+      {showShareExport && (
+        <ShareExportDialog
+          api={api}
+          mods={selectedMods}
+          toast={toast}
+          gameName={status?.game || ''}
+          gameSlug={status?.game_instance_id || status?.game_slug || ''}
+          onClose={() => setShowShareExport(false)}
+        />
+      )}
 
       {/* 更新检测只给出候选；用户勾选后才进入更新流水线。 */}
       {updateReview && (

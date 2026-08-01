@@ -13,6 +13,7 @@ hiddenimports = [
 ]
 hiddenimports += collect_submodules("playwright")
 datas = [(str(ROOT / "modagent" / "default_prompt.md"), "modagent")]
+datas += [(str(ROOT / "shares"), "shares")]
 datas += collect_data_files("playwright")
 
 a = Analysis(

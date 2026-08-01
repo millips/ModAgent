@@ -1,0 +1,63 @@
+{
+  "schema": "modagent-share/v1",
+  "kind": "official_collection",
+  "share_id": "ma-263484",
+  "created_at": 1785456000,
+  "author_note": "Reviewed by ModAgent maintainers. Read warnings before installing.",
+  "game": {
+    "name": "Example Game",
+    "slug": "example-game",
+    "mod_loader": ""
+  },
+  "mods": [
+    {
+      "local_id": "primary-mod",
+      "name": "Primary Mod",
+      "localized_name": "主模组",
+      "summary": "Describe what this Mod changes and why it belongs in the collection.",
+      "version": "",
+      "enabled": true,
+      "load_order": 0,
+      "dependencies": ["framework-mod"],
+      "source": {
+        "type": "github",
+        "key": "owner/repository",
+        "url": "https://github.com/owner/repository/releases",
+        "version": "",
+        "confidence": "reviewed"
+      },
+      "warnings": []
+    },
+    {
+      "local_id": "framework-mod",
+      "name": "Required Framework",
+      "localized_name": "前置框架",
+      "summary": "Required dependency for Primary Mod.",
+      "version": "",
+      "enabled": true,
+      "load_order": 0,
+      "dependencies": [],
+      "source": {
+        "type": "github",
+        "key": "owner/framework",
+        "url": "https://github.com/owner/framework/releases",
+        "version": "",
+        "confidence": "reviewed"
+      },
+      "warnings": []
+    }
+  ],
+  "configuration": {
+    "included": false,
+    "note": "Configuration is documented separately and never silently overwritten."
+  },
+  "snapshots": {
+    "included": false,
+    "items": []
+  },
+  "privacy": {
+    "game_paths_included": false,
+    "api_keys_included": false,
+    "installed_file_paths_included": false
+  }
+}

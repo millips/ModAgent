@@ -570,6 +570,37 @@ def get_main_file(mod_id: int, game_slug: str, api_key: str) -> Optional[dict]:
     return files[0] if files else None
 
 
+def get_main_file_variants(
+    mod_id: int, game_slug: str, api_key: str,
+) -> list[dict]:
+    """Return executable MAIN-file choices with stable Nexus file identity."""
+    files = get_mod_files(mod_id, game_slug, api_key)
+    mains = [f for f in files if f.get("category_name") == "MAIN"]
+    if not mains and files:
+        mains = [files[0]]
+    variants = []
+    for f in mains:
+        file_id = f.get("file_id")
+        if file_id in (None, ""):
+            continue
+        label = (
+            f.get("name") or f.get("file_name")
+            or f"文件 {file_id}"
+        )
+        variants.append({
+            "variant_id": f"nexus:{mod_id}:{file_id}",
+            "file_id": file_id,
+            "name": str(label),
+            "file_name": f.get("file_name", ""),
+            "version": f.get("version", ""),
+            "size_kb": f.get("size_kb", 0),
+            "category_name": f.get("category_name", ""),
+            "description": f.get("description", "") or "",
+            "is_primary": bool(f.get("is_primary")) or not variants,
+        })
+    return variants
+
+
 def _staleness(updated_iso, threshold_months: int = 12) -> dict:
     """据 Nexus updated_time(ISO 8601)判断 mod 陈旧程度 → 安装前预警。
     Basic MiniMap 那类:2024 的 mod 跟不上高频更新的游戏,装了 ModClass 加载失败不生效。
@@ -594,9 +625,12 @@ def _staleness(updated_iso, threshold_months: int = 12) -> dict:
 def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888) -> dict:
     mod = get_mod(mod_id, game_slug, api_key, cdp_port)
     try:
-        main = get_main_file(mod_id, game_slug, api_key)
+        variants = get_main_file_variants(mod_id, game_slug, api_key)
+        primary = next((v for v in variants if v.get("is_primary")), None)
+        primary = primary or (variants[0] if variants else None)
     except Exception:
-        main = None
+        variants = []
+        primary = None
     deps = [d.get("mod_id") for d in mod.get("dependencies", []) if d.get("mod_id")]
     dependency_labels = _extract_dependency_labels(mod.get("description", ""))
     required_loader = _extract_required_loader(
@@ -610,10 +644,12 @@ def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888)
         "name": mod.get("name", ""),
         "summary": mod.get("summary", ""),
         "description": mod.get("description", "")[:2000],
-        "version": main.get("version", mod.get("version", "?")) if main else mod.get("version", "?"),
-        "file_id": main.get("file_id") if main else None,
-        "file_name": main.get("file_name", "") if main else "",
-        "file_size_kb": main.get("size_kb", 0) if main else 0,
+        "version": primary.get("version", mod.get("version", "?")) if primary else mod.get("version", "?"),
+        "file_id": primary.get("file_id") if primary else None,
+        "file_name": primary.get("file_name", "") if primary else "",
+        "file_size_kb": primary.get("size_kb", 0) if primary else 0,
+        "variants": variants,
+        "variant_selection_required": len(variants) > 1,
         "endorsements": mod.get("endorsement_count", 0),
         "downloads": mod.get("mod_downloads", 0),
         "author": mod.get("author", ""),

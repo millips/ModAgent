@@ -1,0 +1,449 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-30",
+  "scope": "Windows PC game mod installation and discovery",
+  "policy": {
+    "stable": "Validated destination rules and package shapes; eligible for automatic install.",
+    "guided": "Known workflow, but the user must confirm a game-specific path, runtime, load order, or anti-cheat condition.",
+    "detect_only": "Detect and explain only; never infer a write target.",
+    "external_manager": "Hand off to the official or ecosystem manager and inventory its output."
+  },
+  "frameworks": [
+    {
+      "id": "bepinex",
+      "name": "BepInEx",
+      "engines": ["Unity Mono", "Unity IL2CPP", ".NET Framework", "XNA", "FNA", "MonoGame"],
+      "automation": "guided",
+      "prerequisites": [
+        "Select a build matching runtime (Unity Mono vs IL2CPP) and architecture (x86/x64).",
+        "Prefer a game-specific Thunderstore pack when the community maintains one.",
+        "Run the game once after loader installation so config and log files are generated."
+      ],
+      "loader_targets": ["{game_root}/BepInEx", "{game_root}/winhttp.dll", "{game_root}/doorstop_config.ini"],
+      "mod_targets": [
+        {"kind": "plugin", "path": "{game_root}/BepInEx/plugins", "extensions": [".dll"], "recursive": true},
+        {"kind": "preloader_patcher", "path": "{game_root}/BepInEx/patchers", "extensions": [".dll"], "recursive": true},
+        {"kind": "config", "path": "{game_root}/BepInEx/config", "extensions": [".cfg"], "recursive": true}
+      ],
+      "detection": ["BepInEx/core", "BepInEx/plugins", "doorstop_config.ini", "winhttp.dll", "BepInEx/LogOutput.log"],
+      "risks": ["BepInEx 5 and 6 plugin ABI is not interchangeable.", "IL2CPP builds and Mono builds are not interchangeable."],
+      "sources": [
+        "https://docs.bepinex.dev/master/articles/user_guide/installation/index.html",
+        "https://docs.bepinex.dev/master/articles/dev_guide/plugin_tutorial/index.html",
+        "https://docs.bepinex.dev/master/articles/user_guide/configuration.html"
+      ]
+    },
+    {
+      "id": "melonloader",
+      "name": "MelonLoader",
+      "engines": ["Unity Mono", "Unity IL2CPP"],
+      "automation": "guided",
+      "prerequisites": ["Game must be closed.", "IL2CPP games require the supported .NET Desktop Runtime."],
+      "loader_targets": ["{game_root}/MelonLoader", "{game_root}/version.dll", "{game_root}/dobby.dll"],
+      "mod_targets": [
+        {"kind": "mod", "path": "{game_root}/Mods", "extensions": [".dll"], "recursive": false},
+        {"kind": "plugin", "path": "{game_root}/Plugins", "extensions": [".dll"], "recursive": false},
+        {"kind": "user_library", "path": "{game_root}/UserLibs", "extensions": [".dll"], "recursive": false},
+        {"kind": "config", "path": "{game_root}/UserData", "extensions": ["*"], "recursive": true}
+      ],
+      "detection": ["MelonLoader", "version.dll", "Mods", "UserData", "MelonLoader/Latest.log"],
+      "risks": ["Some games pin a specific MelonLoader version.", "Flat DLL placement differs from structured mod packages."],
+      "sources": ["https://github.com/LavaGang/MelonLoader"]
+    },
+    {
+      "id": "ue4ss",
+      "name": "UE4SS",
+      "engines": ["Unreal Engine 4", "Unreal Engine 5"],
+      "automation": "guided",
+      "prerequisites": [
+        "Resolve the real Shipping executable directory, not the launcher wrapper.",
+        "Use the game custom config when UE4SS lists one.",
+        "Verify supported Unreal version and game-specific AOB compatibility."
+      ],
+      "loader_targets": ["{shipping_exe_dir}/UE4SS.dll", "{shipping_exe_dir}/dwmapi.dll", "{shipping_exe_dir}/UE4SS-settings.ini"],
+      "mod_targets": [
+        {"kind": "lua", "path": "{shipping_exe_dir}/Mods/{mod}/Scripts/main.lua", "extensions": [".lua"], "recursive": true},
+        {"kind": "cpp", "path": "{shipping_exe_dir}/Mods/{mod}/dlls/main.dll", "extensions": [".dll"], "recursive": true},
+        {"kind": "load_order", "path": "{shipping_exe_dir}/Mods/mods.txt", "extensions": [".txt"], "recursive": false}
+      ],
+      "detection": ["UE4SS.dll", "UE4SS-settings.ini", "Mods/mods.txt", "UE4SS.log"],
+      "risks": ["UE4SS explicitly is not guaranteed plug-and-play for every UE game.", "Proxy DLL name and game-specific signatures may differ."],
+      "sources": [
+        "https://docs.ue4ss.com/installation-guide",
+        "https://docs.ue4ss.com/dev/guides/creating-a-lua-mod.html",
+        "https://docs.ue4ss.com/dev/guides/installing-a-c%2B%2B-mod.html"
+      ]
+    },
+    {
+      "id": "unreal_pak",
+      "name": "Unreal loose pak / IO Store",
+      "engines": ["Unreal Engine 4", "Unreal Engine 5"],
+      "automation": "guided",
+      "prerequisites": ["Resolve the project directory.", "Treat .pak/.ucas/.utoc with the same basename as an atomic set."],
+      "loader_targets": [],
+      "mod_targets": [
+        {"kind": "pak", "path": "{game_root}/{project}/Content/Paks/~mods", "extensions": [".pak", ".ucas", ".utoc"], "recursive": false}
+      ],
+      "detection": ["{project}/Content/Paks", "{project}/Binaries/Win64/*-Win64-Shipping.exe"],
+      "risks": ["~mods is a convention, not a universal engine guarantee.", "Signed/encrypted paks, IO Store and anti-cheat can block loading."],
+      "sources": ["https://dev.epicgames.com/documentation/en-us/unreal-engine/packaging-your-project"]
+    },
+    {
+      "id": "reframework",
+      "name": "REFramework",
+      "engines": ["RE Engine"],
+      "automation": "guided",
+      "prerequisites": ["Use a build for the exact game.", "Game must be closed before replacing dinput8.dll."],
+      "loader_targets": ["{game_root}/dinput8.dll"],
+      "mod_targets": [
+        {"kind": "lua", "path": "{game_root}/reframework/autorun", "extensions": [".lua"], "recursive": true},
+        {"kind": "plugin", "path": "{game_root}/reframework/plugins", "extensions": [".dll"], "recursive": false}
+      ],
+      "detection": ["dinput8.dll", "reframework", "re2_framework_log.txt"],
+      "risks": ["Fluffy Mod Manager package layouts are separate from REFramework scripts/plugins.", "Game updates can break hooks."],
+      "sources": [
+        "https://github.com/praydog/REFramework",
+        "https://github.com/praydog/REFramework/wiki"
+      ]
+    },
+    {
+      "id": "smapi",
+      "name": "SMAPI",
+      "engines": ["Stardew Valley / MonoGame"],
+      "automation": "stable",
+      "prerequisites": ["Run vanilla game once.", "Install SMAPI and launch StardewModdingAPI.exe."],
+      "loader_targets": ["{game_root}/StardewModdingAPI.exe", "{game_root}/smapi-internal"],
+      "mod_targets": [
+        {"kind": "smapi_mod", "path": "{game_root}/Mods/{mod}", "extensions": ["manifest.json", ".dll"], "recursive": true}
+      ],
+      "detection": ["StardewModdingAPI.exe", "smapi-internal", "Mods"],
+      "risks": ["Each mod root must preserve manifest.json and its relative files.", "Dependencies are declared by UniqueID in manifest.json."],
+      "sources": [
+        "https://wiki.stardewvalley.net/Modding:Installing_SMAPI_on_Windows",
+        "https://wiki.stardewvalley.net/Modding:Player_Guide/Getting_Started"
+      ]
+    },
+    {
+      "id": "redengine2077",
+      "name": "Cyberpunk 2077 REDmod and community frameworks",
+      "engines": ["REDengine 4"],
+      "automation": "stable",
+      "prerequisites": ["Install REDmod DLC for REDmods.", "Read dependency metadata for RED4ext, redscript, ArchiveXL, TweakXL and CET."],
+      "loader_targets": ["{game_root}/tools/redmod", "{game_root}/bin/x64/plugins/cyber_engine_tweaks", "{game_root}/red4ext"],
+      "mod_targets": [
+        {"kind": "archive", "path": "{game_root}/archive/pc/mod", "extensions": [".archive"], "recursive": false},
+        {"kind": "redmod", "path": "{game_root}/mods/{mod}", "extensions": ["info.json"], "recursive": true},
+        {"kind": "redscript", "path": "{game_root}/r6/scripts", "extensions": [".reds"], "recursive": true},
+        {"kind": "tweak", "path": "{game_root}/r6/tweaks", "extensions": [".yaml", ".yml"], "recursive": true}
+      ],
+      "detection": ["archive/pc/mod", "mods", "r6/scripts", "red4ext", "bin/x64/plugins/cyber_engine_tweaks"],
+      "risks": ["REDmods and legacy archive mods use different deployment paths.", "Framework dependency order must be explicit."],
+      "sources": [
+        "https://www.cyberpunk.net/en/modding-support",
+        "https://wiki.redmodding.org/cyberpunk-2077-modding/for-mod-users/users-modding-cyberpunk-2077"
+      ]
+    },
+    {
+      "id": "creation_engine",
+      "name": "Bethesda Creation Engine family",
+      "engines": ["Creation Engine", "Creation Engine 2", "Gamebryo"],
+      "automation": "guided",
+      "prerequisites": ["Resolve game edition and script extender build.", "Manage plugin load order outside simple file copy."],
+      "loader_targets": ["{game_root}/{script_extender_loader}", "{game_root}/Data/{script_extender}/Plugins"],
+      "mod_targets": [
+        {"kind": "plugin", "path": "{game_root}/Data", "extensions": [".esp", ".esm", ".esl"], "recursive": false},
+        {"kind": "asset", "path": "{game_root}/Data", "extensions": [".bsa", ".ba2"], "recursive": true}
+      ],
+      "detection": ["Data", "*.esm", "*.exe"],
+      "risks": ["Never overwrite load order blindly.", "Anniversary/next-gen updates can invalidate native DLL plugins.", "MO2/Vortex virtualized installs need external-manager handoff."],
+      "sources": [
+        "https://skse.silverlock.org/",
+        "https://f4se.silverlock.org/",
+        "https://sfse.silverlock.org/"
+      ]
+    },
+    {
+      "id": "bg3",
+      "name": "Baldur's Gate 3 native mod system",
+      "engines": ["Divinity 4.0"],
+      "automation": "guided",
+      "prerequisites": ["Prefer the in-game mod browser for officially supported mod.io content.", "Third-party pak mods may require a generated modsettings.lsx and Script Extender."],
+      "loader_targets": [],
+      "mod_targets": [
+        {"kind": "pak", "path": "%LOCALAPPDATA%/Larian Studios/Baldur's Gate 3/Mods", "extensions": [".pak"], "recursive": false},
+        {"kind": "load_order", "path": "%LOCALAPPDATA%/Larian Studios/Baldur's Gate 3/PlayerProfiles/Public/modsettings.lsx", "extensions": [".lsx"], "recursive": false},
+        {"kind": "loose", "path": "{game_root}/Data", "extensions": ["*"], "recursive": true}
+      ],
+      "detection": ["%LOCALAPPDATA%/Larian Studios/Baldur's Gate 3/Mods", "{game_root}/bin/bg3.exe"],
+      "risks": ["Pak copy alone may not activate a third-party mod.", "Loose files and NativeMods require separate routing.", "Multiplayer requires matching mod sets."],
+      "sources": [
+        "https://baldursgate3.game/news/community-update-27-official-modding-support_118",
+        "https://baldursgate3.game/support/crashes-during-gameplay-pc_61",
+        "https://github.com/LaughingLeader/BG3ModManager"
+      ]
+    },
+    {
+      "id": "modengine2",
+      "name": "Mod Engine 2",
+      "engines": ["FromSoftware proprietary engines"],
+      "automation": "external_manager",
+      "prerequisites": ["Launch offline where the game/community requires it.", "Configure each mod path in the game TOML."],
+      "loader_targets": ["{manager_root}/modengine2_launcher.exe", "{manager_root}/config_{game}.toml"],
+      "mod_targets": [{"kind": "overlay", "path": "{manager_root}/mod/{mod}", "extensions": ["*"], "recursive": true}],
+      "detection": ["modengine2_launcher.exe", "config_eldenring.toml"],
+      "risks": ["The Mod Engine 2 repository is archived and development moved on.", "Do not use gameplay-altering mods on protected online services."],
+      "sources": ["https://github.com/soulsmods/ModEngine2"]
+    },
+    {
+      "id": "fabric",
+      "name": "Fabric Loader",
+      "engines": ["Minecraft Java Edition"],
+      "automation": "external_manager",
+      "prerequisites": ["Match Minecraft, Fabric Loader, Fabric API and mod versions.", "Use an isolated launcher instance when possible."],
+      "loader_targets": ["%APPDATA%/.minecraft/versions"],
+      "mod_targets": [{"kind": "jar", "path": "%APPDATA%/.minecraft/mods", "extensions": [".jar"], "recursive": false}],
+      "detection": ["%APPDATA%/.minecraft/mods", "%APPDATA%/.minecraft/versions"],
+      "risks": ["A global .minecraft directory mixes profiles unless a custom game directory is used."],
+      "sources": ["https://docs.fabricmc.net/players/installing-mods"]
+    },
+    {
+      "id": "neoforge",
+      "name": "NeoForge",
+      "engines": ["Minecraft Java Edition"],
+      "automation": "external_manager",
+      "prerequisites": ["Match Minecraft, NeoForge and mod versions.", "Run the profile once to create the mods directory."],
+      "loader_targets": ["%APPDATA%/.minecraft/versions"],
+      "mod_targets": [{"kind": "jar", "path": "%APPDATA%/.minecraft/mods", "extensions": [".jar"], "recursive": false}],
+      "detection": ["%APPDATA%/.minecraft/mods", "%APPDATA%/.minecraft/versions"],
+      "risks": ["Forge, NeoForge and Fabric artifacts are not interchangeable."],
+      "sources": ["https://docs.neoforged.net/user/docs/client/"]
+    },
+    {
+      "id": "reloaded2",
+      "name": "Reloaded-II",
+      "engines": ["Native x86/x64 games"],
+      "automation": "external_manager",
+      "prerequisites": ["Install and configure the game inside Reloaded-II.", "Let Reloaded-II resolve shared mod dependencies."],
+      "loader_targets": ["{reloaded_root}/Reloaded-II.exe"],
+      "mod_targets": [{"kind": "reloaded_package", "path": "{reloaded_root}/Mods/{mod_id}", "extensions": ["ModConfig.json"], "recursive": true}],
+      "detection": ["Reloaded-II.exe", "Mods/*/ModConfig.json"],
+      "risks": ["Do not duplicate Reloaded-II's dependency resolver or injection deployment."],
+      "sources": ["https://github.com/Reloaded-Project/Reloaded-II"]
+    },
+    {
+      "id": "steam_workshop",
+      "name": "Steam Workshop",
+      "engines": ["Game-specific native workshop support"],
+      "automation": "external_manager",
+      "prerequisites": ["Subscribe through Steam and let Steam own downloads and updates."],
+      "loader_targets": [],
+      "mod_targets": [{"kind": "workshop_item", "path": "{steam_library}/steamapps/workshop/content/{appid}/{published_file_id}", "extensions": ["*"], "recursive": true}],
+      "detection": ["steamapps/workshop/appworkshop_{appid}.acf", "steamapps/workshop/content/{appid}"],
+      "risks": ["Workshop storage is Steam-owned; never move or rewrite subscribed items directly."],
+      "sources": ["https://partner.steamgames.com/doc/features/workshop"]
+    },
+    {
+      "id": "native_game_mods",
+      "name": "Game-native or game-specific mod directory",
+      "engines": ["Multiple"],
+      "automation": "detect_only",
+      "prerequisites": ["Use a dedicated game profile backed by that game's official documentation before enabling writes."],
+      "loader_targets": [],
+      "mod_targets": [],
+      "detection": ["Game-specific manifest, configuration or user-data directory"],
+      "risks": ["There is no safe cross-game destination rule.", "User-data paths, load order and package formats are game-specific."],
+      "sources": ["https://www.nexusmods.com/"]
+    },
+    {
+      "id": "sims4_native",
+      "name": "The Sims 4 user-content system",
+      "engines": ["The Sims 4 proprietary engine"],
+      "automation": "guided",
+      "prerequisites": [
+        "Launch the game once so it creates the active user-data folder and Resource.cfg.",
+        "Resolve the Windows-designated Documents directory; it may be redirected into OneDrive.",
+        "Enable Custom Content and Mods in Game Options > Other.",
+        "Enable Script Mods separately when the package contains .ts4script files, then restart the game."
+      ],
+      "loader_targets": [
+        "{windows_documents}/Electronic Arts/The Sims 4/Mods/Resource.cfg"
+      ],
+      "mod_targets": [
+        {"kind": "custom_content", "path": "{windows_documents}/Electronic Arts/The Sims 4/Mods/{creator_or_package}", "extensions": [".package"], "recursive": true, "max_depth": 5},
+        {"kind": "script_mod", "path": "{windows_documents}/Electronic Arts/The Sims 4/Mods/{mod}", "extensions": [".ts4script", ".package"], "recursive": false, "max_depth": 1},
+        {"kind": "tray_content", "path": "{windows_documents}/Electronic Arts/The Sims 4/Tray", "extensions": [".blueprint", ".bpi", ".hhi", ".householdbinary", ".room", ".sgi", ".trayitem"], "recursive": false}
+      ],
+      "detection": [
+        "{windows_documents}/Electronic Arts/The Sims 4/Options.ini",
+        "{windows_documents}/Electronic Arts/The Sims 4/GameVersion.txt",
+        "{windows_documents}/Electronic Arts/The Sims 4/Mods/Resource.cfg"
+      ],
+      "install_chain": [
+        "Classify archive contents before extraction.",
+        "Reject executables and archives nested as install payload unless the creator explicitly documents them.",
+        "Preserve one creator/mod folder directly below Mods for script mods.",
+        "Keep Tray assets out of Mods and install the complete same-basename asset set together.",
+        "After installation, confirm files are listed by the game's startup mod list."
+      ],
+      "diagnostics": [
+        "Detect multiple active-looking The Sims 4 folders and identify the one containing the currently loaded save path.",
+        "Detect OneDrive cloud-only files, sync conflicts and deleted mods that reappear.",
+        "Detect script mods deeper than one subfolder and package files deeper than Resource.cfg allows.",
+        "Detect duplicate files by hash and likely duplicate package resources.",
+        "Record game patch version and creator compatibility version.",
+        "After removing or changing mods, offer to remove the generated localthumbcache.package.",
+        "Provide a reversible 50/50 isolation workflow without moving saves."
+      ],
+      "risks": [
+        "Game updates disable mods and can make script mods incompatible.",
+        "Do not install user content into the EA App/Steam game program directory.",
+        "OneDrive can rename, restore, lock or cloud-evict user files.",
+        "Never load and save an important household while required CC or gameplay mods are missing."
+      ],
+      "sources": [
+        "https://help.ea.com/en/articles/the-sims/the-sims-4/how-to-install-mods-the-sims-4/",
+        "https://help.ea.com/en/articles/the-sims/the-sims-4/mods-and-the-sims-4-game-updates/",
+        "https://forums.ea.com/discussions/the-sims-4-mods-and-custom-content-en/re-info-how-to-use-mods-and-cc/9360655",
+        "https://forums.ea.com/kb/the-sims-helpers-blog-en/guide-pc-managing-onedrive/12636625/"
+      ]
+    },
+    {
+      "id": "sims3_native",
+      "name": "The Sims 3 package and Sims3Pack systems",
+      "engines": ["The Sims 3 proprietary engine"],
+      "automation": "guided",
+      "prerequisites": [
+        "Launch the game once so it creates the active user-data folder.",
+        "Resolve the Windows-designated Documents directory; it may be redirected into OneDrive.",
+        "For .package mods, create Mods/Packages and place Resource.cfg directly in Mods.",
+        "Use Overrides only when a mod author explicitly requires it."
+      ],
+      "loader_targets": [
+        "{windows_documents}/Electronic Arts/The Sims 3/Mods/Resource.cfg"
+      ],
+      "mod_targets": [
+        {"kind": "package_mod", "path": "{windows_documents}/Electronic Arts/The Sims 3/Mods/Packages/{creator_or_package}", "extensions": [".package"], "recursive": true},
+        {"kind": "override_package", "path": "{windows_documents}/Electronic Arts/The Sims 3/Mods/Overrides", "extensions": [".package"], "recursive": true},
+        {"kind": "launcher_staging", "path": "{windows_documents}/Electronic Arts/The Sims 3/Downloads", "extensions": [".sims3pack"], "recursive": false},
+        {"kind": "saved_sim", "path": "{windows_documents}/Electronic Arts/The Sims 3/SavedSims", "extensions": [".sim"], "recursive": false}
+      ],
+      "detection": [
+        "{windows_documents}/Electronic Arts/The Sims 3/Options.ini",
+        "{windows_documents}/Electronic Arts/The Sims 3/Mods/Resource.cfg",
+        "{windows_documents}/Electronic Arts/The Sims 3/DCCache"
+      ],
+      "install_chain": [
+        "Extract archives and classify .package, .sims3pack and .sim separately.",
+        "Copy .package files below Mods/Packages; never put Resource.cfg inside Packages.",
+        "Stage .sims3pack files in Downloads and hand installation to The Sims 3 Launcher.",
+        "Treat a Sims3Pack as installed only after Launcher confirmation; Downloads is staging, not the loaded content store.",
+        "Inventory Launcher-installed third-party content through DCCache .dbc files without editing those containers."
+      ],
+      "diagnostics": [
+        "Validate the Mods/Resource.cfg + Mods/Packages structure.",
+        "Distinguish package mods from Launcher-installed Sims3Packs.",
+        "Detect duplicate packages and conflicting core/script mods.",
+        "Track game version 1.67 vs 1.69 and expansion requirements.",
+        "Offer removal of generated CASPartCache.package, compositorCache.package, scriptCache.package, simCompositorCache.package and socialCache.package after mod changes.",
+        "Use small Launcher install batches and retain original Sims3Packs outside Downloads as recovery copies."
+      ],
+      "risks": [
+        "The Launcher merges Sims3Pack content into DCCache containers, so file-copy rollback is not granular.",
+        "Do not directly rewrite or delete individual records inside .dbc/.ebc files.",
+        "Old Program Files-era package frameworks must not coexist with the Documents framework.",
+        "A file present in Downloads is not necessarily installed."
+      ],
+      "sources": [
+        "https://forums.ea.com/discussions/the-sims-3-technical-issues-en/how-do-i-make-mods-folder-in-the-sims-3/13137989/replies/13320305",
+        "https://modthesims.info/wiki.php?title=Sims_3:Installing_Package_Files",
+        "https://modthesims.info/wiki.php?title=Game_Help:Installing_TS3_Packs",
+        "https://modthesims.info/wiki.php?title=Game_Help:TS3_User_Folders_Explained"
+      ]
+    },
+    {
+      "id": "thunderstore",
+      "name": "Thunderstore / r2modman ecosystem",
+      "engines": ["Multiple; commonly Unity with BepInEx"],
+      "automation": "external_manager",
+      "prerequisites": ["Resolve community identifier and package dependencies.", "Prefer profile-aware manager installation."],
+      "loader_targets": [],
+      "mod_targets": [{"kind": "package", "path": "{profile_root}", "extensions": ["manifest.json"], "recursive": true}],
+      "detection": ["manifest.json", "BepInEx/plugins", "doorstop_config.ini"],
+      "risks": ["A Thunderstore zip is a dependency package, not always a direct game-root archive.", "Profiles may be stored outside the game directory."],
+      "sources": ["https://thunderstore.io/", "https://github.com/ebkr/r2modmanPlus"]
+    }
+  ],
+  "games": [
+    {"id": "stardewvalley", "name": "Stardew Valley", "aliases": ["Stardew Valley"], "engine": "MonoGame", "frameworks": ["smapi"], "priority": "P0", "automation": "stable", "status": "implemented", "nexus": {"slug": "stardewvalley", "id": 1303}},
+    {"id": "cyberpunk2077", "name": "Cyberpunk 2077", "aliases": ["Cyberpunk 2077"], "engine": "REDengine 4", "frameworks": ["redengine2077"], "priority": "P0", "automation": "stable", "status": "implemented", "nexus": {"slug": "cyberpunk2077", "id": 3333}},
+    {"id": "stellarblade", "name": "Stellar Blade", "aliases": ["StellarBlade"], "engine": "Unreal Engine 4", "frameworks": ["unreal_pak", "ue4ss"], "project": "SB", "priority": "P0", "automation": "stable", "status": "implemented", "nexus": {"slug": "stellarblade", "id": 7804}},
+    {"id": "palworld", "name": "Palworld", "aliases": ["Palworld"], "engine": "Unreal Engine 5", "frameworks": ["unreal_pak", "ue4ss", "steam_workshop"], "project": "Pal", "priority": "P0", "automation": "stable", "status": "implemented", "steam_appid": "1623730", "nexus": {"slug": "palworld", "id": 6063}},
+    {"id": "phasmophobia", "name": "Phasmophobia", "aliases": ["Phasmophobia"], "engine": "Unity", "frameworks": ["melonloader", "thunderstore"], "priority": "P1", "automation": "stable", "status": "implemented", "nexus": {"slug": "phasmophobia", "id": 3463}},
+    {"id": "repo", "name": "R.E.P.O.", "aliases": ["REPO", "R.E.P.O."], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P0", "automation": "stable", "status": "implemented", "nexus": {"slug": "repo", "id": 7398}},
+    {"id": "skyrimspecialedition", "name": "Skyrim Special Edition", "aliases": ["SkyrimSE", "The Elder Scrolls V Skyrim"], "engine": "Creation Engine", "frameworks": ["creation_engine"], "priority": "P0", "automation": "guided", "status": "partial", "nexus": {"slug": "skyrimspecialedition", "id": 1704}},
+    {"id": "fallout4", "name": "Fallout 4", "aliases": ["Fallout4"], "engine": "Creation Engine", "frameworks": ["creation_engine"], "priority": "P0", "automation": "guided", "status": "partial", "nexus": {"slug": "fallout4", "id": 1151}},
+    {"id": "finalfantasy7rebirth", "name": "Final Fantasy VII Rebirth", "aliases": ["FINAL FANTASY VII REBIRTH"], "engine": "Unreal Engine 4", "frameworks": ["unreal_pak", "ue4ss"], "project": "End", "priority": "P0", "automation": "stable", "status": "implemented"},
+    {"id": "lethalcompany", "name": "Lethal Company", "aliases": [], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P0", "automation": "guided", "status": "candidate", "evidence": "Thunderstore popular community"},
+    {"id": "valheim", "name": "Valheim", "aliases": [], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P0", "automation": "guided", "status": "candidate", "nexus": {"slug": "valheim", "id": 3667}},
+    {"id": "riskofrain2", "name": "Risk of Rain 2", "aliases": ["RoR2"], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P0", "automation": "guided", "status": "candidate"},
+    {"id": "peak", "name": "PEAK", "aliases": [], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P0", "automation": "guided", "status": "candidate", "evidence": "Thunderstore fast-growing community"},
+    {"id": "contentwarning", "name": "Content Warning", "aliases": [], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P0", "automation": "guided", "status": "candidate"},
+    {"id": "schedule1", "name": "Schedule I", "aliases": ["Schedule 1"], "engine": "Unity", "frameworks": ["melonloader", "thunderstore"], "priority": "P0", "automation": "guided", "status": "candidate"},
+    {"id": "gtfo", "name": "GTFO", "aliases": [], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "dysonsphereprogram", "name": "Dyson Sphere Program", "aliases": ["DSP"], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "vrising", "name": "V Rising", "aliases": [], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "h3vr", "name": "Hot Dogs, Horseshoes & Hand Grenades", "aliases": ["H3VR"], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "inscryption", "name": "Inscryption", "aliases": [], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "cities_skylines_2", "name": "Cities: Skylines II", "aliases": ["Cities Skylines 2"], "engine": "Unity", "frameworks": ["thunderstore"], "priority": "P1", "automation": "external_manager", "status": "candidate"},
+    {"id": "starfield", "name": "Starfield", "aliases": [], "engine": "Creation Engine 2", "frameworks": ["creation_engine"], "priority": "P0", "automation": "guided", "status": "candidate", "nexus": {"slug": "starfield", "id": 4187}},
+    {"id": "falloutnewvegas", "name": "Fallout: New Vegas", "aliases": ["Fallout New Vegas"], "engine": "Gamebryo", "frameworks": ["creation_engine"], "priority": "P0", "automation": "guided", "status": "candidate", "nexus": {"slug": "newvegas", "id": 130}},
+    {"id": "oblivionremastered", "name": "The Elder Scrolls IV: Oblivion Remastered", "aliases": ["Oblivion Remastered"], "engine": "Creation Engine + Unreal Engine 5", "frameworks": ["creation_engine", "unreal_pak", "ue4ss"], "priority": "P0", "automation": "detect_only", "status": "research", "risks": ["Hybrid engine; legacy Oblivion and remaster packages are not interchangeable."]},
+    {"id": "baldursgate3", "name": "Baldur's Gate 3", "aliases": ["Baldurs Gate 3"], "engine": "Divinity 4.0", "frameworks": ["bg3"], "priority": "P0", "automation": "guided", "status": "candidate", "nexus": {"slug": "baldursgate3", "id": 3474}},
+    {"id": "eldenring", "name": "Elden Ring", "aliases": ["ELDEN RING"], "engine": "FromSoftware", "frameworks": ["modengine2"], "priority": "P0", "automation": "external_manager", "status": "candidate", "nexus": {"slug": "eldenring", "id": 4281}},
+    {"id": "sekiro", "name": "Sekiro: Shadows Die Twice", "aliases": ["Sekiro"], "engine": "FromSoftware", "frameworks": ["modengine2"], "priority": "P1", "automation": "external_manager", "status": "candidate", "nexus": {"slug": "sekiro", "id": 2406}},
+    {"id": "darksouls3", "name": "Dark Souls III", "aliases": ["Dark Souls 3"], "engine": "FromSoftware", "frameworks": ["modengine2"], "priority": "P1", "automation": "external_manager", "status": "candidate", "nexus": {"slug": "darksouls3", "id": 134}},
+    {"id": "residentevil2", "name": "Resident Evil 2 (2019)", "aliases": ["Resident Evil 2"], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "residentevil3", "name": "Resident Evil 3 (2020)", "aliases": ["Resident Evil 3"], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "residentevil4", "name": "Resident Evil 4 (2023)", "aliases": ["Resident Evil 4"], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P0", "automation": "guided", "status": "candidate", "nexus": {"slug": "residentevil42023", "id": 4689}},
+    {"id": "residentevil7", "name": "Resident Evil 7", "aliases": ["Resident Evil 7 Biohazard"], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "residentevil8", "name": "Resident Evil Village", "aliases": ["Resident Evil 8"], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P0", "automation": "guided", "status": "candidate"},
+    {"id": "devilmaycry5", "name": "Devil May Cry 5", "aliases": ["DMC5"], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "dragonsdogma2", "name": "Dragon's Dogma 2", "aliases": ["Dragons Dogma 2"], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "monsterhunterrise", "name": "Monster Hunter Rise", "aliases": [], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P0", "automation": "guided", "status": "candidate", "nexus": {"slug": "monsterhunterrise", "id": 4116}},
+    {"id": "monsterhunterwilds", "name": "Monster Hunter Wilds", "aliases": [], "engine": "RE Engine", "frameworks": ["reframework"], "priority": "P0", "automation": "guided", "status": "candidate"},
+    {"id": "minecraft", "name": "Minecraft: Java Edition", "aliases": ["Minecraft Java"], "engine": "Java", "frameworks": ["fabric", "neoforge"], "priority": "P0", "automation": "external_manager", "status": "candidate"},
+    {"id": "persona5royal", "name": "Persona 5 Royal", "aliases": ["P5R"], "engine": "Atlus proprietary", "frameworks": ["reloaded2"], "priority": "P1", "automation": "external_manager", "status": "candidate"},
+    {"id": "persona4golden", "name": "Persona 4 Golden", "aliases": ["P4G"], "engine": "Atlus proprietary", "frameworks": ["reloaded2"], "priority": "P1", "automation": "external_manager", "status": "candidate"},
+    {"id": "sonicfrontiers", "name": "Sonic Frontiers", "aliases": [], "engine": "Hedgehog Engine 2", "frameworks": ["reloaded2"], "priority": "P1", "automation": "external_manager", "status": "candidate"},
+    {"id": "titanfall2", "name": "Titanfall 2", "aliases": ["Titanfall 2: Northstar"], "engine": "Source", "frameworks": ["thunderstore"], "priority": "P1", "automation": "external_manager", "status": "candidate"},
+    {"id": "rimworld", "name": "RimWorld", "aliases": [], "engine": "Unity", "frameworks": ["steam_workshop"], "priority": "P0", "automation": "external_manager", "status": "research"},
+    {"id": "factorio", "name": "Factorio", "aliases": [], "engine": "Proprietary", "frameworks": ["native_game_mods"], "priority": "P0", "automation": "detect_only", "status": "research", "notes": ["Factorio uses its own user-data mods directory and portal; add a dedicated profile before writes."]},
+    {"id": "projectzomboid", "name": "Project Zomboid", "aliases": [], "engine": "Java/LWJGL", "frameworks": ["steam_workshop"], "priority": "P0", "automation": "external_manager", "status": "research"},
+    {"id": "terraria", "name": "Terraria", "aliases": ["tModLoader"], "engine": "XNA/FNA", "frameworks": ["steam_workshop"], "priority": "P0", "automation": "external_manager", "status": "research"},
+    {"id": "mountandblade2bannerlord", "name": "Mount & Blade II: Bannerlord", "aliases": ["Bannerlord"], "engine": "TaleWorlds", "frameworks": ["steam_workshop"], "priority": "P0", "automation": "detect_only", "status": "research", "nexus": {"slug": "mountandblade2bannerlord", "id": 3174}},
+    {"id": "thewitcher3", "name": "The Witcher 3: Wild Hunt", "aliases": ["The Witcher 3"], "engine": "REDengine 3", "frameworks": ["steam_workshop"], "priority": "P0", "automation": "detect_only", "status": "research", "nexus": {"slug": "thewitcher3", "id": 952}},
+    {"id": "kingdomcomedeliverance2", "name": "Kingdom Come: Deliverance II", "aliases": ["Kingdom Come Deliverance II"], "engine": "CryEngine", "frameworks": ["steam_workshop"], "priority": "P0", "automation": "detect_only", "status": "research", "nexus": {"slug": "kingdomcomedeliverance2", "id": 7656}},
+    {"id": "grandtheftauto5", "name": "Grand Theft Auto V", "aliases": ["GTA V", "GTA 5"], "engine": "RAGE", "frameworks": ["native_game_mods"], "priority": "P0", "automation": "detect_only", "status": "research", "risks": ["Separate story-mode modding from GTA Online; never deploy into online use automatically."]},
+    {"id": "reddeadredemption2", "name": "Red Dead Redemption 2", "aliases": ["RDR2"], "engine": "RAGE", "frameworks": ["native_game_mods"], "priority": "P0", "automation": "detect_only", "status": "research", "nexus": {"slug": "reddeadredemption2", "id": 3729}},
+    {"id": "thesims4", "name": "The Sims 4", "aliases": ["Sims 4", "TS4"], "engine": "Proprietary", "frameworks": ["sims4_native"], "priority": "P0", "automation": "guided", "status": "researched", "notes": ["Program files and user content are separate. Resolve the active Windows Documents folder instead of assuming C:/Users/<name>/Documents."]},
+    {"id": "thesims3", "name": "The Sims 3", "aliases": ["Sims 3", "TS3"], "engine": "Proprietary", "frameworks": ["sims3_native"], "priority": "P0", "automation": "guided", "status": "researched", "notes": ["Support .package and .sims3pack as separate installation systems; never treat Downloads as proof of installation."]},
+    {"id": "hollowknightsilksong", "name": "Hollow Knight: Silksong", "aliases": ["Silksong"], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P0", "automation": "guided", "status": "candidate", "evidence": "Active Thunderstore community"},
+    {"id": "ultrakill", "name": "ULTRAKILL", "aliases": [], "engine": "Unity", "frameworks": ["bepinex", "thunderstore"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "bonelab", "name": "BONELAB", "aliases": [], "engine": "Unity", "frameworks": ["melonloader", "thunderstore"], "priority": "P1", "automation": "guided", "status": "candidate"},
+    {"id": "boneworks", "name": "BONEWORKS", "aliases": [], "engine": "Unity", "frameworks": ["melonloader", "thunderstore"], "priority": "P1", "automation": "guided", "status": "candidate"}
+  ],
+  "popularity_sources": [
+    {
+      "name": "Thunderstore communities",
+      "url": "https://thunderstore.io/",
+      "observed_at": "2026-07-30",
+      "use": "Current package and download activity for Unity/BepInEx-heavy communities."
+    },
+    {
+      "name": "Nexus Mods compatible games",
+      "url": "https://nexus-mods.github.io/NexusMods.App/users/games/CompatibleGames/",
+      "observed_at": "2026-07-30",
+      "use": "Cross-check game identifiers and existing manager support."
+    }
+  ]
+}
