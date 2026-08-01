@@ -46,10 +46,14 @@ export default function CommunityImportDialog({ api, toast, onClose, onPlan }) {
   const title = preview?.official?.title || preview?.title || '分享配置预览'
   const warning = preview?.official?.warnings?.[0] || preview?.warning || ''
   const hostRequirements = preview?.summary?.host_dependency_requirements || []
-  const prerequisitesPending = hostRequirements.length > 0
+  const pendingHostRequirements = hostRequirements.filter(item => ![
+    'satisfied_base_environment', 'satisfied_installed', 'included_collection',
+  ].includes(item.status))
+  const prerequisitesPending = pendingHostRequirements.length > 0
 
   const dependencyLabel = item => {
-    if (item.status === 'verify_base_environment') return '检查基础环境'
+    if (item.status === 'satisfied_base_environment') return '基础环境已检测到'
+    if (item.status === 'base_environment_not_found') return '缺少基础环境'
     if (item.status === 'needs_external_resolution') return '需补齐前置'
     if (item.status === 'collection_version_review') return '版本需确认'
     return item.status || '待核验'
@@ -85,11 +89,11 @@ export default function CommunityImportDialog({ api, toast, onClose, onPlan }) {
             <div className="max-h-40 space-y-1 overflow-y-auto border-t border-surface-700 pt-2">
               {(preview.items || []).map((item, index) => <div key={`${item.name}-${index}`} className="flex items-center justify-between gap-3"><span className="truncate text-surface-300">{item.localized_name || item.name}</span><span className="shrink-0 text-[10px] text-surface-500">{labelFor(item)}</span></div>)}
             </div>
-            {hostRequirements.length > 0 && <div className="rounded border border-cyber-yellow/25 bg-cyber-yellow/5 p-2.5 text-cyber-yellow"><p className="font-medium">导入者主机仍需核验 {hostRequirements.length} 项前置</p><p className="mt-1 text-[11px] leading-relaxed opacity-90">基础环境不会伪装成合集 Mod。带入聊天后，ModAgent 会先检查本机是否已具备；缺失时会说明用途、来源和安装建议，再纳入安装计划。</p><div className="mt-2 max-h-20 space-y-1 overflow-y-auto text-[11px]">{hostRequirements.map(item => <div key={item.id}>• {item.name} <span className="opacity-75">— {dependencyLabel(item)}</span></div>)}</div></div>}
+            {hostRequirements.length > 0 && <div className={`rounded border p-2.5 ${prerequisitesPending ? 'border-cyber-yellow/25 bg-cyber-yellow/5 text-cyber-yellow' : 'border-cyber-green/25 bg-cyber-green/5 text-cyber-green'}`}><p className="font-medium">{prerequisitesPending ? `导入者主机仍需处理 ${pendingHostRequirements.length} 项前置` : '基础环境已在本机检测通过'}</p><p className="mt-1 text-[11px] leading-relaxed opacity-90">基础环境不会伪装成合集 Mod。这里直接检查游戏目录；只有实际缺失或版本需确认的项才会阻止生成主体安装计划。</p><div className="mt-2 max-h-20 space-y-1 overflow-y-auto text-[11px]">{hostRequirements.map(item => <div key={item.id}>• {item.name} <span className="opacity-75">— {dependencyLabel(item)}{item.evidence?.length ? ` (${item.evidence.join(', ')})` : ''}</span></div>)}</div></div>}
             <p className="border-t border-surface-700 pt-2 leading-relaxed text-surface-500">主体 Mod、来源和本机重复项已完成预检。只有全部前置通过，才可生成主体安装计划；任何下载与写入仍会经过最终确认。</p>
             <div className="grid gap-2 sm:grid-cols-2">
               <button className="btn-cyber flex items-center justify-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-40" disabled={prerequisitesPending} onClick={() => startPlan('install_plan')} title={prerequisitesPending ? '请先检查并补齐所列前置依赖' : '直接进入主体 Mod 安装计划'}><Hash size={14} />生成安装计划</button>
-              {prerequisitesPending ? <button className="btn-ghost flex items-center justify-center gap-1.5 border-cyber-yellow/45 text-cyber-yellow hover:bg-cyber-yellow/10" onClick={() => startPlan('prerequisite_plan')}><AlertTriangle size={14} />检查并补齐前置（{hostRequirements.length}）</button> : <div className="flex items-center justify-center rounded border border-cyber-green/20 bg-cyber-green/5 px-3 text-[11px] text-cyber-green">✓ 前置已满足，可生成计划</div>}
+              {prerequisitesPending ? <button className="btn-ghost flex items-center justify-center gap-1.5 border-cyber-yellow/45 text-cyber-yellow hover:bg-cyber-yellow/10" onClick={() => startPlan('prerequisite_plan')}><AlertTriangle size={14} />检查并补齐前置（{pendingHostRequirements.length}）</button> : <div className="flex items-center justify-center rounded border border-cyber-green/20 bg-cyber-green/5 px-3 text-[11px] text-cyber-green">✓ 前置已满足，可生成计划</div>}
             </div>
           </div>
         )}

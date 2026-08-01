@@ -1354,7 +1354,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         from .sources import thunderstore
         q = (args.get("query") or "").strip()
         try:
-            comm = thunderstore.find_community(cfg.game_name)
+            # Known game slugs must not depend on another network request just
+            # to rediscover a stable Thunderstore community identifier.
+            comm = thunderstore.community_hint(cfg.game_name, cfg.game_slug)
+            if not comm:
+                comm = thunderstore.find_community(cfg.game_name)
         except Exception as e:
             return json.dumps({"error": f"获取 Thunderstore 社区失败: {e}"}, ensure_ascii=False)
         if not comm:

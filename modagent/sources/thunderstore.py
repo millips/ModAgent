@@ -361,10 +361,10 @@ def _catalog_cache_path(community: str) -> str:
     return os.path.join(CONFIG_DIR, "cache", f"thunderstore-{safe or 'unknown'}.json.gz")
 
 
-def _load_disk_catalog(community: str) -> list | None:
+def _load_disk_catalog(community: str, allow_stale: bool = False) -> list | None:
     path = _catalog_cache_path(community)
     try:
-        if time.time() - os.path.getmtime(path) > _DISK_PKG_TTL:
+        if not allow_stale and time.time() - os.path.getmtime(path) > _DISK_PKG_TTL:
             return None
         with gzip.open(path, "rt", encoding="utf-8") as stream:
             data = json.load(stream)
@@ -403,15 +403,26 @@ def _packages(
             return disk_cached
     url = f"https://thunderstore.io/c/{community}/api/v1/package/"
     try:
-        pkgs = _http_json(
-            url, total_timeout=75, cancel_check=cancel_check,
-        )
+        pkgs = _http_json(url, total_timeout=75, cancel_check=cancel_check)
     except TypeError as exc:
         # A few integrations/tests replace the transport with a minimal
         # one-argument callable. Keep that extension point compatible.
         if "unexpected keyword argument" not in str(exc):
             raise
         pkgs = _http_json(url)
+    except Exception as first_error:
+        # A transient TLS/proxy handshake must not turn a locally usable
+        # catalogue into a hard "no results" state. Retry once quickly, then
+        # retain a stale local catalogue for read-only search if one exists.
+        try:
+            time.sleep(0.6)
+            pkgs = _http_json(url, total_timeout=75, cancel_check=cancel_check)
+        except Exception:
+            stale_catalog = _load_disk_catalog(community, allow_stale=True)
+            if stale_catalog is not None:
+                _PKG_CACHE[community] = (now, stale_catalog)
+                return stale_catalog
+            raise first_error
     if not isinstance(pkgs, list):
         raise RuntimeError("Thunderstore package API returned an invalid response")
     _PKG_CACHE[community] = (now, pkgs)

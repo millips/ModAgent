@@ -115,7 +115,10 @@ export default function PSharePage({ toast }) {
       const issue = result.issue
       const body = String(issue.body || '')
       if (!body.includes(detail.submission_id)) throw new Error('该 Issue 未包含对应投稿编号')
-      const maCode = body.match(/\bma-[a-z0-9][a-z0-9_-]{1,47}-\d{6}\b/i)?.[0] || detail.ma_code || ''
+      const issueText = [body, ...(issue.modagent_comments || [])].join('\n')
+      const maCode = String(issue.modagent_share_code || '')
+        || issueText.match(/\bma-[a-z0-9][a-z0-9_-]{1,47}-\d{6}\b/i)?.[0]
+        || detail.ma_code || ''
       const next = updatePShareSubmission(detail.submission_id, {
         status: resolveStatus(issue.labels),
         issue_title: issue.title || '',
@@ -126,6 +129,25 @@ export default function PSharePage({ toast }) {
       toast('审核状态已同步。')
     } catch (error) {
       toast(`无法同步审核状态：${error.message || '请检查网络或 Issue 链接'}`, 'error')
+    } finally {
+      setSyncing(false)
+    }
+  }
+  const lookupShareCode = async () => {
+    if (!detail?.issue_url) return
+    setSyncing(true)
+    try {
+      const result = await window.modagent?.lookupPShareCode?.(detail.issue_url)
+      if (!result?.ok || !result.code) throw new Error(result?.error || '未找到正式分享码')
+      const next = updatePShareSubmission(detail.submission_id, {
+        ma_code: result.code,
+        status: 'published',
+        synced_at: new Date().toISOString(),
+      })
+      setDetail(next)
+      toast('已从官方索引读取正式分享码。')
+    } catch (error) {
+      toast(`无法读取分享码：${error.message || '请稍后重试'}`, 'error')
     } finally {
       setSyncing(false)
     }
@@ -196,7 +218,7 @@ export default function PSharePage({ toast }) {
           <div className="flex items-start justify-between gap-3"><div><div className="text-xs text-cyber-cyan tracking-[.18em]">SUBMISSION DETAIL</div><h3 className="text-lg text-white mt-1">{detail.title || '未命名合集'}</h3></div><button className="btn-ghost" onClick={() => setDetail(null)}>关闭</button></div>
           <div className="grid grid-cols-2 gap-3 mt-5 text-sm"><div className="rounded-lg bg-surface-800 p-3"><div className="text-xs text-surface-500">投稿编号</div><div className="text-surface-200 break-all mt-1">{detail.submission_id}</div></div><div className="rounded-lg bg-surface-800 p-3"><div className="text-xs text-surface-500">当前状态</div><div className="mt-1"><StatusBadge status={detail.status} /></div></div></div>
           <div className="mt-4 text-sm text-surface-300 space-y-2"><p>游戏：{detail.game_name || '未记录'} · Mod 数量：{detail.mod_count || 0}</p>{detail.description && <p>简介：{detail.description}</p>}{detail.warning && <p className="text-amber-200">警告：{detail.warning}</p>}{detail.filename && <p className="text-surface-500 text-xs">文件：{detail.filename}</p>}</div>
-          {!detail.issue_url ? <div className="mt-5 rounded-xl border border-surface-600 p-4"><p className="text-sm text-surface-300 mb-3">打开官方投稿页后按辅助填报完成提交；提交成功后，在浏览器地址栏按 Ctrl+L、Ctrl+C，再回到这里一键关联。</p><div className="flex flex-wrap gap-2"><input className="input-cyber min-w-[18rem] flex-1 text-sm" value={issueUrl} onChange={event => setIssueUrl(event.target.value)} placeholder="https://github.com/millips/ModAgent-Share/issues/123" /><button className="btn-ghost text-sm" onClick={saveIssue}>手动关联</button><button className="btn-cyber text-sm" onClick={linkIssueFromClipboard}>从剪贴板关联 Issue</button></div><button className="btn-ghost text-xs mt-3" onClick={() => { setShowSubmissionHelper(true); openExternal(ISSUE_BASE) }}><ExternalLink size={13} /> 打开官方投稿页与辅助填报</button></div> : <div className="mt-5 rounded-xl border border-surface-600 p-4 flex flex-wrap items-center gap-3"><button className="btn-ghost text-sm" onClick={() => openExternal(detail.issue_url)}><ExternalLink size={14} /> 打开 GitHub Issue</button><button className="btn-cyber text-sm" disabled={syncing} onClick={syncIssue}><RefreshCw size={14} className={syncing ? 'animate-spin' : ''} /> {syncing ? '同步中…' : '同步审核状态'}</button>{detail.ma_code && <span className="text-xs text-cyber-green">已发布代码：{detail.ma_code}</span>}</div>}
+          {!detail.issue_url ? <div className="mt-5 rounded-xl border border-surface-600 p-4"><p className="text-sm text-surface-300 mb-3">打开官方投稿页后按辅助填报完成提交；提交成功后，在浏览器地址栏按 Ctrl+L、Ctrl+C，再回到这里一键关联。</p><div className="flex flex-wrap gap-2"><input className="input-cyber min-w-[18rem] flex-1 text-sm" value={issueUrl} onChange={event => setIssueUrl(event.target.value)} placeholder="https://github.com/millips/ModAgent-Share/issues/123" /><button className="btn-ghost text-sm" onClick={saveIssue}>手动关联</button><button className="btn-cyber text-sm" onClick={linkIssueFromClipboard}>从剪贴板关联 Issue</button></div><button className="btn-ghost text-xs mt-3" onClick={() => { setShowSubmissionHelper(true); openExternal(ISSUE_BASE) }}><ExternalLink size={13} /> 打开官方投稿页与辅助填报</button></div> : <div className="mt-5 rounded-xl border border-surface-600 p-4 flex flex-wrap items-center gap-3"><button className="btn-ghost text-sm" onClick={() => openExternal(detail.issue_url)}><ExternalLink size={14} /> 打开 GitHub Issue</button><button className="btn-cyber text-sm" disabled={syncing} onClick={syncIssue}><RefreshCw size={14} className={syncing ? 'animate-spin' : ''} /> {syncing ? '同步中…' : '同步审核状态'}</button>{detail.status === 'published' && !detail.ma_code && <button className="btn-ghost text-xs" disabled={syncing} onClick={lookupShareCode}>查看分享码</button>}{detail.ma_code && <><code className="rounded border border-cyber-green/30 bg-cyber-green/5 px-2 py-1 text-xs text-cyber-green">{detail.ma_code}</code><button className="btn-ghost text-xs" onClick={() => copySubmissionText(detail.ma_code, toast, '正式分享码')}>复制分享码</button></>}</div>}
         </div>
       </div>}
       {showSubmissionHelper && detail && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 p-4" role="dialog" aria-modal="true" aria-label="GitHub 辅助填报">

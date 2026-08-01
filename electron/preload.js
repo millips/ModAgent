@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('modagent', {
   readSubmissionIssueFromClipboard: () => ipcRenderer.invoke('read-submission-issue-from-clipboard'),
   getReviewerAccess: () => ipcRenderer.invoke('get-reviewer-access'),
   syncPShareIssue: url => ipcRenderer.invoke('sync-p-share-issue', url),
+  lookupPShareCode: url => ipcRenderer.invoke('lookup-p-share-code', url),
   selectGameDirectory: () => ipcRenderer.invoke('select-game-directory'),
   selectModDirectory: () => ipcRenderer.invoke('select-mod-directory'),
   selectReviewerRepository: () => ipcRenderer.invoke('select-reviewer-repository'),

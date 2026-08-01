@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import time
 import uuid
@@ -63,6 +64,75 @@ def _version_at_least(actual: tuple[int, ...], wanted: tuple[int, ...]) -> bool:
 
 def _is_base_runtime_dependency(value: Any) -> bool:
     return bool(re.match(r"^(?:bepinex|melonloader|smapi)[-_]", str(value or "").strip(), re.I))
+
+
+def _base_runtime_evidence(cfg: Config, dependency: str) -> dict[str, Any]:
+    """Inspect the selected game directory for a real loader installation.
+
+    Package-manager metadata is not a reliable inventory of BepInEx/SMAPI:
+    their bootstrap files deliberately live in the game root and are not normal
+    Mod rows.  Treating every such dependency as unresolved made a valid
+    collection permanently block its own install-plan button.
+
+    This is intentionally conservative.  It proves the loader *kind* from its
+    on-disk runtime files; it does not claim an exact package version when that
+    version cannot be read safely from those files.
+    """
+    configured_root = str(getattr(cfg, "game_root", "") or "").strip()
+    root = os.path.abspath(os.path.expandvars(os.path.expanduser(configured_root))) if configured_root else ""
+    label = str(dependency or "").casefold()
+    if not root or not os.path.isdir(root):
+        return {
+            "status": "base_environment_not_found",
+            "matched_version": "",
+            "evidence": [],
+            "note": "Selected game directory is unavailable; loader files could not be checked.",
+        }
+
+    if label.startswith("bepinex"):
+        core = os.path.join(root, "BepInEx", "core")
+        candidates = [
+            os.path.join(core, "BepInEx.dll"),
+            os.path.join(core, "BepInEx.Core.dll"),
+        ]
+        hits = [os.path.relpath(path, root).replace("\\", "/") for path in candidates if os.path.isfile(path)]
+        bootstrap = [
+            name for name in ("winhttp.dll", "doorstop_config.ini")
+            if os.path.isfile(os.path.join(root, name))
+        ]
+        if hits:
+            return {
+                "status": "satisfied_base_environment",
+                "matched_version": "runtime files detected",
+                "evidence": hits + bootstrap,
+                "note": "BepInEx runtime files were found in the selected game directory.",
+            }
+    elif label.startswith("smapi"):
+        candidates = ["StardewModdingAPI.exe", "StardewModdingAPI.dll"]
+        hits = [name for name in candidates if os.path.isfile(os.path.join(root, name))]
+        if hits:
+            return {
+                "status": "satisfied_base_environment",
+                "matched_version": "runtime files detected",
+                "evidence": hits,
+                "note": "SMAPI runtime files were found in the selected game directory.",
+            }
+    elif label.startswith("melonloader"):
+        candidates = ["MelonLoader", "version.dll"]
+        hits = [name for name in candidates if os.path.exists(os.path.join(root, name))]
+        if hits:
+            return {
+                "status": "satisfied_base_environment",
+                "matched_version": "runtime files detected",
+                "evidence": hits,
+                "note": "MelonLoader runtime files were found in the selected game directory.",
+            }
+    return {
+        "status": "base_environment_not_found",
+        "matched_version": "",
+        "evidence": [],
+        "note": "Required base runtime files were not found in the selected game directory.",
+    }
 
 
 def _source_identity(item: dict[str, Any]) -> str:
@@ -126,11 +196,14 @@ def _share_dependency_requirements(payload: dict, cfg: Config, scope: str) -> li
                 "matched_version": actual_label,
             })
         elif _is_base_runtime_dependency(entry["name"]):
+            evidence = _base_runtime_evidence(cfg, entry["name"])
             entry.update({
-                "status": "verify_base_environment",
+                "status": evidence["status"],
                 "scope": "base_environment",
                 "matched_mod": "",
-                "matched_version": "",
+                "matched_version": evidence["matched_version"],
+                "evidence": evidence["evidence"],
+                "note": evidence["note"],
             })
         elif identity in installed_packages and _version_at_least(_dependency_version(installed_packages[identity]), wanted):
             entry.update({
@@ -401,7 +474,8 @@ def inspect_share_import(payload: dict, cfg: Config) -> dict:
     dependency_requirements = _share_dependency_requirements(payload, cfg, scope)
     host_requirements = [
         item for item in dependency_requirements
-        if item.get("status") in {"verify_base_environment", "needs_external_resolution", "collection_version_review"}
+        if item.get("scope") == "base_environment"
+        or item.get("status") in {"needs_external_resolution", "collection_version_review"}
     ]
     return {
         "kind": "share_import_preview",

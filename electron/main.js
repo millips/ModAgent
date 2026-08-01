@@ -155,11 +155,11 @@ function getReviewerAccess() {
   });
 }
 
-function fetchPublicGitHubIssue(issueNumber) {
+function fetchPublicGitHubJson(apiPath) {
   return new Promise((resolve, reject) => {
     const request = https.get({
       hostname: 'api.github.com',
-      path: `/repos/millips/ModAgent-Share/issues/${issueNumber}`,
+      path: apiPath,
       headers: {
         Accept: 'application/vnd.github+json',
         'User-Agent': `${IDENTITY.productName} p-share-status`,
@@ -170,7 +170,7 @@ function fetchPublicGitHubIssue(issueNumber) {
       response.on('data', value => { body = (body + value).slice(-512000); });
       response.on('end', () => {
         if (response.statusCode >= 200 && response.statusCode < 300) {
-          try { resolve(JSON.parse(body)); } catch (_) { reject(new Error('GitHub 返回了无法解析的 Issue 数据')); }
+          try { resolve(JSON.parse(body)); } catch (_) { reject(new Error('GitHub returned invalid JSON')); }
           return;
         }
         const hint = response.statusCode === 403
@@ -182,6 +182,47 @@ function fetchPublicGitHubIssue(issueNumber) {
     request.setTimeout(15000, () => request.destroy(new Error('GitHub 请求超时，请稍后重试。')));
     request.on('error', error => reject(error));
   });
+}
+
+function fetchPublicOfficialShareIndex() {
+  return new Promise((resolve, reject) => {
+    const request = https.get({
+      hostname: 'raw.githubusercontent.com',
+      path: '/millips/ModAgent-Share/main/index.json',
+      headers: { Accept: 'application/json', 'User-Agent': `${IDENTITY.productName} p-share-status` },
+    }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', value => { body = (body + value).slice(-512000); });
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          try { resolve(JSON.parse(body)); } catch (_) { resolve({}); }
+        } else resolve({});
+      });
+    });
+    request.setTimeout(10000, () => request.destroy(new Error('Official index timeout')));
+    request.on('error', reject);
+  });
+}
+
+async function fetchPublicGitHubIssue(issueNumber) {
+  const issuePath = `/repos/millips/ModAgent-Share/issues/${issueNumber}`;
+  const issue = await fetchPublicGitHubJson(issuePath);
+  // The official code is normally written to the approval comment rather than
+  // the user-authored Issue body.  Read both so the creator can see it locally.
+  try {
+    const comments = await fetchPublicGitHubJson(`${issuePath}/comments?per_page=100`);
+    issue.modagent_comments = Array.isArray(comments) ? comments.map(item => String(item?.body || '')) : [];
+  } catch (_) {
+    issue.modagent_comments = [];
+  }
+  try {
+    const index = await fetchPublicOfficialShareIndex();
+    const canonicalIssue = `https://github.com/millips/ModAgent-Share/issues/${issueNumber}`;
+    const match = (index.collections || []).find(item => String(item?.issue_url || '').replace(/\/$/, '') === canonicalIssue);
+    if (match?.id) issue.modagent_share_code = String(match.id);
+  } catch (_) {}
+  return issue;
 }
 
 function findAvailableApiPort(preferredPort) {
@@ -574,6 +615,19 @@ ipcMain.handle('sync-p-share-issue', async (_, rawUrl) => {
     return { ok: true, issue };
   } catch (error) {
     return { ok: false, error: error.message || '无法读取 GitHub Issue。' };
+  }
+});
+ipcMain.handle('lookup-p-share-code', async (_, rawUrl) => {
+  const match = String(rawUrl || '').trim().match(/^https:\/\/github\.com\/millips\/ModAgent-Share\/issues\/(\d+)\/?$/i);
+  if (!match) return { ok: false, error: '投稿链接必须是 ModAgent-Share 的 GitHub Issue 地址。' };
+  try {
+    const index = await fetchPublicOfficialShareIndex();
+    const canonicalIssue = `https://github.com/millips/ModAgent-Share/issues/${match[1]}`;
+    const entry = (index.collections || []).find(item => String(item?.issue_url || '').replace(/\/$/, '') === canonicalIssue);
+    if (!entry?.id) return { ok: false, error: '官方索引中尚未找到该投稿的正式分享码。请确认审核已完成并已推送官方仓库。' };
+    return { ok: true, code: String(entry.id) };
+  } catch (error) {
+    return { ok: false, error: error.message || '无法读取官方分享索引。' };
   }
 });
 ipcMain.handle('notify-reply-complete', () => {

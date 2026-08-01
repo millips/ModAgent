@@ -110,6 +110,25 @@ def main():
     finally:
         share_config._read_remote_share = original_read
 
+    # Base runtimes are root-level framework files, not normal Mod rows.
+    # Their real on-disk presence must unblock the official plan preview.
+    runtime_root = os.path.join(TMP, "runtime-game")
+    os.makedirs(os.path.join(runtime_root, "BepInEx", "core"), exist_ok=True)
+    with open(os.path.join(runtime_root, "BepInEx", "core", "BepInEx.Core.dll"), "wb") as stream:
+        stream.write(b"runtime")
+    runtime_cfg = Config(game_slug="repo", game_instance_id="runtime-game", game_root=runtime_root)
+    runtime_payload = {
+        "schema": share_config.SCHEMA, "kind": "official_collection",
+        "game": {"slug": "repo", "name": "R.E.P.O."}, "mods": [{
+            "local_id": "alpha", "name": "Alpha", "source": {"type": "thunderstore", "key": "a-alpha", "url": "https://thunderstore.io/c/repo/p/a/Alpha/"},
+            "dependencies": ["BepInEx-BepInExPack-5.4.2305"],
+        }],
+    }
+    runtime_preview = share_config.inspect_share_import(runtime_payload, runtime_cfg)
+    runtime_requirement = runtime_preview["summary"]["host_dependency_requirements"][0]
+    assert runtime_requirement["status"] == "satisfied_base_environment"
+    assert runtime_requirement["evidence"] == ["BepInEx/core/BepInEx.Core.dll"]
+
     try:
         share_config.load_share_input("https://example.invalid/share.json")
         raise AssertionError("Unexpected non-GitHub remote source accepted")
