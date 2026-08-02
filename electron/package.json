@@ -53,5 +53,6 @@
     "tailwindcss": "^3.4.1",
     "vite": "^5.1.0"
   },
-  "author": "ModAgent Project"
+  "author": "ModAgent Project",
+  "modagentChannel": "stable"
 }

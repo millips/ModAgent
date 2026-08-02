@@ -39,6 +39,15 @@ GAME_MOD_PATHS = {
     ],
 }
 
+# Some engines install a package by directly overlaying many internal game
+# resources.  There is no trustworthy package boundary left on disk after
+# extraction, so these games must not fall through to the generic file-name
+# scanner (which would turn 100 texture files into 100 fake Mods).
+DIRECT_OVERLAY_GAME_SLUGS = {"streetfighter6"}
+RE_ENGINE_OVERLAY_SUFFIXES = (
+    ".mesh.", ".tex.", ".mdf2.", ".chain.", ".scn.", ".motlist.",
+)
+
 EXTERNAL_MOD_EXTENSIONS = {
     ".archive", ".pak", ".ucas", ".utoc", ".dll", ".asi", ".reds",
     ".yaml", ".yml", ".lua", ".esp", ".esm", ".esl", ".zip", ".7z", ".rar",
@@ -231,6 +240,65 @@ def _scan_external_mod_root(root: str) -> list[dict]:
     return results
 
 
+def _scan_streetfighter6_overlays(game_root: str, existing_mods: list) -> dict:
+    """Account for SF6 RE Engine overlay assets without inventing Mod names.
+
+    Fluffy packages are flattened into ``natives`` on install.  The durable
+    ModAgent install ledger is therefore the only authoritative package
+    boundary.  We first prove ledger-owned files still exist; assets with no
+    matching ledger are reported as *unattributed overlay groups* for manual
+    alignment, never silently imported as one Mod per texture.
+    """
+    natives = os.path.join(game_root, "natives")
+    if not os.path.isdir(natives):
+        return {"detected": 0, "owned_packages": 0, "unidentified": []}
+
+    live_files: set[str] = set()
+    for base, _, filenames in os.walk(natives):
+        for filename in filenames:
+            lower = filename.lower()
+            if any(marker in lower for marker in RE_ENGINE_OVERLAY_SUFFIXES):
+                live_files.add(os.path.normcase(os.path.realpath(os.path.join(base, filename))))
+
+    owned_files: set[str] = set()
+    owned_packages = 0
+    for mod in existing_mods:
+        files = _file_signature(_stored_files(mod.files_installed))
+        present = set(files) & live_files
+        if present:
+            owned_packages += 1
+            owned_files.update(present)
+
+    # The first character/costume path after ``.../model/esf`` is a useful
+    # review unit, but not a claimed upstream package.  It gives users a small,
+    # actionable list when they have copied files manually or used Fluffy.
+    groups: dict[str, int] = {}
+    prefix = os.path.normcase(os.path.realpath(natives)) + os.sep
+    for full in sorted(live_files - owned_files):
+        rel = full[len(prefix):] if full.startswith(prefix) else os.path.basename(full)
+        parts = rel.replace("\\", "/").split("/")
+        try:
+            esf = next(index for index, value in enumerate(parts) if value.lower() == "esf")
+            group = "/".join(parts[:min(len(parts) - 1, esf + 3)])
+        except StopIteration:
+            group = "/".join(parts[:min(len(parts) - 1, 5)])
+        groups[group or "natives"] = groups.get(group or "natives", 0) + 1
+
+    return {
+        "detected": len(live_files),
+        "owned_packages": owned_packages,
+        "unidentified": [
+            {
+                "name": f"SF6 未归属覆盖资源 · {group}",
+                "file_count": count,
+                "confidence": "overlay_unattributed",
+                "reason": "RE Engine 直接覆盖文件无法从磁盘反推原始 Mod 包；请用来源对齐或导入历史恢复包边界。",
+            }
+            for group, count in sorted(groups.items())
+        ],
+    }
+
+
 def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
                        extra_roots: list[str] | None = None,
                        game_instance_id: str = "") -> dict:
@@ -378,6 +446,22 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
             existing_names.add(key)
             existing_file_signatures.add(signature)
             existing_owned_file_sets.append(frozenset(signature))
+
+    # 0.9) RE Engine direct overlay games.  Keep source package boundaries from
+    # the ledger and expose only truly unattributed files for a later alignment
+    # decision.  This happens before GAME_MOD_PATHS because generic grouping by
+    # file name is unsafe for these layouts.
+    if game_slug in DIRECT_OVERLAY_GAME_SLUGS:
+        overlay = _scan_streetfighter6_overlays(game_root, existing_mods)
+        detected += overlay["detected"]
+        natives = os.path.join(game_root, "natives")
+        if os.path.isdir(natives):
+            scanned_roots.append(natives)
+        unidentified.extend(overlay["unidentified"])
+        return {"detected": detected, "identified": identified, "unidentified": unidentified,
+                "scanned_roots": scanned_roots, "missing_roots": missing_roots,
+                "owned_packages": overlay["owned_packages"],
+                "scan_strategy": "direct_overlay_ledger_first"}
 
     # 没有该游戏的 Nexus 文件规则就到此为止（BepInEx 类游戏走通用探测即可）
     if game_slug not in GAME_MOD_PATHS:

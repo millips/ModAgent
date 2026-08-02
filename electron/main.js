@@ -33,7 +33,11 @@ if (IS_SMOKE_TEST) {
 // to begin as soon as the renderer is ready; the renderer still retries safely
 // on the first gesture if a device is temporarily unavailable.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-const DEFAULT_DATA_FOLDER = IDENTITY.isBeta ? '.modagent-beta' : '.modagent';
+// Channel is a delivery cadence, not a second user profile.  Stable and Beta
+// builds of the same edition must see the same conversation, inventory and
+// rollback ledger.  Keeping a separate folder here made a perfectly ordinary
+// channel switch look like data loss.
+const DEFAULT_DATA_FOLDER = '.modagent';
 const DATA_DIR = path.resolve(process.env.MODAGENT_DATA_DIR || path.join(os.homedir(), DEFAULT_DATA_FOLDER));
 const BG_DIR = path.join(DATA_DIR, 'editions', APP_EDITION, 'bg');
 const APP_USER_DATA = IS_SMOKE_TEST && process.env.MODAGENT_USER_DATA_DIR

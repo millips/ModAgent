@@ -8,6 +8,32 @@ import filecmp
 from .config import CONFIG_DIR
 
 SNAPSHOTS_DIR = os.path.join(CONFIG_DIR, "snapshots")
+LEGACY_SNAPSHOT_ROOTS_FILE = os.path.join(CONFIG_DIR, "legacy-snapshot-roots.json")
+
+
+def _snapshot_roots() -> list[str]:
+    """Return the canonical store followed by read-only legacy stores.
+
+    A Beta-to-stable migration merges the database immediately but must not
+    duplicate potentially tens of GB of historical snapshots.  Legacy roots
+    therefore remain discoverable for preview/restore until the user chooses
+    to archive them.  New snapshots are always written only to SNAPSHOTS_DIR.
+    """
+    roots = [SNAPSHOTS_DIR]
+    try:
+        with open(LEGACY_SNAPSHOT_ROOTS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        candidates = data.get("roots", []) if isinstance(data, dict) else []
+    except (OSError, ValueError, TypeError):
+        candidates = []
+    seen = {os.path.normcase(os.path.realpath(SNAPSHOTS_DIR))}
+    for value in candidates if isinstance(candidates, list) else []:
+        root = os.path.abspath(os.path.expanduser(str(value or "")))
+        normalized = os.path.normcase(os.path.realpath(root))
+        if root and os.path.isdir(root) and normalized not in seen:
+            roots.append(root)
+            seen.add(normalized)
+    return roots
 
 
 def find_snapshot_dir(snapshot_id: str, game_scope: str = "") -> str:
@@ -18,15 +44,18 @@ def find_snapshot_dir(snapshot_id: str, game_scope: str = "") -> str:
     appear invalid, so every caller uses this one compatibility locator.
     """
     snapshot_id = str(snapshot_id or "").strip()
-    if not snapshot_id or not os.path.isdir(SNAPSHOTS_DIR):
+    if not snapshot_id:
         return ""
 
     candidates = []
-    if game_scope:
-        candidates.append(os.path.join(SNAPSHOTS_DIR, game_scope, snapshot_id))
-    candidates.append(os.path.join(SNAPSHOTS_DIR, snapshot_id))
-    for bucket in os.listdir(SNAPSHOTS_DIR):
-        candidates.append(os.path.join(SNAPSHOTS_DIR, bucket, snapshot_id))
+    for root in _snapshot_roots():
+        if not os.path.isdir(root):
+            continue
+        if game_scope:
+            candidates.append(os.path.join(root, game_scope, snapshot_id))
+        candidates.append(os.path.join(root, snapshot_id))
+        for bucket in os.listdir(root):
+            candidates.append(os.path.join(root, bucket, snapshot_id))
 
     seen = set()
     for candidate in candidates:
@@ -145,6 +174,12 @@ GAME_SNAPSHOT_SPECS: dict[str, list[dict]] = {
         {"dir": "Plugins", "include": None},           # MelonLoader 插件(非 BepInEx plugins)
         {"dir": "BepInEx/plugins", "include": None},
         {"dir": "BepInEx/config", "include": None},
+    ],
+    # Street Fighter 6's Fluffy/RE Engine packages overlay this directory.
+    # Steam's vanilla installation does not create it, so this is a safe,
+    # game-specific rollback domain rather than a broad root scan.
+    "streetfighter6": [
+        {"dir": "natives", "include": None},
     ],
 }
 
@@ -790,15 +825,16 @@ def snapshot_restore(snapshot_id: str) -> dict:
 
 
 def list_snapshots_dir() -> list[str]:
-    if not os.path.exists(SNAPSHOTS_DIR):
-        return []
-    result = []
-    for entry in os.listdir(SNAPSHOTS_DIR):
-        sub = os.path.join(SNAPSHOTS_DIR, entry)
-        if os.path.isdir(sub) and entry.startswith("snap_"):
-            result.append(entry)
-        elif os.path.isdir(sub):
-            for snap in os.listdir(sub):
-                if snap.startswith("snap_"):
-                    result.append(snap)
+    result = set()
+    for root in _snapshot_roots():
+        if not os.path.isdir(root):
+            continue
+        for entry in os.listdir(root):
+            sub = os.path.join(root, entry)
+            if os.path.isdir(sub) and entry.startswith("snap_"):
+                result.add(entry)
+            elif os.path.isdir(sub):
+                for snap in os.listdir(sub):
+                    if snap.startswith("snap_"):
+                        result.add(snap)
     return sorted(result, reverse=True)

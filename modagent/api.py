@@ -91,6 +91,16 @@ PROMPT_REFERENCED_TOOLS = {
 async def lifespan(app: FastAPI):
     global cfg
     db.init_db()
+    # Beta used to have a separate .modagent-beta backend store.  A channel
+    # update must retain chats, inventory and rollback history.  The helper is
+    # fingerprinted and creates backups, so normal starts are a no-op.
+    try:
+        from modagent.data_unification import migrate_default_beta_history
+        migrate_default_beta_history(CONFIG_DIR)
+    except Exception as exc:
+        # Migration failure must not prevent the user from opening ModAgent;
+        # its source data remains untouched and the next start can retry.
+        print(f"legacy Beta data migration deferred: {exc}")
     cfg = load_config()
     if cfg.game_slug and cfg.game_instance_id:
         db.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
