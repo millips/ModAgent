@@ -4,7 +4,7 @@
 
 当前版本：**v1.5.1 稳定版**。
 
-[下载 v1.5.1 普通版](https://github.com/millips/ModAgent/releases/tag/v1.5.1) · [游戏适配讨论](https://github.com/millips/ModAgent/discussions/5) · [提交问题](https://github.com/millips/ModAgent/issues) · [隐私说明](PRIVACY.md)
+[下载 v1.5.1 普通版](https://github.com/millips/ModAgent/releases/tag/v1.5.1) · [游戏适配与合作评估](https://github.com/millips/ModAgent/discussions/5) · [提交问题](https://github.com/millips/ModAgent/issues) · [隐私说明](PRIVACY.md)
 
 ![ModAgent 普通版对话与状态总览](docs/assets/promo/v1.0.0/01-chat-overview.png)
 
