@@ -60,7 +60,7 @@ function createPortableZip(source, destination) {
 copy(path.join(verifiedRoot, report.installer))
 copy(path.join(verifiedRoot, manifest.cleanupTool.file))
 copy(path.join(verifiedRoot, 'p-update.json'))
-copy(path.join(repoRoot, 'docs', 'MODAGENT-P-MEMBERSHIP-GUIDE.md'), 'ModAgent-P-会员教程.md')
+copy(path.join(repoRoot, 'docs', 'MODAGENT-P-MEMBERSHIP-GUIDE-v1.5.1.md'), 'ModAgent-P-会员教程.md')
 copy(path.join(repoRoot, 'docs', `USER-GUIDE-v${packageInfo.version}.md`), '使用教程.md')
 copy(path.join(repoRoot, 'docs', `RELEASE-SECURITY-REVIEW-v${packageInfo.version}.md`), '发行安全审查.md')
 const afdianNotes = path.join(repoRoot, 'docs', `AFDIAN-P-LAUNCH-v${packageInfo.version}.md`)
@@ -70,6 +70,9 @@ copy(
     : path.join(repoRoot, 'docs', 'AFDIAN-P-LAUNCH-2026-07-26.md'),
   '爱发电发布文案.md',
 )
+copy(path.join(repoRoot, 'docs', 'AFDIAN-CATALOG-2026-08-08.md'), '爱发电商品页执行稿.md')
+copy(path.join(repoRoot, 'docs', 'MONTHLY-CONTENT-PACKS.md'), '月度内容包规则.md')
+copy(path.join(repoRoot, 'docs', '90-DAY-FEEDBACK-OPERATIONS.md'), '90天反馈与交付台账.md')
 
 const portableName = `ModAgent-P-Portable-${packageInfo.version}.zip`
 const portablePath = path.join(resolved, portableName)

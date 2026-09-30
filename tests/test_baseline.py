@@ -78,8 +78,15 @@ r = tools.execute("snapshot_list", {}, cfg)
 check("7 snapshot_list filtered + path", s0 in r and s1 in r and "存储于" in r)
 check("7 baseline labeled", "原版基线" in r)
 
-# 8. 跨游戏回滚拒绝:把 s1 改挂到 stellarblade 名下再试
+# 8. 跨游戏回滚拒绝:数据库身份和快照真实根目录都指向另一个安装。
+# 只改旧数据库标签但 manifest 仍明确属于当前 root，是历史迁移场景，不能
+# 当作真正的跨盘/跨游戏快照；守卫以稳定身份 + 物理根目录双重判断。
 conn = db.get_conn(); conn.execute("UPDATE snapshots SET game_slug='stellarblade' WHERE id=?", (s1,)); conn.commit(); conn.close()
+manifest_path = os.path.join(snap.SNAPSHOTS_DIR, "palworld", s1, "manifest.json")
+foreign_manifest = json.load(open(manifest_path, encoding="utf-8"))
+foreign_manifest["game_root"] = os.path.join(TMP, "StellarBlade")
+with open(manifest_path, "w", encoding="utf-8") as handle:
+    json.dump(foreign_manifest, handle, ensure_ascii=False)
 r = tools.execute("snapshot_restore", {"snapshot_id": s1}, cfg)
 check("8 cross-game restore refused", "跨游戏回滚已拒绝" in r)
 

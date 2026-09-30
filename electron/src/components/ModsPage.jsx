@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput, Link2, Sparkles, Share2 } from 'lucide-react'
+import { Search, Download, CheckSquare, Trash2, RefreshCw, AlertTriangle, Archive, RotateCcw, XCircle, FolderInput, Link2, Sparkles, Share2, Layers, ChevronDown, ChevronRight } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
 import { isPAccessEnabled, usePLicenseStatus } from '../license/pLicense'
 import { usePShareProfile } from '../pshare/pShareStore'
 import ShareExportDialog from './ShareExportDialog'
+import { tr } from '../i18n'
+import { uninstallOutcome } from './uninstallOutcome.mjs'
 
 const MOCK_MODS = [
   { id: '107', name: 'Cyber Engine Tweaks', name_cn: 'CET 脚本框架', version: '1.32.2', latest: null, category: '框架', desc: '所有脚本 mod 的前置依赖', size: '2.3MB', hasConflict: false, disabled: false },
@@ -20,9 +22,14 @@ const MOCK_MODS = [
   { id: '5265', name: 'Equipment-EX', name_cn: '装备系统扩展', version: '1.2.0', latest: null, category: '框架', desc: '独立装备槽位系统', size: '3.1MB', hasConflict: false, disabled: false },
 ]
 
-const FILTERS = ['全部', '可更新', '已禁用']
+const FILTERS = [
+  { value: 'all', key: 'all' },
+  { value: 'updates', key: 'updates' },
+  { value: 'disabled', key: 'disabled' },
+]
 
-export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) {
+export default function ModsPage({ toast, api, onRefresh, refreshKey, status, language = 'zh-CN' }) {
+  const t = key => tr(language, key)
   const pLicense = usePLicenseStatus()
   const pShareProfile = usePShareProfile()
   const canCreateShare = isPAccessEnabled(pLicense) && Boolean(pShareProfile)
@@ -30,13 +37,14 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const [mods, setMods] = useState([])
   const [search, setSearch] = useState('')
   const [catFilter, setCatFilter] = useState('全部')
-  const [statusFilter, setStatusFilter] = useState('全部')
+  const [statusFilter, setStatusFilter] = useState('all')
   const [selected, setSelected] = useState(new Set())
   const [hovered, setHovered] = useState(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(null)
   const [dependencyGate, setDependencyGate] = useState(null)
   const [batchDelete, setBatchDelete] = useState(null)
   const [batchBusy, setBatchBusy] = useState(false)
+  const [batchProgress, setBatchProgress] = useState(null)
   const [actionLock, setActionLock] = useState(null)
   const [showDownload, setShowDownload] = useState(false)
   const [dlUrl, setDlUrl] = useState('')
@@ -49,8 +57,13 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   const [binding, setBinding] = useState(false)
   const [bindingProgress, setBindingProgress] = useState(null)
   const [alignmentReview, setAlignmentReview] = useState(null)
+  const [manualSource, setManualSource] = useState({})
+  const [manualSourcePreview, setManualSourcePreview] = useState({})
   const [enriching, setEnriching] = useState(false)
   const [showShareExport, setShowShareExport] = useState(false)
+  const [expandedPackages, setExpandedPackages] = useState(new Set())
+  const [packageMerge, setPackageMerge] = useState(null)
+  const [packageMerging, setPackageMerging] = useState(false)
   const bindingAbortRef = useRef(null)
   const updateAbortRef = useRef(null)
 
@@ -72,9 +85,12 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
         sourceKey: m.source_key || '',
         sourceMatchMethod: m.source_match_method || '',
         sourceConfidence: Number(m.source_confidence) || 0,
+        installedBy: m.installed_by || '',
+        managementProvider: m.management_provider || 'local_files',
         dependencies: Array.isArray(m.dependencies) ? m.dependencies : [],
         fileCount: Number(m.file_count) || 0,
         variantCount: Number(m.variant_count) || 0,
+        variants: Array.isArray(m.variants) ? m.variants : [],
         managementUnit: m.management_unit || 'package',
         hasVerifiedSource: Boolean(m.source_key && m.source_url),
         size: '',
@@ -122,23 +138,24 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
   }
 
   const reconcileMods = async () => {
-    toast('对账中...')
+    toast('对账并同步中...')
     try {
       const scope = status?.game_instance_id || status?.game_slug || ''
-      const r = await fetch(`${api}/mods/reconcile?game_slug=${encodeURIComponent(scope)}`, { method: 'POST' })
+      const r = await fetch(`${api}/mods/reconcile?game_slug=${encodeURIComponent(scope)}&sync_missing=true`, { method: 'POST' })
       const d = await r.json()
       const merged = Number(d.duplicates_merged) || 0
+      const removed = Number(d.removed_missing?.length) || 0
       if (d.issues?.length) {
         const names = d.issues.slice(0, 3).map(i => `${i.name}(${i.problem})`).join('、')
         emitFeedback('warning', { source: 'mod-reconcile', count: d.issues.length })
-        toast(`${merged ? `已合并 ${merged} 条重复记录；` : ''}发现 ${d.issues.length}/${d.checked} 个 mod 账实不符: ${names}${d.issues.length > 3 ? ' 等' : ''}`, 'error')
+        toast(`${removed ? `已从管理清单同步移除 ${removed} 个已被手动删空的 Mod；` : ''}${merged ? `已合并 ${merged} 条重复记录；` : ''}发现 ${d.issues.length}/${d.checked} 个 Mod 账实不符: ${names}${d.issues.length > 3 ? ' 等' : ''}`, 'error')
       } else {
         emitFeedback('notice', { source: 'mod-reconcile', count: merged })
         toast(merged
           ? `对账完成：已安全合并 ${merged} 条重复记录，${d.checked} 个 Mod 账实一致`
-          : `对账完成：${d.checked} 个 Mod 账实一致`)
+          : `对账完成：${removed ? `已同步移除 ${removed} 个已手动删除的 Mod；` : ''}${d.checked} 个 Mod 账实一致`)
       }
-      if (merged) await loadFromApi()
+      if (merged || removed) await loadFromApi()
     } catch (_) { emitFeedback('error', { source: 'mod-reconcile' }); toast('对账失败', 'error') }
   }
 
@@ -266,7 +283,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     }
   }
 
-  const runAlignment = async (targetMods = null) => {
+  const runAlignment = async (targetMods = null, forceRebind = false) => {
     const targets = Array.isArray(targetMods)
       ? targetMods
       : mods.filter(mod => !mod.hasVerifiedSource)
@@ -300,6 +317,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           force_refresh: false,
+          force_rebind: forceRebind,
           mod_ids: targetMods ? targets.map(mod => String(mod.id)) : [],
         }),
         signal: controller.signal,
@@ -316,11 +334,14 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       setBindingProgress({ completed: attempted, total: attempted, current: '' })
       emitFeedback('notice', { source: 'source-align', count: summary.bound || 0 })
       const ambiguous = result.ambiguous || []
-      if (ambiguous.length) {
+      const unmatched = result.unmatched || []
+      if (ambiguous.length || unmatched.length) {
         setAlignmentReview({
           items: ambiguous,
-          unmatched: result.unmatched || [],
+          unmatched,
         })
+        setManualSource({})
+        setManualSourcePreview({})
       }
       toast(`对齐完成：沿用已有 ${summary.already_bound || 0}，新增 ${summary.bound || 0}，待确认 ${summary.ambiguous || 0}，未匹配 ${summary.unmatched || 0}`)
       await loadFromApi()
@@ -371,12 +392,20 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       const envelope = await response.json()
       const result = JSON.parse(envelope.result || '{}')
       if (result.error || !result.bound) throw new Error(result.error || '绑定失败')
-      const remaining = (alignmentReview?.items || []).filter(
+      const remainingItems = (alignmentReview?.items || []).filter(
         row => String(row.mod_id) !== String(item.mod_id),
       )
-      setAlignmentReview(remaining.length
-        ? { ...alignmentReview, items: remaining }
+      const remainingUnmatched = (alignmentReview?.unmatched || []).filter(
+        row => String(row.mod_id) !== String(item.mod_id),
+      )
+      setAlignmentReview(remainingItems.length || remainingUnmatched.length
+        ? { ...alignmentReview, items: remainingItems, unmatched: remainingUnmatched }
         : null)
+      setManualSourcePreview(previous => {
+        const next = { ...previous }
+        delete next[item.mod_id]
+        return next
+      })
       toast(`${item.name} 已确认绑定到 ${candidate.name || candidate.source_key}`)
       await loadFromApi()
       onRefresh?.()
@@ -389,6 +418,74 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       window.clearTimeout(timeoutId)
       setActionLock(null)
     }
+  }
+
+  const parseManualSourceUrl = (rawUrl) => {
+    let url
+    try { url = new URL(String(rawUrl || '').trim()) } catch (_) { return null }
+    const host = url.hostname.toLowerCase()
+    const path = url.pathname
+    const nexus = path.match(/\/mods\/(\d+)/i)
+    if (host.endsWith('nexusmods.com') && nexus) {
+      return { source: 'nexus', source_key: nexus[1], source_url: url.href }
+    }
+    const thunder = path.match(/\/c\/[^/]+\/p\/([^/]+)\/([^/?#]+)/i)
+    if (host.endsWith('thunderstore.io') && thunder) {
+      return {
+        source: 'thunderstore',
+        source_key: `${decodeURIComponent(thunder[1])}-${decodeURIComponent(thunder[2])}`,
+        source_url: url.href,
+      }
+    }
+    return null
+  }
+
+  const inspectManualSource = async (item) => {
+    const rawUrl = String(manualSource[item.mod_id] || '').trim()
+    const parsed = parseManualSourceUrl(rawUrl)
+    if (!parsed) {
+      toast('请粘贴 Nexus 或 Thunderstore 的具体 Mod 维护页网址', 'error')
+      return
+    }
+    const lockId = `manual-source:${item.mod_id}`
+    if (actionLock) return
+    setActionLock(lockId)
+    try {
+      const response = await fetch(api + '/tool/mod_source_bind', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          local_mod_id: String(item.mod_id),
+          ...parsed,
+          nexus_mod_id: parsed.source === 'nexus' ? Number(parsed.source_key) : undefined,
+          confirmed: false,
+        }),
+      })
+      const envelope = await response.json()
+      const result = JSON.parse(envelope.result || '{}')
+      if (result.error || !result.requires_confirmation) {
+        throw new Error(result.error || '网址未能通过来源核验')
+      }
+      setManualSourcePreview(previous => ({ ...previous, [item.mod_id]: {
+        ...parsed, preview: result.preview || {},
+      }}))
+      toast('网址已核验，请确认是否绑定到当前 Mod')
+    } catch (error) {
+      toast(error?.message || '网址核验失败', 'error')
+    } finally {
+      setActionLock(null)
+    }
+  }
+
+  const confirmManualSource = async (item) => {
+    const candidate = manualSourcePreview[item.mod_id]
+    if (!candidate) return
+    await confirmAlignmentCandidate(item, {
+      source: candidate.source,
+      source_key: candidate.source_key,
+      url: candidate.source_url,
+      name: candidate.preview?.nexus?.name || candidate.preview?.source?.name || candidate.source_key,
+      latest_version: candidate.preview?.nexus?.version || candidate.preview?.source?.version || '',
+    })
   }
 
   // 下载新 Mod：粘贴 GitHub/Thunderstore/GameBanana 链接 → 下载（+可选安装）
@@ -440,9 +537,9 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       && !m.desc.toLowerCase().includes(search.toLowerCase())
     ) return false
     if (catFilter !== '全部' && m.category !== catFilter) return false
-    if (statusFilter === '可更新' && !m.latest) return false
+    if (statusFilter === 'updates' && !m.latest) return false
     if (statusFilter === '有冲突' && !m.hasConflict) return false
-    if (statusFilter === '已禁用' && !m.disabled) return false
+    if (statusFilter === 'disabled' && !m.disabled) return false
     return true
   })
 
@@ -450,6 +547,53 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     const next = new Set(selected)
     next.has(id) ? next.delete(id) : next.add(id)
     setSelected(next)
+  }
+
+  const togglePackageExpanded = (id) => {
+    setExpandedPackages(previous => {
+      const next = new Set(previous)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
+  const beginPackageMerge = () => {
+    const chosen = mods.filter(mod => selected.has(mod.id))
+    if (chosen.length < 2) return
+    const first = chosen[0]?.name_cn || chosen[0]?.name || '自定义 Mod 包'
+    setPackageMerge({ name: first, items: chosen })
+  }
+
+  const confirmPackageMerge = async () => {
+    if (!packageMerge || packageMerging) return
+    const name = String(packageMerge.name || '').trim()
+    if (!name) {
+      toast('请为合并后的 Mod 包填写名称', 'error')
+      return
+    }
+    setPackageMerging(true)
+    try {
+      const scope = status?.game_instance_id || status?.game_slug || ''
+      const response = await fetch(`${api}/mods/package-merge`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mod_ids: packageMerge.items.map(item => item.id),
+          package_name: name,
+          game_slug: scope,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok || !result.ok) throw new Error(result.detail || result.error || 'package_merge_failed')
+      setSelected(new Set())
+      setPackageMerge(null)
+      await loadFromApi()
+      onRefresh?.()
+      toast(`已合并为“${result.name}”：${result.file_count} 个文件；未改动游戏文件`)
+    } catch (error) {
+      toast('合并记录失败：' + (error?.message || '请稍后重试'), 'error')
+    } finally {
+      setPackageMerging(false)
+    }
   }
 
   const toggleAll = () => {
@@ -466,9 +610,11 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       })
       const d = await r.json()
       const preview = JSON.parse(d.result || '{}')
+      if (!r.ok || preview.error || preview.requires_confirmation !== true) throw new Error(preview.error || '无法取得卸载预览')
       setShowDeleteConfirm({ ...mod, preview })
     } catch (e) {
-      setShowDeleteConfirm({ ...mod, preview: null })   // 预览失败仍允许确认(降级,后端仍会二次守门)
+      setShowDeleteConfirm(null)
+      toast(friendlyErr(e?.message || '卸载预览失败，未执行删除'), 'error')
     }
   }
 
@@ -484,7 +630,13 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       })
       const d = await r.json()
       const data = JSON.parse(d.result || '{}')
-      if (data.error) { emitFeedback('error', { source: 'uninstall' }); toast(friendlyErr(data.error), 'error') }
+      const outcome = uninstallOutcome(data, language)
+      if (!r.ok || !outcome.complete) {
+        emitFeedback('error', { source: 'uninstall' })
+        toast(outcome.message, 'error')
+        loadFromApi()
+        onRefresh?.()
+      }
       else {
         emitFeedback('remove-complete', { modId: mod.id, name: mod.name })
         toast(`${mod.name || mod.id} 已卸载 (${data.removed || 0} 个文件)`)
@@ -514,7 +666,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       if (data.error) {
         emitFeedback('error', { source: action })
         toast(friendlyErr(data.error), 'error')
-      } else if (data.blocked || data.requires_confirmation) {
+      } else if (data.blocked || data.requires_confirmation || data.requires_external_manager) {
         setDependencyGate({ mod, action, enabling, data })
         emitFeedback(data.blocked || !enabling ? 'warning' : 'notice', {
           source: 'dependency-gate', modId: mod.id,
@@ -545,18 +697,22 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     const targets = mods.filter(mod => selected.has(mod.id))
     if (!targets.length || batchBusy) return
     setBatchBusy(true)
+    setBatchProgress({ phase: 'preview', completed: 0, total: targets.length, current: '' })
     toast(`正在核对 ${targets.length} 个 Mod 的卸载影响...`)
     try {
       const items = []
-      for (const mod of targets) {
+      for (let index = 0; index < targets.length; index += 1) {
+        const mod = targets[index]
+        setBatchProgress({ phase: 'preview', completed: index, total: targets.length, current: mod.name })
         const r = await fetch(api + '/tool/mod_uninstall', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ mod_id: mod.id }),
         })
         const d = await r.json()
         const preview = JSON.parse(d.result || '{}')
-        if (preview.error || !preview.requires_confirmation) throw new Error(preview.error || `无法预览 ${mod.name}`)
+        if (!r.ok || preview.error || preview.requires_confirmation !== true) throw new Error(preview.error || `无法预览 ${mod.name}`)
         items.push({ mod, preview })
+        setBatchProgress({ phase: 'preview', completed: index + 1, total: targets.length, current: mod.name })
       }
       setBatchDelete({ items })
       emitFeedback('warning', { source: 'batch-uninstall-preview', count: items.length })
@@ -565,6 +721,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       toast(friendlyErr(error?.message || '批量卸载预览失败'), 'error')
     } finally {
       setBatchBusy(false)
+      setBatchProgress(null)
     }
   }
 
@@ -575,26 +732,49 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
     setBatchBusy(true)
     const succeeded = []
     const failed = []
-    for (const item of plan.items) {
+    let snapshotId = ''
+    try {
+      setBatchProgress({ phase: 'snapshot', completed: 0, total: plan.items.length, current: '正在创建批量删除前安全快照' })
+      const snapshotResponse = await fetch(api + '/tool/snapshot_create', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trigger_mod_name: `批量删除 ${plan.items.length} 个 Mod 前` }),
+      })
+      const snapshotEnvelope = await snapshotResponse.json()
+      const snapshotData = JSON.parse(snapshotEnvelope.result || '{}')
+      if (snapshotData.error || !snapshotData.snapshot_id) throw new Error(snapshotData.error || '无法创建批量删除前安全快照')
+      snapshotId = snapshotData.snapshot_id
+    } catch (error) {
+      setBatchBusy(false)
+      setBatchProgress(null)
+      emitFeedback('error', { source: 'batch-uninstall-snapshot' })
+      toast(friendlyErr(error?.message || '无法创建批量删除前安全快照，已取消删除'), 'error')
+      return
+    }
+    for (let index = 0; index < plan.items.length; index += 1) {
+      const item = plan.items[index]
+      setBatchProgress({ phase: 'delete', completed: index, total: plan.items.length, current: item.mod.name, succeeded: succeeded.length, failed: failed.length })
       try {
         const r = await fetch(api + '/tool/mod_uninstall', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mod_id: item.mod.id, confirmed: true }),
+          body: JSON.stringify({ mod_id: item.mod.id, confirmed: true, snapshot_id: snapshotId }),
         })
         const d = await r.json()
         const data = JSON.parse(d.result || '{}')
-        if (data.error) failed.push(item.mod.name)
+        if (!r.ok || !uninstallOutcome(data, language).complete) failed.push(item.mod.name)
         else succeeded.push(item.mod.id)
       } catch (_) {
         failed.push(item.mod.name)
       }
+      setBatchProgress({ phase: 'delete', completed: index + 1, total: plan.items.length, current: item.mod.name, succeeded: succeeded.length, failed: failed.length })
     }
     if (succeeded.length) {
       emitFeedback('remove-complete', { source: 'batch-uninstall', count: succeeded.length })
       setSelected(prev => new Set([...prev].filter(id => !succeeded.includes(id))))
-      await loadFromApi()
-      onRefresh?.()
     }
+    // A partial removal may change files without removing its management row.
+    // Refresh for every outcome, while leaving failed targets selected.
+    await loadFromApi()
+    onRefresh?.()
     if (failed.length) {
       emitFeedback('error', { source: 'batch-uninstall', count: failed.length })
       toast(`已卸载 ${succeeded.length} 个；${failed.length} 个失败：${failed.slice(0, 3).join('、')}`, 'error')
@@ -602,6 +782,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       toast(`已卸载 ${succeeded.length} 个 Mod`)
     }
     setBatchBusy(false)
+    setBatchProgress(null)
   }
 
   const totalSize = mods.reduce((sum, m) => {
@@ -634,7 +815,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-500" />
             <input
               className="input-cyber pl-9"
-              placeholder="搜索 Mod 名称..."
+              placeholder={t('searchMods')}
               value={search}
               onChange={e => setSearch(e.target.value)}
             />
@@ -642,18 +823,18 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
           <div className="flex gap-1">
             {FILTERS.map(f => (
               <button
-                key={f}
-                onClick={() => setStatusFilter(f)}
-                className={`px-3 py-1.5 rounded-md text-xs transition-all ${statusFilter === f ? 'bg-cyber-blue/20 text-cyber-cyan border border-cyber-cyan/30' : 'text-surface-500 hover:text-white'}`}
+                key={f.value}
+                onClick={() => setStatusFilter(f.value)}
+                className={`px-3 py-1.5 rounded-md text-xs transition-all ${statusFilter === f.value ? 'bg-cyber-blue/20 text-cyber-cyan border border-cyber-cyan/30' : 'text-surface-500 hover:text-white'}`}
               >
-                {f}
+                {t(f.key)}
               </button>
             ))}
           </div>
           <div className="flex flex-wrap justify-end gap-1 ml-auto">
             <button className="btn-ghost flex items-center gap-1" onClick={reconcileMods}
               title="校验每个已装 mod 记录的文件是否还在磁盘上,揪出空账/缺文件">
-              对账
+              {t('reconcile')}
             </button>
             <button
               className={`btn-ghost flex items-center gap-1 ${checking ? 'text-cyber-red' : ''}`}
@@ -664,7 +845,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               {checking ? <XCircle size={14} /> : <RefreshCw size={14} />}
               {checking
                 ? `取消检查 ${updateProgress?.completed || 0}/${updateProgress?.total || mods.length}`
-                : '检查更新'}
+                : t('checkUpdates')}
             </button>
             <button
               className={`btn-ghost flex items-center gap-1 ${binding ? 'text-cyber-red' : ''}`}
@@ -676,7 +857,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               {binding ? <XCircle size={14} /> : <Link2 size={14} />}
               {binding
                 ? `取消对齐 ${bindingProgress?.completed || 0}/${bindingProgress?.total || mods.length}`
-                : `对齐 ${boundCount}/${mods.length}`}
+                : `${t('align')} ${boundCount}/${mods.length}`}
             </button>
             <button
               className="btn-ghost flex items-center gap-1"
@@ -685,13 +866,13 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               title="依据本地清单和已绑定来源生成中文名称与一句话功能简介；证据不足时会明确标记为 AI 推测"
             >
               <Sparkles size={14} className={enriching ? 'animate-pulse' : ''} />
-              {enriching ? '生成简介中' : 'AI 补全简介'}
+              {enriching ? t('generatingSummary') : t('enrichSummary')}
             </button>
             <button className="btn-ghost flex items-center gap-1" onClick={loadFromApi}>
-              刷新
+              {t('refreshMods')}
             </button>
             <button className="btn-cyber flex items-center gap-1.5" onClick={() => setShowDownload(true)}>
-              <Download size={14} /> 下载新 Mod
+              <Download size={14} /> {t('downloadNewMod')}
             </button>
             <button className="btn-ghost flex items-center gap-1" title="打开投放文件夹：把手动下载的 mod(三宫六院/3DM/网盘等)拖进去，再让 ModAgent 扫描安装"
               onClick={async () => {
@@ -702,7 +883,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                   else { emitFeedback('error', { source: 'dropbox' }); toast('打开失败: ' + (d.error || ''), 'error') }
                 } catch (e) { emitFeedback('error', { source: 'dropbox' }); toast('打开失败', 'error') }
               }}>
-              <FolderInput size={14} /> 投放文件夹
+              <FolderInput size={14} /> {t('dropFolder')}
             </button>
             <button className="btn-ghost flex items-center gap-1" title="打开 ModAgent 为当前游戏保存下载包的目录"
               onClick={async () => {
@@ -713,7 +894,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                   else { emitFeedback('error', { source: 'downloads' }); toast('打开失败: ' + (d.error || ''), 'error') }
                 } catch (e) { emitFeedback('error', { source: 'downloads' }); toast('打开失败', 'error') }
               }}>
-              <FolderInput size={14} /> Mod 文件夹
+              <FolderInput size={14} /> {t('modFolder')}
             </button>
             <button className="btn-ghost flex items-center gap-1" title="打开独立 Mod 管理器、加载器等工具的受控解压目录"
               onClick={async () => {
@@ -724,10 +905,10 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                   else { emitFeedback('error', { source: 'tools' }); toast('打开失败: ' + (d.error || ''), 'error') }
                 } catch (e) { emitFeedback('error', { source: 'tools' }); toast('打开失败', 'error') }
               }}>
-              <FolderInput size={14} /> 工具目录
+              <FolderInput size={14} /> {t('toolsFolder')}
             </button>
             <button className="btn-ghost flex items-center gap-1" onClick={toggleAll}>
-              <CheckSquare size={14} /> {selected.size === filtered.length ? '取消全选' : '全选'}
+              <CheckSquare size={14} /> {selected.size === filtered.length ? t('clearSelection') : t('selectAll')}
             </button>
           </div>
         </div>
@@ -760,8 +941,8 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
       {/* Mod list */}
       <div className="flex-1 overflow-y-auto">
         {filtered.map((mod, i) => (
+          <React.Fragment key={mod.id}>
           <div
-            key={mod.id}
             onMouseEnter={() => setHovered(mod.id)}
             onMouseLeave={() => setHovered(null)}
             className={`flex items-center gap-3 px-4 py-2.5 border-b border-surface-700/50 transition-all duration-150 animate-fade-in
@@ -816,12 +997,15 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                   </span>
                 )}
                 {mod.variantCount > 1 && (
-                  <span
-                    className="shrink-0 rounded border border-cyber-cyan/25 px-1.5 py-0.5 text-[9px] text-cyber-cyan"
+                  <button
+                    type="button"
+                    onClick={() => togglePackageExpanded(mod.id)}
+                    className="flex shrink-0 items-center gap-1 rounded border border-cyber-cyan/25 px-1.5 py-0.5 text-[9px] text-cyber-cyan hover:bg-cyber-cyan/10"
                     title={`该下载包包含 ${mod.variantCount} 个文件变体；更新、启用、禁用和卸载均按整包处理`}
                   >
+                    {expandedPackages.has(mod.id) ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
                     包内 {mod.variantCount} 个变体
-                  </span>
+                  </button>
                 )}
               </div>
             </div>
@@ -894,6 +1078,25 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               </button>
             </div>
           </div>
+          {mod.variantCount > 1 && expandedPackages.has(mod.id) && (
+            <div className="border-b border-cyber-cyan/15 bg-surface-900/55 px-16 py-2 text-xs">
+              <div className="mb-1.5 flex items-center gap-2 text-cyber-cyan">
+                <Layers size={12} />
+                <span>包内变体（可查看；整包启停和卸载仍由主条目统一处理）</span>
+              </div>
+              <div className="grid gap-1 md:grid-cols-2 xl:grid-cols-3">
+                {mod.variants.map(variant => (
+                  <div key={variant.key} className="flex items-center justify-between gap-2 rounded border border-surface-700 bg-surface-800/60 px-2 py-1">
+                    <span className="truncate text-surface-300" title={variant.name}>{variant.name}</span>
+                    <span className={variant.disabled ? 'shrink-0 text-surface-500' : 'shrink-0 text-cyber-cyan/80'}>
+                      {variant.disabled ? '已停用' : `${variant.file_count} 文件`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          </React.Fragment>
         ))}
         {filtered.length === 0 && mods.length === 0 && (
           <div className="mods-empty-state flex flex-col items-center justify-center py-20 text-surface-500">
@@ -930,8 +1133,21 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               </span>
             )}
             {canEnrollShare && <span className="text-[10px] text-surface-400">请先在设置中开通 P Share 创作者计划</span>}
+            {selected.size >= 2 && (
+              <button
+                onClick={beginPackageMerge}
+                disabled={batchBusy}
+                className="btn-ghost text-cyber-cyan flex items-center gap-1"
+                title="只合并 ModAgent 的本地管理记录，不移动、删除或改名游戏文件"
+              >
+                <Layers size={12} /> 合并为 Mod 包
+              </button>
+            )}
             <button onClick={previewBatchDelete} disabled={batchBusy} className="btn-ghost text-cyber-red flex items-center gap-1">
-              {batchBusy ? <RefreshCw size={12} className="animate-spin" /> : <Trash2 size={12} />} 批量删除
+              {batchBusy ? <RefreshCw size={12} className="animate-spin" /> : <Trash2 size={12} />}
+              {batchBusy && batchProgress
+                ? `${batchProgress.phase === 'preview' ? '核对' : batchProgress.phase === 'snapshot' ? '创建快照' : '删除'} ${batchProgress.completed}/${batchProgress.total}`
+                : '批量删除'}
             </button>
           </div>
         )}
@@ -942,10 +1158,48 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
           api={api}
           mods={selectedMods}
           toast={toast}
+          language={language}
           gameName={status?.game || ''}
           gameSlug={status?.game_instance_id || status?.game_slug || ''}
           onClose={() => setShowShareExport(false)}
         />
+      )}
+
+      {packageMerge && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={() => !packageMerging && setPackageMerge(null)}>
+          <div className="w-[min(92vw,620px)] rounded-lg border border-cyber-cyan/35 bg-surface-800 p-5 shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
+            <div className="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-base font-semibold text-white">合并为一个 Mod 包</h3>
+                <p className="mt-1 text-xs text-surface-400">把选中的 {packageMerge.items.length} 条本地管理记录合成一个父条目。不会移动、删除或改名任何游戏文件。</p>
+              </div>
+              <button className="btn-ghost p-1.5" disabled={packageMerging} onClick={() => setPackageMerge(null)} title="关闭"><XCircle size={16} /></button>
+            </div>
+            <label className="block text-xs text-surface-300">
+              Mod 包名称
+              <input
+                className="mt-2 w-full rounded-md border border-surface-600 bg-surface-900 px-3 py-2 text-sm text-white outline-none focus:border-cyber-cyan"
+                value={packageMerge.name}
+                maxLength={160}
+                disabled={packageMerging}
+                onChange={event => setPackageMerge(previous => ({ ...previous, name: event.target.value }))}
+              />
+            </label>
+            <div className="mt-3 rounded-md border border-surface-700 bg-surface-900/70 p-3 text-xs">
+              <div className="mb-2 text-surface-400">将合并以下组件：</div>
+              <div className="max-h-36 space-y-1 overflow-y-auto text-white/85">
+                {packageMerge.items.map(item => <div key={item.id}>• {item.name}</div>)}
+              </div>
+            </div>
+            <p className="mt-3 text-[11px] leading-5 text-cyber-yellow">提示：若这些条目来自不同的官方页面，合并后会保留为“本地包”，避免把不确定来源误标成同一个已核验来源；你仍可重新对齐该整包。</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button className="btn-ghost" disabled={packageMerging} onClick={() => setPackageMerge(null)}>取消</button>
+              <button className="btn-cyber" disabled={packageMerging || !String(packageMerge.name || '').trim()} onClick={confirmPackageMerge}>
+                {packageMerging ? '正在合并…' : '确认合并'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* 更新检测只给出候选；用户勾选后才进入更新流水线。 */}
@@ -1041,7 +1295,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                   {batchDelete.items.length > 12 && <p>…另有 {batchDelete.items.length - 12} 个</p>}
                 </div>
                 {!!dependents.length && <p className="text-cyber-yellow">⚠️ 受影响依赖：{dependents.slice(0, 8).join('、')}{dependents.length > 8 ? ' 等' : ''}</p>}
-                <p className="text-surface-500">每个本地 Mod 卸载前仍会建立快照；单项失败会单独报告，不会伪装成全部成功。</p>
+                <p className="text-surface-500">确认后会先创建 1 份“批量删除前”安全快照，再逐项删除；单项失败会单独报告，不会伪装成全部成功。</p>
               </div>
               <div className="flex justify-end gap-2">
                 <button onClick={() => setBatchDelete(null)} className="btn-ghost">取消</button>
@@ -1051,6 +1305,20 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
           </div>
         )
       })()}
+
+      {batchProgress && (
+        <div className="fixed right-5 bottom-14 z-[60] w-80 rounded-lg border border-cyber-cyan/40 bg-surface-900/95 p-3 shadow-2xl text-xs">
+          <div className="flex items-center justify-between gap-3 text-white/90">
+            <span>{batchProgress.phase === 'preview' ? '正在核对批量卸载影响' : batchProgress.phase === 'snapshot' ? '正在创建安全快照' : '正在批量删除'}</span>
+            <span className="font-mono text-cyber-cyan">{batchProgress.completed}/{batchProgress.total}</span>
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded bg-surface-700">
+            <div className="h-full bg-cyber-cyan transition-all" style={{ width: `${batchProgress.total ? (batchProgress.completed / batchProgress.total) * 100 : 0}%` }} />
+          </div>
+          <p className="mt-2 truncate text-surface-400">{batchProgress.current || '准备中…'}</p>
+          {batchProgress.phase === 'delete' && <p className="mt-1 text-surface-500">成功 {batchProgress.succeeded || 0} · 失败 {batchProgress.failed || 0}</p>}
+        </div>
+      )}
 
       {/* Delete confirm dialog */}
       {showDeleteConfirm && (
@@ -1097,15 +1365,19 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                 <AlertTriangle size={20} className={dependencyGate.data.blocked || !dependencyGate.enabling ? 'text-cyber-red' : 'text-cyber-cyan'} />
               </div>
               <div>
-                <h3 className="text-sm font-semibold text-white">
+                {dependencyGate.data.requires_external_manager && (
+                  <h3 className="text-sm font-semibold text-white">请在 Steam 中管理启用状态</h3>
+                )}
+                {!dependencyGate.data.requires_external_manager && <h3 className="text-sm font-semibold text-white">
                   {dependencyGate.data.blocked ? '缺少前置依赖' : dependencyGate.enabling ? '确认启用依赖链' : '确认级联禁用'}
-                </h3>
+                </h3>}
                 <p className="text-xs text-surface-300">{dependencyGate.mod.name_cn || dependencyGate.mod.name}</p>
               </div>
             </div>
             <div className="bg-surface-900 rounded-md p-3 mb-4 text-xs text-surface-400 space-y-2">
               <p><span className="text-white/80">功能：</span>{dependencyGate.mod.desc}</p>
               <p>{dependencyGate.data.note}</p>
+              {dependencyGate.data.user_action && <p className="text-cyber-cyan">{dependencyGate.data.user_action}</p>}
               {!!dependencyGate.data.decision_support && (
                 <div className="space-y-2 border-l-2 border-cyber-yellow/60 pl-3">
                   <p className="text-white">{dependencyGate.data.decision_support.summary}</p>
@@ -1172,7 +1444,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
               </button>
             </div>
             <div className="space-y-4">
-              {alignmentReview.items.map(item => (
+              {[...(alignmentReview.items || []), ...(alignmentReview.unmatched || [])].map(item => (
                 <div key={item.mod_id} className="rounded-md border border-surface-600 bg-surface-900/70 p-3">
                   <div className="mb-2">
                     <div className="text-sm font-medium text-white">{item.name}</div>
@@ -1221,6 +1493,47 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status }) 
                         </div>
                       </div>
                     ))}
+                  </div>
+                  <div className="mt-3 border-t border-surface-700 pt-3">
+                    <div className="text-[11px] text-surface-400 mb-2">
+                      如果你知道它来自哪里，可直接粘贴 Nexus / Thunderstore 的具体 Mod 维护页。ModAgent 会先核验，再由你确认绑定。
+                    </div>
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <input
+                        value={manualSource[item.mod_id] || ''}
+                        onChange={event => setManualSource(previous => ({
+                          ...previous, [item.mod_id]: event.target.value,
+                        }))}
+                        placeholder="手动添加网址并检查"
+                        className="input-cyber flex-1 text-xs"
+                      />
+                      <button
+                        className="btn-ghost text-xs shrink-0"
+                        disabled={!!actionLock}
+                        onClick={() => inspectManualSource(item)}
+                      >
+                        {actionLock === `manual-source:${item.mod_id}` ? '检查中…' : '检查网址'}
+                      </button>
+                      <button
+                        className="btn-ghost text-xs shrink-0"
+                        disabled={binding || !!actionLock}
+                        onClick={() => runAlignment([item], true)}
+                      >
+                        重新对齐
+                      </button>
+                    </div>
+                    {manualSourcePreview[item.mod_id] && (
+                      <div className="mt-2 flex items-center justify-between gap-3 rounded border border-cyber-cyan/35 bg-cyber-cyan/5 px-3 py-2">
+                        <div className="min-w-0 text-[11px] text-surface-200">
+                          已核验：{manualSourcePreview[item.mod_id].preview?.nexus?.name || manualSourcePreview[item.mod_id].preview?.source?.name || manualSourcePreview[item.mod_id].source_key}
+                        </div>
+                        <button
+                          className="btn-cyber text-xs shrink-0"
+                          disabled={!!actionLock}
+                          onClick={() => confirmManualSource(item)}
+                        >确认绑定</button>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}

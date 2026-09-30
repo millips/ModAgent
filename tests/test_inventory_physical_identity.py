@@ -4,7 +4,7 @@ import os
 import tempfile
 import zipfile
 
-from modagent import db, games, nexus, scanner, snapshot, tools
+from modagent import db, downloader, games, nexus, scanner, snapshot, tools
 from modagent.config import Config, Tier
 from modagent.inventory_match import find_installed_duplicate
 
@@ -64,6 +64,58 @@ assert direct_scan["identified"] == [], direct_scan
 assert [(item.id, item.name) for item in db.get_installed_mods("repo")] == [
     ("39", "MoneyValueTracker"),
 ]
+
+# A custom install can record the package payload while a later loader scan
+# adds a generated file and reports the manifest name.  Shared DLL evidence
+# plus the normalized name must still collapse it to one Mod.
+gmcm_dll = os.path.join(
+    game, "BepInEx", "plugins", "GenericModConfigMenu", "GMCM.dll",
+)
+gmcm_cfg = os.path.join(
+    game, "BepInEx", "config", "GMCM.cfg",
+)
+os.makedirs(os.path.dirname(gmcm_dll), exist_ok=True)
+os.makedirs(os.path.dirname(gmcm_cfg), exist_ok=True)
+open(gmcm_dll, "wb").close()
+open(gmcm_cfg, "wb").close()
+db.add_mod(db.InstalledMod(
+    id="custom_5098_1145906_Generic_Mod_Config_Menu_GMCM",
+    name="Generic Mod Config Menu (GMCM)", version="", snapshot_id="",
+    files_installed=json.dumps([gmcm_dll]), installed_by="custom",
+    game_slug="repo",
+))
+db.add_mod(db.InstalledMod(
+    id="local_gmcm", name="GenericModConfigMenu", version="unknown",
+    snapshot_id="", files_installed=json.dumps([gmcm_dll, gmcm_cfg]),
+    installed_by="imported", game_slug="repo",
+))
+merged_semantic = db.merge_duplicate_inventory_rows("repo")
+assert any(item["reason"] == "shared_file_matching_name" for item in merged_semantic), merged_semantic
+assert db.get_mod("local_gmcm", "repo") is None
+db.remove_mod("custom_5098_1145906_Generic_Mod_Config_Menu_GMCM", "repo")
+
+# A Nexus archive downloaded by ModAgent carries a numeric Mod ID even before
+# a browser detail page is available.  It must become an immediate source
+# binding after install rather than falling back to a future manual alignment.
+original_provenance_reader = downloader.read_download_provenance
+downloader.read_download_provenance = lambda _path: {
+    "source": "nexus", "game_slug": "repo", "source_key": "5098",
+}
+try:
+    nexus_provenance = tools._download_source_provenance("ignored.zip", "repo")
+finally:
+    downloader.read_download_provenance = original_provenance_reader
+assert nexus_provenance["source"] == "nexus", nexus_provenance
+assert nexus_provenance["source_url"] == "https://www.nexusmods.com/repo/mods/5098", nexus_provenance
+db.add_mod(db.InstalledMod(
+    id="custom_5098_1145906_legacy", name="legacy nexus install",
+    version="1.0", snapshot_id="", files_installed="[]", installed_by="custom",
+    game_slug="repo",
+))
+backfilled = db.backfill_custom_nexus_bindings("repo")
+assert backfilled == [{"mod_id": "custom_5098_1145906_legacy", "source_key": "5098"}], backfilled
+assert db.get_mod_source_binding("custom_5098_1145906_legacy", "repo")["source"] == "nexus"
+db.remove_mod("custom_5098_1145906_legacy", "repo")
 
 # The visible "reconcile" action includes identity reconciliation, not only a
 # missing-file check.
@@ -135,5 +187,21 @@ assert result["already_installed"] is True, result
 assert result["install_skipped"] is True, result
 with open(plugin, "rb") as handle:
     assert handle.read() == b"existing"
+
+# An explicit list reconciliation must synchronise an externally deleted Mod
+# out of the visible inventory, while the ordinary diagnostic mode keeps its
+# conservative no-write behaviour.
+deleted_file = os.path.join(game, "BepInEx", "plugins", "deleted", "gone.dll")
+db.add_mod(db.InstalledMod(
+    id="externally_deleted", name="Externally deleted Mod", version="1.0",
+    snapshot_id="", files_installed=json.dumps([deleted_file]),
+    installed_by="imported", game_slug="repo",
+))
+diagnostic = api.mods_reconcile("repo")
+assert any(item["mod_id"] == "externally_deleted" for item in diagnostic["issues"]), diagnostic
+assert db.get_mod("externally_deleted", "repo") is not None
+synchronised = api.mods_reconcile("repo", sync_missing=True)
+assert [item["mod_id"] for item in synchronised["removed_missing"]] == ["externally_deleted"], synchronised
+assert db.get_mod("externally_deleted", "repo") is None
 
 print("PHYSICAL INVENTORY IDENTITY TESTS PASSED")

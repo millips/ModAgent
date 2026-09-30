@@ -1,0 +1,40 @@
+name: Agent Core v2 evals
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Deterministic suite size
+        required: true
+        default: '1000'
+        type: choice
+        options: ['120', '500', '1000']
+  schedule:
+    - cron: '25 18 * * *'
+
+jobs:
+  deterministic-gates:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pip install -e . pytest
+      - name: Core suite
+        if: github.event_name == 'pull_request'
+        run: python -m evals.runner --suite 120 --json
+      - name: Extended or nightly suite
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $suite = '${{ inputs.suite }}'
+          if (-not $suite) { $suite = '1000' }
+          python -m evals.runner --suite $suite --json
+      - name: State, cancellation, retry and idempotency tests
+        run: python -m pytest tests/test_agent_core_v2.py tests/test_turn_cancellation.py -q
+

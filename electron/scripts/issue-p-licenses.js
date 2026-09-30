@@ -11,17 +11,25 @@ function hasFlag(name) {
   return process.argv.includes(name)
 }
 
+function options(name) {
+  return process.argv.reduce((values, value, index) => (
+    value === name && process.argv[index + 1] ? [...values, process.argv[index + 1]] : values
+  ), [])
+}
+
 const privateKeyPath = path.resolve(option('--private-key'))
 const outputDir = path.resolve(option('--output'))
 const count = Number(option('--count', '1'))
 const days = Number(option('--days', '60'))
 const permanent = hasFlag('--permanent')
 const batch = option('--batch', new Date().toISOString().slice(0, 10))
+const contentPacks = [...new Set(options('--pack').map(value => String(value).trim()))]
 if (!option('--private-key') || !option('--output')) {
-  throw new Error('Usage: node issue-p-licenses.js --private-key <private.pem> --output <folder> [--count 100] [--days 60 | --permanent] [--batch launch]')
+  throw new Error('Usage: node issue-p-licenses.js --private-key <private.pem> --output <folder> [--count 100] [--days 30 | --permanent] [--pack content-pack-id] [--batch launch]')
 }
 if (!Number.isInteger(count) || count < 1 || count > 10000) throw new Error('count must be 1..10000')
 if (!permanent && (!Number.isInteger(days) || days < 1 || days > 366)) throw new Error('days must be 1..366')
+if (contentPacks.some(pack => !/^[a-z0-9][a-z0-9_-]{2,63}$/.test(pack))) throw new Error('content pack ids must be lowercase a-z, 0-9, _ or -')
 
 const privateKey = fs.readFileSync(privateKeyPath, 'utf8')
 const rows = []
@@ -31,6 +39,7 @@ for (let index = 0; index < count; index += 1) {
     product: 'modagent-p',
     id: crypto.randomBytes(12).toString('base64url'),
     batch,
+    ...(contentPacks.length ? { content_packs: contentPacks } : {}),
     ...(permanent ? { entitlement: 'permanent' } : { days }),
   }
   const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
@@ -40,6 +49,7 @@ for (let index = 0; index < count; index += 1) {
     batch,
     entitlement: permanent ? 'permanent' : 'fixed',
     duration_days: permanent ? null : days,
+    content_packs: contentPacks,
     issued: false,
     order_reference: '',
     token: `MAP1.${encodedPayload}.${signature}`,
@@ -59,6 +69,7 @@ fs.writeFileSync(ledgerPath, JSON.stringify({
   product: 'modagent-p',
   entitlement: permanent ? 'permanent' : 'fixed',
   duration_days: permanent ? null : days,
+  content_packs: contentPacks,
   batch,
   generated_at: new Date().toISOString(),
   licenses: rows,

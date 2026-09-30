@@ -1,4 +1,5 @@
 const path = require('path');
+const { candidateId } = require('./candidateProfile');
 
 const IDENTITIES = {
   free: {
@@ -26,11 +27,13 @@ const IDENTITIES = {
 };
 
 function getAppIdentity(packageInfo = {}) {
-  const requested = process.env.MODAGENT_EDITION || packageInfo.modagentEdition;
+  const testId = candidateId(packageInfo);
+  const requested = testId ? packageInfo.modagentEdition : process.env.MODAGENT_EDITION || packageInfo.modagentEdition;
   const edition = requested === 'subscription' ? 'subscription' : 'free';
-  const requestedChannel = process.env.MODAGENT_CHANNEL || packageInfo.modagentChannel;
+  const requestedChannel = testId ? packageInfo.modagentChannel : process.env.MODAGENT_CHANNEL || packageInfo.modagentChannel;
   const channel = requestedChannel === 'beta' ? 'beta' : 'stable';
   const base = IDENTITIES[edition];
+  if (testId && channel !== 'beta') throw new Error('Test candidates must use the beta channel');
   const identity = channel === 'beta'
     ? {
         ...base,
@@ -44,6 +47,14 @@ function getAppIdentity(packageInfo = {}) {
     : base;
   return {
     ...identity,
+    ...(testId ? {
+      productName: `${identity.productName} Core Safety Test (${testId})`,
+      executableName: `${identity.executableName}-CoreSafety`,
+      appId: `${identity.appId}.test.${testId}`,
+      userDataFolder: `${identity.userDataFolder} Test ${testId}`,
+      manualUpdateManifestUrl: '',
+      candidateId: testId,
+    } : {}),
     channel,
     isBeta: channel === 'beta',
     version: packageInfo.version || '0.0.0',

@@ -9,6 +9,31 @@ from urllib.parse import urlparse
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
+class CredentialFormatError(ValueError):
+    """Contains a field identifier only, never the rejected secret."""
+    def __init__(self, field: str):
+        self.field = field if field in {"llm_api_key", "nexus_api_key", "tavily_api_key"} else "llm_api_key"
+        super().__init__(f"credential_{self.field}_invalid")
+
+
+def validate_api_key(value: str, field: str) -> str:
+    clean = str(value or "").strip()
+    # No provider-specific prefix requirement; empty also permits explicit clear.
+    if any(ord(char) < 33 or ord(char) > 126 for char in clean):
+        raise CredentialFormatError(field)
+    return clean
+
+
+def model_failure_summary(exc: Exception, route: dict | None = None) -> tuple[str, bool]:
+    configuration_error = isinstance(exc, (CredentialFormatError, UnicodeError))
+    advice = "请在设置中修正配置后重新发送。" if configuration_error else "请检查连接或服务状态后重新发送。"
+    return (
+        "本轮未能完成模型通信：" + friendly_network_error(exc, route)
+        + "。已停止新增操作；此前已执行的结果请以任务记录为准。" + advice,
+        not configuration_error,
+    )
+
+
 def _env_value(environ, name: str) -> str:
     for key, value in environ.items():
         if key.casefold() == name.casefold() and str(value or "").strip():
@@ -53,6 +78,11 @@ def build_http_client(endpoint: str, timeout: float = 120):
 
 
 def friendly_network_error(exc: Exception, route: dict | None = None) -> str:
+    if isinstance(exc, CredentialFormatError):
+        field = {"llm_api_key": "LLM API Key", "nexus_api_key": "Nexus API Key", "tavily_api_key": "Tavily API Key"}[exc.field]
+        return f"{field} 格式不正确，请填写密钥本身，不要包含中文、空格或换行"
+    if isinstance(exc, UnicodeError):
+        return "请求配置发生字符编码错误，请检查密钥及自定义请求配置；这不等同于网络断开"
     text = str(exc)
     if "Unknown scheme for proxy URL" in text:
         return "检测到不受支持的代理协议，已忽略该代理；请重试，程序会改走直连。"

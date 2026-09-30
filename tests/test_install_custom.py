@@ -65,7 +65,7 @@ check("D1 overwrote flag correct",
 check("D2 overwrite warning present", any("覆盖已存在文件" in w for w in r["warnings"]))
 check("D3 root-exec warning present", any("可执行文件落游戏根" in w for w in r["warnings"]))
 # 覆盖前备份进集中区(C-0)
-bak = os.path.join(installer.BACKUPS_DIR, "phasmophobia", "Phasmophobia_Data", "sharedassets2.assets")
+bak = installer._backup_lookup(os.path.join(G, "Phasmophobia_Data", "sharedassets2.assets"), G, "phasmophobia")
 check("A4 original backed up to central区", os.path.exists(bak) and open(bak).read() == "ORIGINAL",
       f"bak={bak}")
 

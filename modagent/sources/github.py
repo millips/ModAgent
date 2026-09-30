@@ -19,6 +19,7 @@ _GENERIC_NON_MOD_NAMES = {
     "template", "tutorial", "example", "examples",
 }
 _FRAMEWORK_ALIASES = {
+    "smapi": ("pathoschild/smapi", "smapi"),
     "bepinex": ("bepinex/bepinex", "bepinex"),
     "ue4ss": ("ue4ss-re/ue4ss", "ue4ss"),
     "melonloader": ("lavagang/melonloader", "melonloader"),
@@ -46,10 +47,10 @@ def _game_aliases(game_name: str) -> set[str]:
 def _evidence(item: dict, game_name: str) -> tuple[list[str], list[str]]:
     text = " ".join([
         str(item.get("name") or ""),
-        str(item.get("full_name") or ""),
+        # Repository owners are identities, not game evidence.
+        str(item.get("full_name") or "").rsplit("/", 1)[-1],
         str(item.get("summary") or ""),
         " ".join(item.get("topics") or []),
-        str(item.get("homepage") or ""),
     ])
     compact_text = _compact(text)
     game_hits = [
@@ -67,7 +68,7 @@ def _is_explicit_framework(query: str, item: dict) -> bool:
     name = _compact(str(item.get("name") or ""))
     for alias, (official, token) in _FRAMEWORK_ALIASES.items():
         if alias in compact_query and (
-            full_name == official or token in name
+            full_name == official
         ):
             return True
     return False
@@ -90,6 +91,8 @@ def _filter_game_mod_results(
             _compact(value) for value in _GENERIC_NON_MOD_NAMES
         }
         framework = _is_explicit_framework(query, item)
+        if _compact(query) in _FRAMEWORK_ALIASES and not framework:
+            continue
         if not framework and (not game_hits or not mod_hits or generic_name):
             continue
         enriched = dict(item)
@@ -118,7 +121,7 @@ def _search_once(query: str, limit: int) -> list:
             "name": r.get("name", ""),
             "full_name": r.get("full_name", ""),
             "url": r.get("html_url", ""),
-            "summary": (r.get("description") or "")[:140],
+            "summary": (r.get("description") or "")[:2000],
             "topics": r.get("topics") or [],
             "homepage": r.get("homepage") or "",
             "stars": r.get("stargazers_count", 0),

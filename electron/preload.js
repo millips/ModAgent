@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('modagent', {
   getApiToken: () => process.env.MODAGENT_API_TOKEN || '',
   getPLicenseStatusSync: () => ipcRenderer.sendSync('get-p-license-status-sync'),
   getPLicenseStatus: () => ipcRenderer.invoke('get-p-license-status'),
+  startPTrial: () => ipcRenderer.invoke('start-p-trial'),
   activatePLicense: code => ipcRenderer.invoke('activate-p-license', code),
   onPLicenseStatus: callback => {
     const listener = (_, detail) => callback(detail);
@@ -28,6 +29,7 @@ contextBridge.exposeInMainWorld('modagent', {
   selectBg: () => ipcRenderer.invoke('select-bg'),
   removeBg: () => ipcRenderer.invoke('remove-bg'),
   saveSecrets: secrets => ipcRenderer.invoke('save-secrets', secrets),
+  getCredentialStatus: () => ipcRenderer.invoke('credential-status'),
   openDiagnosticsFolder: () => ipcRenderer.invoke('open-diagnostics-folder'),
   openMaintenanceFolder: kind => ipcRenderer.invoke('open-maintenance-folder', kind),
   copyMaintenancePath: kind => ipcRenderer.invoke('copy-maintenance-path', kind),

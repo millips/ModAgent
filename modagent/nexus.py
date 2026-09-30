@@ -220,23 +220,55 @@ def search(query: str, game_slug: str, api_key: str, cdp_port: int = 18888, game
     if tavily_key:
         result = _search_via_tavily(query, game_slug, tavily_key)
         if result:
-            return result
+            return _dedupe_search_results(result, game_slug)
 
     api_error = None
     try:
         result = _search_api(query, game_slug, api_key, game_id)
         if result:
-            return result
+            return _dedupe_search_results(result, game_slug)
     except NexusSearchUnavailable as exc:
         api_error = exc
 
     # CDP is an adaptive final route, not a prerequisite for ordinary search.
     result = _search_cdp(query, game_slug, api_key, cdp_port, game_id)
     if result and not (len(result) == 1 and result[0].get("error")):
-        return result
+        return _dedupe_search_results(result, game_slug)
     if api_error:
         raise api_error
     return []
+
+
+def _dedupe_search_results(rows: list[dict], game_slug: str = "") -> list[dict]:
+    """Collapse URL variants of one Nexus project to its stable Mod ID.
+
+    Search engines commonly return a mod's overview, files, images and
+    tracking URLs.  Those are one project, never independent recommendations.
+    Keep the most informative row while preserving the original ranking order.
+    """
+    unique: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for raw in rows or []:
+        row = dict(raw or {})
+        mod_id = str(row.get("mod_id") or "").strip()
+        slug = str(row.get("nexus_slug") or game_slug or "").strip().casefold()
+        key = (slug, mod_id) if mod_id else ("url", str(row.get("url") or ""))
+        if key not in unique:
+            unique[key] = row
+            order.append(key)
+            continue
+        current = unique[key]
+        # Detailed API rows and a useful summary are preferred over a bare
+        # search-engine snippet; neither changes the stable project identity.
+        current_quality = sum(bool(current.get(field)) for field in (
+            "version", "author", "summary", "updated_time", "downloads",
+        )) + len(str(current.get("summary") or "")) / 1000
+        row_quality = sum(bool(row.get(field)) for field in (
+            "version", "author", "summary", "updated_time", "downloads",
+        )) + len(str(row.get("summary") or "")) / 1000
+        if row_quality > current_quality:
+            unique[key] = row
+    return [unique[key] for key in order]
 
 
 def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
@@ -276,12 +308,12 @@ def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
             results.append({
                 "mod_id": int(m.group(1)),
                 "name": item.get("title", "").split(" at ")[0].strip()[:80],
-                "summary": item.get("content", "")[:200],
+                "summary": _source_plain_text(item.get("content", ""))[:200],
                 "endorsements": 0,
                 "version": "",
                 "updated": "",
             })
-    return results
+    return _dedupe_search_results(results, game_slug)
 
 
 _TOOL_QUERY_WORDS = (
@@ -642,8 +674,10 @@ def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888)
     return {
         "mod_id": mod.get("mod_id", mod_id),
         "name": mod.get("name", ""),
-        "summary": mod.get("summary", ""),
-        "description": mod.get("description", "")[:2000],
+        # Nexus descriptions often carry BBCode/HTML.  UI consumers must not
+        # expose markup as if it were a Mod description.
+        "summary": _source_plain_text(mod.get("summary", ""))[:800],
+        "description": _source_plain_text(mod.get("description", ""))[:2000],
         "version": primary.get("version", mod.get("version", "?")) if primary else mod.get("version", "?"),
         "file_id": primary.get("file_id") if primary else None,
         "file_name": primary.get("file_name", "") if primary else "",
@@ -707,6 +741,7 @@ def _source_plain_text(value: str) -> str:
     text = re.sub(r"\[/?(?:b|i|u|size|color|font|list)(?:=[^\]]+)?\]", "", text, flags=re.I)
     text = re.sub(r"\[[^\]]+\]", " ", text)
     text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n\s*\n+", "\n", text)
     return text.strip()
 

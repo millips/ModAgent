@@ -1,0 +1,468 @@
+{
+  "metrics": [
+    {
+      "file": "modagent/agent.py",
+      "lines": 3089,
+      "chars": 139205,
+      "largest_functions": [
+        [
+          "chat_stream",
+          2132,
+          958
+        ],
+        [
+          "_exec",
+          838,
+          527
+        ],
+        [
+          "chat",
+          1912,
+          217
+        ]
+      ]
+    },
+    {
+      "file": "modagent/tools.py",
+      "lines": 4672,
+      "chars": 213767,
+      "largest_functions": [
+        [
+          "execute",
+          832,
+          3571
+        ],
+        [
+          "build_tools_definitions",
+          402,
+          295
+        ],
+        [
+          "download_install_preflight",
+          1000,
+          199
+        ]
+      ]
+    },
+    {
+      "file": "modagent/api.py",
+      "lines": 1485,
+      "chars": 54900,
+      "largest_functions": [
+        [
+          "chat_stream",
+          927,
+          213
+        ],
+        [
+          "list_mods",
+          607,
+          69
+        ],
+        [
+          "run_task",
+          1050,
+          52
+        ]
+      ]
+    },
+    {
+      "file": "modagent/prompts.py",
+      "lines": 173,
+      "chars": 11651,
+      "largest_functions": [
+        [
+          "build_prompt",
+          75,
+          99
+        ]
+      ]
+    },
+    {
+      "file": "modagent/default_prompt.md",
+      "lines": 177,
+      "chars": 11964
+    },
+    {
+      "file": "modagent/recommendation_ui.py",
+      "lines": 1675,
+      "chars": 61251,
+      "largest_functions": [
+        [
+          "merge_recommendation_resolution",
+          1454,
+          222
+        ],
+        [
+          "_normalize_item",
+          529,
+          193
+        ],
+        [
+          "normalize_recommendations",
+          1108,
+          156
+        ]
+      ]
+    },
+    {
+      "file": "electron/src/components/ChatPage.jsx",
+      "lines": 2150,
+      "chars": 98502
+    }
+  ],
+  "test_files": 102,
+  "eval120": {
+    "total": 120,
+    "passed": 120,
+    "failed": 0,
+    "pass_rate": 1.0,
+    "categories": {
+      "chat_explain": 12,
+      "search_exact": 18,
+      "recommend_broad": 12,
+      "resolve_source": 10,
+      "build_plan": 16,
+      "execute_plan": 16,
+      "update_installed": 10,
+      "diagnose": 6,
+      "snapshot_rollback": 4,
+      "share_import": 8,
+      "lifecycle": 8
+    },
+    "failures": []
+  },
+  "eval1000": {
+    "total": 1000,
+    "passed": 1000,
+    "failed": 0,
+    "pass_rate": 1.0,
+    "categories": {
+      "chat_explain": 108,
+      "search_exact": 162,
+      "recommend_broad": 106,
+      "resolve_source": 80,
+      "build_plan": 128,
+      "execute_plan": 128,
+      "update_installed": 80,
+      "diagnose": 48,
+      "snapshot_rollback": 32,
+      "share_import": 64,
+      "lifecycle": 64
+    },
+    "failures": []
+  },
+  "prompt": {
+    "legacy_0_mods_chars": 19684,
+    "legacy_100_mods_chars": 22960,
+    "legacy_1000_mods_chars": 54460,
+    "free_schema_chars": 23472,
+    "free_tools": 54,
+    "pro_schema_chars": 23472,
+    "pro_tools": 54
+  },
+  "routes": [
+    {
+      "input": "不要帮我更新，我只是想知道全部更新是什么意思",
+      "intent": "UPDATE_INSTALLED",
+      "confidence": 0.98,
+      "install_authorized": true,
+      "tools": [
+        "collection_view",
+        "game_file_check",
+        "get_installed",
+        "list_local_mods",
+        "mod_source_align",
+        "mod_update",
+        "mod_update_check",
+        "snapshot_list",
+        "stardew_smapi_status"
+      ]
+    },
+    {
+      "input": "为什么检查更新会失败？先别更新",
+      "intent": "UPDATE_INSTALLED",
+      "confidence": 0.98,
+      "install_authorized": false,
+      "tools": [
+        "collection_view",
+        "game_file_check",
+        "get_installed",
+        "list_local_mods",
+        "mod_source_align",
+        "mod_update_check",
+        "snapshot_list",
+        "stardew_smapi_status"
+      ]
+    },
+    {
+      "input": "分享码是什么意思？",
+      "intent": "IMPORT_SHARE",
+      "confidence": 0.99,
+      "install_authorized": false,
+      "tools": [
+        "collection_view",
+        "conflict_check",
+        "game_file_check",
+        "get_installed",
+        "list_local_mods",
+        "nexus_get_detail",
+        "official_share_catalog",
+        "official_share_import",
+        "official_share_network_diagnostics",
+        "read_readme",
+        "share_import",
+        "stardew_smapi_status"
+      ]
+    },
+    {
+      "input": "推荐一个能改钱的mod，不要别的功能",
+      "intent": "RECOMMEND_BROAD",
+      "confidence": 0.91,
+      "install_authorized": false,
+      "tools": [
+        "collection_view",
+        "conflict_check",
+        "game_file_check",
+        "gamebanana_search",
+        "get_installed",
+        "github_search",
+        "list_local_mods",
+        "mod_recommend",
+        "nexus_get_detail",
+        "nexus_search",
+        "read_readme",
+        "stardew_smapi_status",
+        "thunderstore_search",
+        "workshop_search"
+      ]
+    },
+    {
+      "input": "有哪些 eve 的换皮但是是别的游戏动漫 IP，比如 FF7 Tifa",
+      "intent": "CHAT_EXPLAIN",
+      "confidence": 0.6,
+      "install_authorized": false,
+      "tools": []
+    },
+    {
+      "input": "创建一个快照",
+      "intent": "SNAPSHOT_ROLLBACK",
+      "confidence": 0.98,
+      "install_authorized": false,
+      "tools": [
+        "collection_view",
+        "game_file_check",
+        "get_installed",
+        "list_local_mods",
+        "snapshot_delete",
+        "snapshot_list",
+        "snapshot_restore",
+        "stardew_smapi_status"
+      ]
+    },
+    {
+      "input": "禁用我选中的这个mod",
+      "intent": "CHAT_EXPLAIN",
+      "confidence": 0.6,
+      "install_authorized": false,
+      "tools": []
+    },
+    {
+      "input": "How do I check for updates without installing anything?",
+      "intent": "UPDATE_INSTALLED",
+      "confidence": 0.98,
+      "install_authorized": false,
+      "tools": [
+        "collection_view",
+        "game_file_check",
+        "get_installed",
+        "list_local_mods",
+        "mod_source_align",
+        "mod_update_check",
+        "snapshot_list",
+        "stardew_smapi_status"
+      ]
+    }
+  ],
+  "failed_tool_with_text": {
+    "status": "completed",
+    "summary": "搜索失败，请稍后重试。",
+    "completed": [],
+    "not_completed": [
+      {
+        "tool": "nexus_search",
+        "target": "query:Tifa"
+      }
+    ],
+    "warnings": [],
+    "next_actions": [],
+    "retryable": false
+  },
+  "empty_no_evidence": {
+    "status": "completed",
+    "summary": "本轮任务已完成。",
+    "completed": [],
+    "not_completed": [],
+    "warnings": [],
+    "next_actions": [],
+    "retryable": false
+  },
+  "variant_key_collision": true,
+  "batch_key_collision": true,
+  "frozen_spec_mutable": true,
+  "events_after_cancel": [
+    "task_started",
+    "phase_changed",
+    "task_cancelled",
+    "tool_finished"
+  ],
+  "checkpoint_after_cancel": true,
+  "shadow_changes_execution": {
+    "stub_calls": 1,
+    "second_result": {
+      "status": "completed",
+      "reused_effect": true,
+      "message": "该操作已完成，已复用结果，未重复执行。"
+    }
+  },
+  "spec_target_without_legacy_selection": {
+    "stub_called": true,
+    "result": {
+      "status": "completed"
+    }
+  },
+  "timeout_worker": {
+    "result": {
+      "error": "tool_extract 执行超时(>0.03s),已跳过。",
+      "hint": "该工具可能在遍历超大目录或等待外部资源。请换用其他方式完成当前目标,并向用户如实说明此工具超时。"
+    },
+    "entered": true,
+    "done_at_return": false,
+    "late_simulated_effect": [
+      "simulated write after timeout"
+    ]
+  },
+  "manual_gate_recorded_as_completed_effect": true,
+  "midstream_failure_outcome": {
+    "status": "completed",
+    "summary": "本轮任务已完成。",
+    "completed": [],
+    "not_completed": [],
+    "warnings": [],
+    "next_actions": [],
+    "retryable": false
+  },
+  "resolve_intersection": [
+    "game_file_check",
+    "nexus_get_detail"
+  ],
+  "http_transient": {
+    "401": true,
+    "403": true,
+    "404": true,
+    "500": true
+  },
+  "relevance": {
+    "partial_match": true,
+    "chinese_no_filter": true,
+    "github_owner_as_game": true,
+    "central_wrong_game_rows": 1
+  },
+  "requests": [
+    {
+      "input": "什么是 mod？",
+      "mode": "off",
+      "action": "",
+      "system_chars": 19684,
+      "tools": [
+        "browser_pages",
+        "browser_doctor",
+        "browser_observe",
+        "browser_click",
+        "browser_input",
+        "browser_wait",
+        "browser_open",
+        "scan_existing_mods",
+        "import_existing_mods",
+        "mod_recommend",
+        "nexus_search",
+        "collection_view",
+        "download_from_url",
+        "thunderstore_search",
+        "workshop_search",
+        "github_search",
+        "gamebanana_search",
+        "workshop_install",
+        "workshop_uninstall",
+        "nexus_get_detail",
+        "mod_download",
+        "batch_download",
+        "mod_install_batch",
+        "mod_install",
+        "mod_install_custom",
+        "tool_extract",
+        "mod_uninstall",
+        "conflict_check",
+        "list_local_mods",
+        "snapshot_create",
+        "snapshot_restore",
+        "snapshot_delete",
+        "snapshot_list",
+        "mod_patch",
+        "game_config_write",
+        "read_readme",
+        "game_diagnose",
+        "mod_source_align",
+        "mod_source_bind",
+        "mod_update_check",
+        "mod_update",
+        "scan_games",
+        "get_installed",
+        "share_export",
+        "share_import",
+        "official_share_catalog",
+        "official_share_import",
+        "official_share_network_diagnostics",
+        "game_file_check",
+        "stardew_smapi_status",
+        "list_downloads",
+        "mod_disable",
+        "mod_enable",
+        "mod_dependency_set"
+      ]
+    },
+    {
+      "input": "什么是 mod？",
+      "mode": "on",
+      "action": "",
+      "system_chars": 505,
+      "tools": []
+    },
+    {
+      "input": "补齐详情",
+      "mode": "on",
+      "action": "resolve",
+      "system_chars": 1166,
+      "tools": [
+        "nexus_get_detail",
+        "game_file_check"
+      ]
+    },
+    {
+      "input": "创建一个快照",
+      "mode": "on",
+      "action": "",
+      "system_chars": 469,
+      "tools": [
+        "collection_view",
+        "list_local_mods",
+        "snapshot_restore",
+        "snapshot_delete",
+        "snapshot_list",
+        "get_installed",
+        "game_file_check",
+        "stardew_smapi_status"
+      ]
+    }
+  ]
+}

@@ -89,44 +89,20 @@ def _base_runtime_evidence(cfg: Config, dependency: str) -> dict[str, Any]:
             "note": "Selected game directory is unavailable; loader files could not be checked.",
         }
 
-    if label.startswith("bepinex"):
-        core = os.path.join(root, "BepInEx", "core")
-        candidates = [
-            os.path.join(core, "BepInEx.dll"),
-            os.path.join(core, "BepInEx.Core.dll"),
-        ]
-        hits = [os.path.relpath(path, root).replace("\\", "/") for path in candidates if os.path.isfile(path)]
-        bootstrap = [
-            name for name in ("winhttp.dll", "doorstop_config.ini")
-            if os.path.isfile(os.path.join(root, name))
-        ]
-        if hits:
-            return {
-                "status": "satisfied_base_environment",
-                "matched_version": "runtime files detected",
-                "evidence": hits + bootstrap,
-                "note": "BepInEx runtime files were found in the selected game directory.",
-            }
-    elif label.startswith("smapi"):
-        candidates = ["StardewModdingAPI.exe", "StardewModdingAPI.dll"]
-        hits = [name for name in candidates if os.path.isfile(os.path.join(root, name))]
-        if hits:
-            return {
-                "status": "satisfied_base_environment",
-                "matched_version": "runtime files detected",
-                "evidence": hits,
-                "note": "SMAPI runtime files were found in the selected game directory.",
-            }
-    elif label.startswith("melonloader"):
-        candidates = ["MelonLoader", "version.dll"]
-        hits = [name for name in candidates if os.path.exists(os.path.join(root, name))]
-        if hits:
-            return {
-                "status": "satisfied_base_environment",
-                "matched_version": "runtime files detected",
-                "evidence": hits,
-                "note": "MelonLoader runtime files were found in the selected game directory.",
-            }
+    from .runtime_detection import loader_evidence
+    loader = "BepInEx" if label.startswith("bepinex") else (
+        "SMAPI" if label.startswith("smapi") else (
+            "MelonLoader" if label.startswith("melonloader") else ""
+        )
+    )
+    evidence = loader_evidence(root, loader) if loader else {"installed": False, "evidence": []}
+    if evidence["installed"]:
+        return {
+            "status": "satisfied_base_environment",
+            "matched_version": "runtime files detected",
+            "evidence": evidence["evidence"],
+            "note": f"{loader} runtime files were found in the selected game directory.",
+        }
     return {
         "status": "base_environment_not_found",
         "matched_version": "",

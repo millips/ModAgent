@@ -247,7 +247,8 @@ def test_stream_pauses_for_manual_gate_then_resumes_exact_target(
         "mod_download", {"mod_id": "2937", "file_id": "7327"}
     )]
     assert any(
-        event.get("tool_result", {}).get("ok") is True
+        event.get("tool_result", {}).get("ok") is False
+        and event.get("tool_result", {}).get("outcome_status") == "waiting_user"
         and "等待 Nexus 人机验证"
         in event.get("tool_result", {}).get("summary", "")
         for event in first_events

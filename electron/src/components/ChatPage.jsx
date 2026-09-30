@@ -1,12 +1,16 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { Send, RotateCcw, Search, RefreshCw, Zap, Shield, AlertTriangle, Plus, Trash2, PenLine, MessageSquare, PanelLeftClose, PanelLeft, Copy, Undo2, Square, Reply, Check, X, Bug, FolderPlus, FolderOpen, FileType2, Clock3, Download } from 'lucide-react'
-import PlanCard from './PlanCard'
+import ChatMarkdown from './ChatMarkdown'
 import DebugPanel from './DebugPanel'
 import { getManualActionQuickReply } from './chatQuickReplies.mjs'
 import { hasSameRecommendation } from './recommendationRecovery.mjs'
+import { apiErrorMessage, canCompleteSelection, canPresentConfirmation, receiptProgress } from './taskOutcome.mjs'
+import { isTerminalTaskEvent, upsertTaskResult, taskPresentation, precedingAnswer, updateTaskProgress, upsertProgressMessage, pendingPlanCard, taskActionLabel } from './taskPresentation.mjs'
 import { emitFeedback, emitToolFeedback, emitToolStartFeedback } from '../feedback/feedbackBus'
 import { ChatEditionMessage } from '@edition'
 import CommunityImportDialog from './CommunityImportDialog'
+import { tr } from '../i18n'
+import { scanInventory } from './scanInventory.mjs'
 
 // 有副作用的工具(装/卸/下/改文件/动快照)。重新生成时把已完成项传给后端；
 // 后端强制只读生成，副作用不重放、也不撤销。
@@ -40,7 +44,7 @@ const QUIET_TOOLS = new Set([
 
 const TOOL_LABELS = {
   nexus_search: '搜索 Nexus', nexus_get_detail: '核验 Mod 详情',
-  mod_recommend: '分析推荐结果',
+  mod_recommend: '搜索与核验候选',
   mod_source_bind: '确认 Mod 维护来源',
   browser_open: '打开下载页面', browser_observe: '识别页面状态',
   browser_click: '操作下载页面', browser_input: '填写页面信息', browser_wait: '等待页面响应',
@@ -107,6 +111,24 @@ function insertRecommendationAtAnchor(messages, payload, createId) {
   return result
 }
 
+const TOOL_LABELS_EN = {
+  nexus_search: 'Search Nexus', nexus_get_detail: 'Verify Mod details',
+  mod_recommend: 'Search and verify candidates', mod_source_bind: 'Bind a Mod source',
+  browser_open: 'Open download page', browser_observe: 'Read page state',
+  browser_click: 'Use download page', browser_input: 'Fill page fields', browser_wait: 'Wait for page',
+  conflict_check: 'Check conflicts and placement', game_file_check: 'Check game files', game_config_write: 'Write game configuration',
+  stardew_smapi_status: 'Check SMAPI startup', get_installed: 'Read installed Mods', list_downloads: 'Check download cache',
+  list_local_mods: 'Check local Mods', scan_existing_mods: 'Scan installed Mods', mod_update_check: 'Check updates',
+  import_existing_mods: 'Bind installed Mods', snapshot_create: 'Create safety snapshot', snapshot_restore: 'Restore snapshot',
+  batch_download: 'Download batch', mod_download: 'Download Mod', mod_install_batch: 'Install batch', mod_install: 'Install Mod',
+  mod_install_custom: 'Install custom Mod', mod_uninstall: 'Uninstall Mod', mod_update: 'Update Mod',
+  mod_disable: 'Disable Mod', mod_enable: 'Enable Mod',
+}
+
+function toolLabel(name, language) {
+  return (language === 'en' ? TOOL_LABELS_EN[name] : TOOL_LABELS[name]) || name
+}
+
 function mergeRecommendationUpdate(messages, payload, createId) {
   const updatedKeys = new Set(
     (payload?.items || []).map(item => item?.selection_key).filter(Boolean)
@@ -130,15 +152,18 @@ function mergeRecommendationUpdate(messages, payload, createId) {
   ))
 }
 
-function formatProgressTime(value) {
+function formatProgressTime(value, language = 'zh-CN') {
   const seconds = Math.max(0, Number(value) || 0)
-  if (seconds < 60) return `${Math.max(1, Math.round(seconds))} 秒`
+  if (seconds < 60) return language === 'en'
+    ? `${Math.max(1, Math.round(seconds))} sec`
+    : `${Math.max(1, Math.round(seconds))} 秒`
   const minutes = Math.floor(seconds / 60)
   const rest = Math.round(seconds % 60)
+  if (language === 'en') return rest ? `${minutes} min ${rest} sec` : `${minutes} min`
   return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`
 }
 
-function ActiveTaskProgress({ task }) {
+function ActiveTaskProgress({ task, language = 'zh-CN' }) {
   const [now, setNow] = useState(Date.now())
   useEffect(() => {
     setNow(Date.now())
@@ -150,17 +175,19 @@ function ActiveTaskProgress({ task }) {
   const stageElapsed = Math.max(0, (now - task.stageStartedAt) / 1000)
   const actual = task.mode === 'determinate'
   const pct = Math.max(0, Math.min(100, Number(task.pct) || 0))
-  let estimated = '任务仍在进行，可随时停止'
+  let estimated = language === 'en' ? 'Task is still running. You can stop it at any time.' : '任务仍在进行，可随时停止'
   if (task.etaSeconds != null) {
     // Download progress has real byte counts and speed, so a remaining-time
     // estimate is meaningful here.
-    estimated = `按当前速度约剩 ${formatProgressTime(task.etaSeconds)}`
+    estimated = language === 'en'
+      ? `About ${formatProgressTime(task.etaSeconds, language)} remaining at the current speed`
+      : `按当前速度约剩 ${formatProgressTime(task.etaSeconds)}`
   } else if (task.expectedSeconds) {
     // Search, browser and LLM stages have no trustworthy throughput signal.
     // Keep the heuristic internal and only use it to explain a long wait.
     estimated = stageElapsed > Math.max(30, task.expectedSeconds * 1.8)
-      ? '外部响应较慢，任务仍在进行'
-      : '正在处理，可随时停止'
+      ? (language === 'en' ? 'Waiting for this step; elapsed time alone does not identify a network problem.' : '仍在等待当前步骤；仅凭耗时无法判断是否为网络问题')
+      : (language === 'en' ? 'Processing. You can stop it at any time.' : '正在处理，可随时停止')
   }
 
   return (
@@ -168,9 +195,9 @@ function ActiveTaskProgress({ task }) {
       <div className="flex items-center justify-between gap-3 text-xs">
         <span className="flex items-center gap-2 text-cyber-cyan min-w-0">
           <RefreshCw size={13} className="animate-spin shrink-0" />
-          <span className="truncate">{task.label || '正在处理任务'}</span>
+          <span className="truncate">{task.label || (language === 'en' ? 'Processing task' : '正在处理任务')}</span>
         </span>
-        <span className="text-surface-300 tabular-nums shrink-0">{actual ? `${pct.toFixed(pct % 1 ? 1 : 0)}%` : '处理中'}</span>
+        <span className="text-surface-300 tabular-nums shrink-0">{actual ? `${pct.toFixed(pct % 1 ? 1 : 0)}%` : (language === 'en' ? 'Processing' : '处理中')}</span>
       </div>
       <div className="h-1.5 mt-2 rounded-full bg-surface-700 overflow-hidden">
         {actual ? (
@@ -349,7 +376,103 @@ function UpdateReportCard({ payload, api, toast, onRefresh }) {
   )
 }
 
-export default function ChatPage({ status, games, onGameChange, onGameImport, onGamesRefresh, toast, api, onRefresh }) {
+function TaskResultCard({ event, language, disabled, onResume, presentation, onShowPlan, planSubmitted = false }) {
+  const result = event?.payload?.result || {}
+  const state = String(event?.state || '').toUpperCase()
+  const completed = Array.isArray(result.completed) ? result.completed.length : 0
+  const pending = Array.isArray(result.not_completed) ? result.not_completed.length : 0
+  const terminalLabel = {
+    COMPLETED: language === 'en' ? 'Completed' : '已完成',
+    PARTIAL: language === 'en' ? 'Partially completed' : '部分完成',
+    BLOCKED: language === 'en' ? 'Waiting for action' : '等待处理',
+    FAILED: language === 'en' ? 'Failed' : '未完成',
+    CANCELLED: language === 'en' ? 'Cancelled' : '已取消',
+    PAUSED_BY_NEW_TURN: language === 'en' ? 'Paused by a new message' : '已被新消息暂停',
+    WAITING_CONFIRMATION: language === 'en' ? 'Waiting for confirmation' : '等待确认',
+  }[state] || state
+  const retryable = Boolean(result.retryable)
+  const completedItems = state === 'WAITING_CONFIRMATION' ? [] : (Array.isArray(result.completed) ? result.completed : [])
+  const pendingItems = planSubmitted ? [] : (Array.isArray(result.not_completed) ? result.not_completed : [])
+  const warnings = Array.isArray(result.warnings) ? result.warnings : []
+  const nextActions = planSubmitted ? [] : (Array.isArray(result.next_actions) ? result.next_actions : [])
+  const itemText = item => {
+    if (typeof item === 'string') return item
+    if (!item || typeof item !== 'object') return ''
+    return taskActionLabel(item.name || (item.tool ? toolLabel(item.tool, language) : '') || item.target || item.reason || item.action || '', language)
+  }
+
+  return (
+    <section className="w-full rounded-xl border border-cyber-cyan/25 bg-surface-900/85 px-4 py-3 shadow-[0_0_22px_rgba(0,212,255,0.06)]">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-sm font-semibold text-white">
+          {state === 'COMPLETED' ? <Check size={15} className="text-green-400" /> : <AlertTriangle size={15} className="text-cyber-yellow" />}
+          {planSubmitted ? (language === 'en' ? 'Confirmation submitted (history)' : '确认已提交（历史记录）') : terminalLabel}
+        </div>
+        {presentation.showCounts && <div className="text-[11px] text-surface-500">
+          {language === 'en' ? `${completed} completed · ${pending} pending` : `${completed} 项完成 · ${pending} 项未完成`}
+        </div>}
+      </div>
+      {presentation.summary && <div className="mt-2 text-xs leading-relaxed text-surface-300">
+        <ChatMarkdown text={planSubmitted
+          ? (language === 'en' ? 'This is an earlier review record. See the later execution result; submitting confirmation does not prove installation succeeded.'
+            : '这是先前的核验记录。确认已经提交，请查看后续执行结果；提交确认不代表安装成功。')
+          : presentation.summary} />
+      </div>}
+      {(completedItems.length > 0 || pendingItems.length > 0 || warnings.length > 0) && (
+        <div className="mt-3 grid gap-2 text-[11px] text-surface-400 md:grid-cols-2">
+          {completedItems.length > 0 && (
+            <div className="rounded-lg border border-green-500/15 bg-green-500/5 px-3 py-2">
+              <div className="mb-1 font-medium text-green-300">{language === 'en' ? 'Done' : '已经完成'}</div>
+              {completedItems.slice(0, 6).map((item, index) => <div key={index}>• {itemText(item)}</div>)}
+            </div>
+          )}
+          {pendingItems.length > 0 && (
+            <div className="rounded-lg border border-cyber-yellow/15 bg-cyber-yellow/5 px-3 py-2">
+              <div className="mb-1 font-medium text-cyber-yellow">{language === 'en' ? 'Not completed' : '尚未完成'}</div>
+              {pendingItems.slice(0, 6).map((item, index) => <div key={index}>• {itemText(item)}</div>)}
+            </div>
+          )}
+          {warnings.length > 0 && (
+            <div className="rounded-lg border border-cyber-red/15 bg-cyber-red/5 px-3 py-2 md:col-span-2">
+              <div className="mb-1 font-medium text-cyber-red">{language === 'en' ? 'Warnings' : '注意事项'}</div>
+              {warnings.slice(0, 6).map((item, index) => <div key={index}>• {String(item)}</div>)}
+            </div>
+          )}
+        </div>
+      )}
+      {nextActions.length > 0 && (
+        <div className="mt-2 text-[11px] text-surface-500">
+          {language === 'en' ? 'Next: ' : '下一步：'}
+          {nextActions.map(itemText).filter(Boolean).join(' / ')}
+        </div>
+      )}
+      {state === 'WAITING_CONFIRMATION' && !planSubmitted && (onShowPlan ? (
+        <button type="button" className="btn-ghost mt-3 px-3 py-1.5 text-xs" disabled={disabled} onClick={onShowPlan}>
+          {language === 'en' ? 'View pending selection' : '查看待确认清单'}
+        </button>
+      ) : !disabled && <div className="mt-3 text-xs text-cyber-yellow">
+        {language === 'en' ? 'No confirmation control is ready. Return to the original selection to recheck the plan; do not confirm by typing.'
+          : '确认入口尚未就绪。请回到原推荐表重新核验计划，不要靠输入“确认安装”继续。'}
+      </div>)}
+      {event?.task_id && (event?.payload?.recovery_available === true || (retryable && event?.payload?.resume_available === true)) && state !== 'WAITING_CONFIRMATION' && (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onResume?.(event.task_id)}
+          className="btn-ghost mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs disabled:opacity-40"
+        >
+          <RotateCcw size={12} />
+          {event?.payload?.recovery_available
+            ? (language === 'en' ? 'Recover selection and recheck plan' : '恢复选择并重新核验计划')
+            : (language === 'en' ? 'Continue unfinished items' : '继续未完成项')}
+        </button>
+      )}
+    </section>
+  )
+}
+
+export default function ChatPage({ status, games, onGameChange, onGameImport, onGamesRefresh, toast, api, onRefresh, language = 'zh-CN' }) {
+  const t = key => tr(language, key)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState(() => sessionStorage.getItem('chat_draft') || '')
   const [loading, setLoading] = useState(false)
@@ -387,6 +510,10 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   const recoveryAgentRef = useRef({ id: null, text: '' })
   const idRef = useRef(0)
   const activeSessionRef = useRef(null)
+  // A cancelled HTTP stream can still flush one final buffered event.  Tie
+  // every render-side mutation to this monotonically increasing run id so an
+  // old task can never overwrite a newer conversation.
+  const streamEpochRef = useRef(0)
 
   useEffect(() => {
     const query = window.matchMedia('(max-width: 1100px)')
@@ -582,6 +709,13 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
 
   const applyRecoveredEvents = (events, taskStartedAt) => {
     for (const data of events || []) {
+      if (data.task_event?.task_id) {
+        if (isTerminalTaskEvent(data.task_event)) {
+          recoveryAgentRef.current = { id: null, text: '' }
+          setMessages(prev => upsertTaskResult(prev, data.task_event))
+        }
+        continue
+      }
       if (data.error) {
         recoveryAgentRef.current = { id: null, text: '' }
         setMessages(prev => [...prev, { id: mkId(), role: 'error', content: '[ERR] ' + data.error }])
@@ -594,13 +728,17 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         if (visible.length) {
           setMessages(prev => [...prev, {
             id: mkId(), role: 'sys', kind: 'call',
-            content: '正在执行：' + visible.map(name => TOOL_LABELS[name] || name).join('、'),
+            content: language === 'en'
+              ? 'Running: ' + visible.map(name => toolLabel(name, language)).join(', ')
+              : '正在执行：' + visible.map(name => toolLabel(name, language)).join('、'),
           }])
         }
         const now = Date.now()
         setTaskProgress(previous => ({
           ...(previous || { startedAt: taskStartedAt }),
-          label: `正在${uniq.map(name => TOOL_LABELS[name] || name).join('、')}`,
+          label: language === 'en'
+            ? `Running ${uniq.map(name => toolLabel(name, language)).join(', ')}`
+            : `正在${uniq.map(name => toolLabel(name, language)).join('、')}`,
           mode: 'indeterminate', pct: 0, etaSeconds: null,
           expectedSeconds: uniq.reduce((sum, name) => sum + (TOOL_STAGE_SECONDS[name] || 12), 0),
           stageStartedAt: now,
@@ -615,7 +753,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         }
         if (!QUIET_TOOLS.has(tr.name)) {
           setMessages(prev => [...prev, {
-            id: mkId(), role: 'sys', kind: 'tool', ok: tr.ok, name: tr.name,
+            id: mkId(), role: 'sys', kind: 'tool', ok: tr.ok, name: tr.name, outcomeStatus: tr.outcome_status,
             summary: tr.summary || `${tr.ok ? '✅' : '❌'} ${tr.name}`,
             raw: tr.preview || '',
           }])
@@ -809,6 +947,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
 
   const stopStream = async () => {
     if (abortRef.current) {
+      streamEpochRef.current += 1
       abortRef.current.abort()
       abortRef.current = null
       setLoading(false)
@@ -914,6 +1053,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       sendMsg(`确认安装表中最终勾选的 ${count} 个 Mod。`, undefined, {
         recommendationSelection: selectedItems,
         selectionAction: 'confirm',
+        planTaskId: message.payload.plan_task_id || '',
+        planRevisionId: message.payload.plan_revision_id || '',
         editionCompletion: {
           messageId: message.id,
           completed: { ...executingPayload, phase: 'completed' },
@@ -922,15 +1063,25 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       })
       return
     }
-    const confirmationPayload = {
+    // Keep the decision card in place during plan verification.  Previously
+    // this waited for a free-form LLM reply to finish, which made the UI look
+    // as if variants had fallen back to a text "A/B/y/n" conversation.
+    const planningPayload = {
       ...message.payload,
-      phase: 'confirm',
+      phase: 'planning',
       selected_keys: selectedItems.map(item => item.selection_key),
     }
+    setMessages(prev => prev.map(item => item.id === message.id
+      ? { ...item, payload: planningPayload } : item))
+    persistEditionState(activeSession, planningPayload)
     sendMsg(`请为我在推荐决策表中勾选的 ${count} 个 Mod 生成安装计划。`, undefined, {
       recommendationSelection: selectedItems,
       selectionAction: 'plan',
-      confirmationPayload,
+      editionCompletion: {
+        messageId: message.id,
+        completed: { ...planningPayload, phase: 'confirm' },
+        failed: { ...message.payload, phase: 'recommendation' },
+      },
     })
   }
 
@@ -947,6 +1098,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       })
       const d = await r.json()
       sid = d.id
+      // A local/cached response can arrive before React's effect updates the
+      // ref. Establish ownership now, or the first reply is discarded as old.
+      activeSessionRef.current = d.id
       setActiveSession(d.id)
       loadSessions()
     }
@@ -973,10 +1127,14 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
 
     const controller = new AbortController()
     abortRef.current = controller
+    const runEpoch = ++streamEpochRef.current
 
     const sendSid = sid
     // 仅当用户仍停留在发送时的会话才更新界面（否则后端照常保存，切回时从 DB 重载）
-    const guardedSet = (updater) => { if (activeSessionRef.current === sendSid) setMessages(updater) }
+    const isActiveRun = () => (
+      activeSessionRef.current === sendSid && streamEpochRef.current === runEpoch
+    )
+    const guardedSet = (updater) => { if (isActiveRun()) setMessages(updater) }
 
     let curAgentId = null   // 当前正在流式的 agent 消息 id
     let segText = ''        // 当前段落累计文本
@@ -984,8 +1142,12 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     let streamCompleted = false
     let streamFailed = false
     let executionFailed = false
+    let executionVerified = false
     let planBlocked = false
     let latestRecommendationUpdate = null
+    let planTaskId = null
+    let planRevisionId = null
+    let progressMessageId = null
 
     try {
       const r = await fetch(api + '/chat/stream', {
@@ -998,10 +1160,18 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           completed_effects: options.completedEffects || [],
           recommendation_selection: options.recommendationSelection || [],
           selection_action: options.selectionAction || '',
+          resume_task_id: options.resumeTaskId || '',
+          recovery_task_id: options.recoveryTaskId || '',
+          plan_task_id: options.planTaskId || '',
+          plan_revision_id: options.planRevisionId || '',
         }),
         signal: controller.signal,
       })
 
+      if (!r.ok) {
+        const payload = await r.json().catch(() => ({}))
+        throw new Error(apiErrorMessage(payload, `HTTP ${r.status}`))
+      }
       const reader = r.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
@@ -1009,6 +1179,13 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       let sawDoneEvent = false
       while (!sawDoneEvent) {
         const { done, value } = await reader.read()
+        // An older SSE response may race a newly started turn even after its
+        // AbortController was signalled.  Do not render progress, tools, or
+        // final text from a run that is no longer the active conversation.
+        if (!isActiveRun()) {
+          try { await reader.cancel() } catch (_) {}
+          return
+        }
         if (done) break
 
         buffer += decoder.decode(value, { stream: true })
@@ -1034,7 +1211,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
               const uniq = [...new Set(data.tool)]
               const stageStartedAt = Date.now()
               const expectedSeconds = uniq.reduce((sum, name) => sum + (TOOL_STAGE_SECONDS[name] || 12), 0)
-              const stageNames = uniq.map(name => TOOL_LABELS[name] || name)
+              const stageNames = uniq.map(name => toolLabel(name, language))
               setTaskProgress(previous => ({
                 ...(previous || { startedAt: taskStartedAt }),
                 label: `正在${stageNames.join('、')}`,
@@ -1042,15 +1219,26 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
                 expectedSeconds, stageStartedAt,
               }))
               uniq.forEach(name => emitToolStartFeedback(name, { source: 'chat-tool' }))
-              const visible = uniq.filter(name => !QUIET_TOOLS.has(name))
+              // Discovery progress is represented by the trustworthy progress
+              // event below.  Do not append one raw tool row per query.
+              const visible = uniq.filter(name => (
+                !QUIET_TOOLS.has(name)
+                && !['nexus_search', 'thunderstore_search', 'gamebanana_search', 'github_search', 'workshop_search'].includes(name)
+              ))
               if (visible.length) {
-                guardedSet(prev => [...prev, { id: mkId(), role: 'sys', kind: 'call', content: '正在执行：' + visible.map(name => TOOL_LABELS[name] || name).join('、') }])
+                guardedSet(prev => [...prev, {
+                  id: mkId(), role: 'sys', kind: 'call',
+                  content: language === 'en'
+                    ? 'Running: ' + visible.map(name => toolLabel(name, language)).join(', ')
+                    : '正在执行：' + visible.map(name => toolLabel(name, language)).join('、'),
+                }])
               }
               continue
             }
             if (data.tool_result) {
               curAgentId = null
               const tr = data.tool_result
+              if (tr.execution_complete === true) executionVerified = true
               const terminalSelectionStatuses = new Set([
                 'manual_action_required',
                 'partial_manual_action_required',
@@ -1086,14 +1274,14 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
               if (QUIET_TOOLS.has(tr.name)) continue
               setTaskProgress(previous => ({
                 ...(previous || { startedAt: taskStartedAt }),
-                label: `${TOOL_LABELS[tr.name] || tr.name}已完成，正在继续处理`,
+                label: receiptProgress(tr, toolLabel(tr.name, language), language),
                 mode: 'indeterminate', pct: 0, etaSeconds: null,
                 expectedSeconds: null, stageStartedAt: Date.now(),
               }))
               emitToolFeedback(tr.name, tr.ok, { preview: tr.preview || '' })
               guardedSet(prev => [...prev, {
                 id: mkId(), role: 'sys', kind: 'tool',
-                ok: tr.ok, name: tr.name,
+                ok: tr.ok, name: tr.name, outcomeStatus: tr.outcome_status,
                 summary: tr.summary || `${tr.ok ? '✅' : '❌'} ${tr.name}`,
                 raw: tr.preview || '',
               }])
@@ -1108,6 +1296,56 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
               }
               guardedSet(prev => [...prev, { id: mkId(), role: 'edition', payload }])
               persistEditionState(sendSid, payload)
+              continue
+            }
+            if (data.task_event?.task_id) {
+              const event = data.task_event
+              if (options.selectionAction === 'plan') planTaskId = event.task_id
+              if (options.selectionAction === 'plan' && event.payload?.plan_revision?.revision_id) {
+                planRevisionId = event.payload.plan_revision.revision_id
+              }
+              if (options.selectionAction === 'plan' && event.type === 'decision_required'
+                  && !event.payload?.plan_revision?.revision_id) {
+                planBlocked = true
+              }
+              const phaseLabels = {
+                task_started: language === 'en' ? 'Understanding the request' : '正在理解请求',
+                phase_changed: language === 'en' ? 'Working on the task' : '正在处理任务',
+                tool_started: language === 'en' ? 'Checking sources and local state' : '正在核验来源与本机状态',
+              }
+              if (phaseLabels[event.type]) {
+                setTaskProgress(previous => ({
+                  ...(previous || { startedAt: taskStartedAt }),
+                  label: phaseLabels[event.type], mode: 'indeterminate', pct: 0,
+                  etaSeconds: null, expectedSeconds: null, stageStartedAt: Date.now(),
+                }))
+              }
+              if (['task_completed', 'task_partial', 'task_failed', 'task_cancelled', 'decision_required'].includes(event.type)) {
+                if (['task_partial', 'task_failed', 'task_cancelled'].includes(event.type)) {
+                  executionFailed = true
+                  if (options.selectionAction === 'plan') planBlocked = true
+                }
+                curAgentId = null
+                guardedSet(prev => upsertTaskResult(prev, event))
+              }
+              continue
+            }
+            if (data.progress?.label) {
+              const progress = data.progress
+              const stage = String(progress.stage || 'process')
+              const progressLabel = language === 'en' && progress.label_en
+                ? progress.label_en : progress.label
+              setTaskProgress(previous => ({
+                ...updateTaskProgress(previous, progress, language, Date.now(), taskStartedAt),
+                expectedSeconds: TOOL_STAGE_SECONDS[progress.tool] || 12,
+              }))
+              const content = progress.current > 1
+                ? `${progressLabel}${language === 'en' ? ` (item ${progress.current})` : `（第 ${progress.current} 项）`}`
+                : progressLabel
+              if (!progressMessageId) progressMessageId = progress.task_id
+                ? `task-progress-${progress.task_id}` : mkId()
+              const id = progressMessageId
+              guardedSet(prev => upsertProgressMessage(prev, id, content, stage === 'heartbeat'))
               continue
             }
             if (data.plan_blocked) {
@@ -1171,7 +1409,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         }
       }
 
-      streamCompleted = true
+      streamCompleted = sawDoneEvent
+      if (!sawDoneEvent) throw new Error(language === 'en' ? 'The response ended without a completion receipt.' : '响应中断，未收到结束确认；不能据此显示计划就绪。')
       loadSessions()
     } catch (e) {
       if (e.name === 'AbortError') {
@@ -1181,16 +1420,22 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             ? { ...item, payload: completion.failed } : item))
           persistEditionState(sendSid, completion.failed)
         }
-        setLoading(false)
-        setTaskProgress(null)
-        abortRef.current = null
+        if (isActiveRun()) {
+          setLoading(false)
+          setTaskProgress(null)
+          abortRef.current = null
+        }
         return
       }
+      // A superseded stream can still reject after the user has stopped it
+      // and started a fresh turn.  It must not append an old network error to
+      // the new conversation or alter that turn's completion state.
+      if (!isActiveRun()) return
       streamFailed = true
-      setMessages(prev => [...prev, { id: mkId(), role: 'error', content: '连接失败: ' + e.message }])
+      guardedSet(prev => [...prev, { id: mkId(), role: 'error', content: '连接失败: ' + e.message }])
     }
 
-    if (streamCompleted && options.confirmationPayload && !planBlocked) {
+    if (options.confirmationPayload && canPresentConfirmation({ streamCompleted, streamFailed, executionFailed, planBlocked })) {
       const payload = {
         ...(latestRecommendationUpdate || options.confirmationPayload),
         phase: 'confirm',
@@ -1207,8 +1452,12 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     }
     if (options.editionCompletion) {
       const completion = options.editionCompletion
-      const payload = streamCompleted && !streamFailed && !executionFailed
-        ? completion.completed : completion.failed
+      const payload = canCompleteSelection({ streamCompleted, streamFailed, executionFailed,
+        planBlocked, executionVerified, selectionAction: options.selectionAction })
+        ? { ...completion.completed, ...(options.selectionAction === 'plan' ? {
+            plan_task_id: planTaskId,
+            plan_revision_id: planRevisionId,
+          } : {}) } : completion.failed
       guardedSet(prev => prev.map(item => item.id === completion.messageId
         ? { ...item, payload } : item))
       persistEditionState(sendSid, payload)
@@ -1225,14 +1474,68 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         window.modagent?.notifyReplyComplete?.()
       }
     }
-    setLoading(false)
-    setTaskProgress(null)
-    abortRef.current = null
+    if (isActiveRun()) {
+      setLoading(false)
+      setTaskProgress(null)
+      abortRef.current = null
+    }
   }
 
   const handleKey = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg() } }
 
+  const resumeTask = async (taskId) => {
+    if (!taskId || loading) return
+    try {
+      const response = await fetch(`${api}/tasks/${encodeURIComponent(taskId)}/resume`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: language === 'en' ? 'Continue unfinished items' : '继续未完成项' }),
+      })
+      const payload = await response.json()
+      if (!response.ok || !payload.ok) throw new Error(apiErrorMessage(payload, 'resume_failed'))
+      if (payload.action === 'rebuild_plan') {
+        const items = payload.recommendation_selection || []
+        if (!items.length || payload.session_id !== activeSession) throw new Error('recovery_session_mismatch')
+        const id = mkId()
+        const card = { kind: 'recommendation_set', items, selected_keys: items.map(item => item.selection_key), phase: 'planning' }
+        setMessages(previous => [...previous, { id, role: 'edition', payload: card }])
+        persistEditionState(activeSession, card)
+        await sendMsg(payload.message, undefined, {
+          recoveryTaskId: payload.recovery_task_id,
+          recommendationSelection: items,
+          selectionAction: 'plan',
+          editionCompletion: {
+            messageId: id,
+            completed: { ...card, phase: 'confirm' },
+            failed: { ...card, phase: 'recommendation' },
+          },
+        })
+      } else {
+        await sendMsg(payload.message, undefined, { resumeTaskId: payload.resume_task_id })
+      }
+    } catch (error) {
+      toast(error.message || (language === 'en' ? 'Could not resume this task.' : '无法恢复这个任务，请查看任务详情。'), 'error')
+    }
+  }
+
   const renderMessage = (msg, i) => {
+    if (msg.role === 'task-result') {
+      const presentation = taskPresentation(msg.event, precedingAnswer(messages, i))
+      if (presentation.hidden) return null
+      const card = pendingPlanCard(messages, msg.event?.task_id)
+      const planSubmitted = msg.event?.state === 'WAITING_CONFIRMATION' && messages.some(item =>
+        item.role === 'edition' && item.payload?.plan_task_id === msg.event?.task_id
+        && ['executing', 'completed'].includes(item.payload?.phase))
+      const showPlan = card ? () => {
+        const node = document.getElementById(`decision-${card.id}`)
+        node?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        node?.focus({ preventScroll: true })
+      } : undefined
+      return (
+        <div key={msg.id} className="animate-fade-in w-full py-1">
+          <TaskResultCard event={msg.event} presentation={presentation} language={language} disabled={loading} onResume={resumeTask} onShowPlan={showPlan} planSubmitted={planSubmitted} />
+        </div>
+      )
+    }
     if (msg.role === 'update-report') {
       return (
         <div key={msg.id} className="animate-fade-in w-full py-1">
@@ -1242,9 +1545,10 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     }
     if (msg.role === 'edition') {
       return (
-        <div key={msg.id} className="animate-fade-in w-full py-1">
+        <div key={msg.id} id={`decision-${msg.id}`} tabIndex={-1} className="animate-fade-in w-full py-1">
           <ChatEditionMessage
             message={msg}
+            language={language}
             disabled={loading}
             onChange={(selectedKeys, wantedKeys, selectedVariants) => (
               updateEditionSelection(msg, selectedKeys, wantedKeys, selectedVariants)
@@ -1365,7 +1669,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   const renderToolResult = (msg) => (
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-2">
-        <span className={msg.ok ? 'text-cyber-green' : 'text-cyber-red'}>{msg.summary}</span>
+        <span className={msg.ok ? 'text-cyber-green' : ['waiting_user', 'blocked', 'partial'].includes(msg.outcomeStatus) ? 'text-cyber-yellow' : 'text-cyber-red'}>{msg.summary}</span>
         {msg.raw && (
           <button onClick={() => toggleRaw(msg.id)}
             className="text-[10px] text-surface-500 hover:text-cyber-cyan transition-colors shrink-0">
@@ -1380,21 +1684,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   )
 
   const renderContent = (msg) => {
-    const text = msg.content
-    const parts = text.split(/(```[\s\S]*?```)/g)
-    return parts.map((part, i) => {
-      if (part.startsWith('```')) {
-        return <pre key={i} className="bg-surface-900 rounded-md p-3 my-2 text-xs font-mono text-cyber-cyan overflow-x-auto">{part.replace(/^```\w*\n?/, '').replace(/```$/, '')}</pre>
-      }
-      return <div key={i}>{part.split('\n').map((l, j) => {
-        if (l.match(/^(#+)\s/)) return <h3 key={j} className="text-base font-semibold mt-3 mb-1 text-white">{l.replace(/^#+\s/, '')}</h3>
-        if (l.match(/^[-*]\s/)) return <li key={j} className="ml-4 text-surface-400">{l.replace(/^[-*]\s/, '')}</li>
-        if (l.includes('PLAN') || l.includes('计划') || l.includes('安装计划')) return <PlanCard key={j} text={l} />
-        if (l.includes('已安装') || l.includes('快照创建完成')) return <span key={j} className="text-cyber-green">{l}<br/></span>
-        if (l.includes('错误') || l.includes('失败') || l.includes('ERR')) return <span key={j} className="text-cyber-red">{l}<br/></span>
-        return <span key={j}>{l}<br/></span>
-      })}</div>
-    })
+    return <ChatMarkdown text={msg.content} />
   }
 
   const groupSessions = () => {
@@ -1550,7 +1840,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         <div className="chat-session-rail w-56 min-w-[224px] h-full min-h-0 overflow-hidden bg-surface-800 border-r border-surface-600 flex flex-col">
           <div className="chat-session-header shrink-0 flex items-center gap-2 p-3 border-b border-surface-600">
             <button onClick={newSession} className="btn-cyber min-w-0 flex-1 flex items-center justify-center gap-2">
-              <Plus size={14} /> 新对话
+              <Plus size={14} /> {t('newChat')}
             </button>
             <button
               type="button"
@@ -1582,7 +1872,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
                           onBlur={() => renameSession(s.id)} onKeyDown={e => { if (e.key==='Enter') renameSession(s.id); if (e.key==='Escape') setEditingId(null) }}
                           autoFocus onClick={e => e.stopPropagation()} />
                       ) : (
-                        <span className="flex-1 truncate">{s.title || '新对话'}</span>
+                        <span className="flex-1 truncate">{s.title || t('newChat')}</span>
                       )}
                       <div className="hidden group-hover:flex items-center gap-0.5">
                         <button onClick={e => { e.stopPropagation(); setEditingId(s.id); setEditTitle(s.title||'') }} className="p-0.5 rounded hover:bg-surface-600"><PenLine size={10} /></button>
@@ -1689,7 +1979,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             </div>
           )}
           {messages.map((msg, i) => renderMessage(msg, i))}
-          {loading && <ActiveTaskProgress task={taskProgress} />}
+          {loading && <ActiveTaskProgress task={taskProgress} language={language} />}
           <div ref={bottomRef} />
         </div>
 
@@ -1698,11 +1988,11 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             {sidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeft size={16} />}
           </button>
           <textarea value={input} onChange={e => { setInput(e.target.value); sessionStorage.setItem('chat_draft', e.target.value) }} onKeyDown={handleKey}
-            placeholder="输入消息 · Enter 发送 · Shift+Enter 换行" rows={1}
+            placeholder={t('messagePlaceholder')} rows={1}
             className="flex-1 px-3 py-2 rounded-md text-sm bg-surface-900 border border-surface-600 text-white placeholder-surface-500 outline-none resize-none max-h-[120px] focus:border-cyber-cyan/50 transition-colors"
             onInput={e => { e.target.style.height='auto'; e.target.style.height=Math.min(e.target.scrollHeight,120)+'px' }} />
           {loading ? (
-            <button onClick={stopStream} className="tc-icon-button tc-icon-danger p-2.5 rounded-md bg-cyber-red/20 text-cyber-red border border-cyber-red/30 hover:bg-cyber-red/30 transition-all" title="停止">
+            <button onClick={stopStream} className="tc-icon-button tc-icon-danger p-2.5 rounded-md bg-cyber-red/20 text-cyber-red border border-cyber-red/30 hover:bg-cyber-red/30 transition-all" title={t('stop')}>
               <Square size={16} />
             </button>
           ) : (
@@ -1781,27 +2071,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait"
           onClick={() => sendMsg('请自动对齐当前游戏已安装 Mod 的维护来源，检查所有可用更新，并给出绑定成功、未绑定、版本未知和检查失败的可交互报告。')}
         ><RefreshCw size={14}/> 检查更新</button>
-        <button disabled={!status.online} className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait" onClick={async () => {
-          emitFeedback('scan-start', { source: 'quick-action' })
-          try {
-            const r = await fetch(api + '/tool/scan_existing_mods', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
-            const d = await r.json()
-            const data = JSON.parse(d.result || '{}')
-            if (data.error) {
-              emitFeedback('error', { source: 'scan' })
-              toast('扫描失败', 'error')
-              return
-            }
-            const identified = data.identified || []
-            if (identified.length > 0) {
-              toast(`已导入 ${identified.length} 个 Mod`)
-              onRefresh?.()
-            } else {
-              toast('未检测到新 Mod')
-            }
-            emitFeedback('scan-complete', { count: identified.length })
-          } catch (e) { emitFeedback('error', { source: 'scan' }); toast('扫描失败', 'error') }
-        }}><Search size={14}/> 扫描已有 Mod</button>
+        <button disabled={!status.online} className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait"
+          onClick={() => scanInventory({ api, toast, emitFeedback, onRefresh })}
+        ><Search size={14}/> 扫描已有 Mod</button>
         <button disabled={!status.online} className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait" onClick={async () => {
           try {
             const r = await fetch(api + '/tool/snapshot_create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trigger_mod_name: '手动快照' }) })
@@ -1824,6 +2096,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         <CommunityImportDialog
           api={api}
           toast={toast}
+          language={language}
           onClose={() => setCommunityImportOpen(false)}
           onPlan={request => {
             const prerequisiteOnly = request.action === 'prerequisite_plan'

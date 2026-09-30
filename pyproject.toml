@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modagent"
-version = "1.5.0"
+version = "1.6.0-beta.1"
 description = "LLM 驱动的 PC 游戏 mod 管理器"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["modagent", "modagent.sources"]
+packages = ["modagent", "modagent.sources", "modagent.orchestration"]
 
 [tool.setuptools.package-data]
 modagent = ["default_prompt.md"]
