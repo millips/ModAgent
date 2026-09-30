@@ -8,8 +8,10 @@ import json
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from . import db
+from .recommendation_fit import assess_goal, apply_selection, compile_goal
 from .inventory_match import (
     find_installed_duplicate,
     find_installed_functional_equivalent,
@@ -103,6 +105,8 @@ def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str
     """Render every structured candidate; model prose may not omit rows."""
     items = (payload or {}).get("items") or []
     if not items:
+        if (payload or {}).get('goal_reviewed'):
+            return '本轮搜索未取得足够证据证明有候选符合你的具体需求，未预选任何项目。已排除不匹配项；这不代表相关 Mod 不存在。可以调整需求或换来源继续查找。'
         text = _text(value, RECOMMENDATION_FALLBACK_TEXT)
         kept = []
         for line in text.splitlines():
@@ -189,6 +193,10 @@ def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str
             + (f" ({identity})" if identity else "")
         )
         lines.append(_text(item.get("content"), MISSING_CONTENT_TEXT))
+        if item.get('goal_fit'):
+            lines.append('需求匹配：' + ('来源功能描述支持匹配' if item['goal_fit']['status'] == 'matched' else '尚未确认，不代表详情核验失败'))
+            if item.get('selection_reason'):
+                lines.append(item['selection_reason'])
 
         facts = []
         version = _text(item.get("version"))
@@ -984,20 +992,76 @@ def _merge_evidence(broad: list[dict], verified: list[dict]) -> list[dict]:
     return result
 
 
+_GENERIC_SEARCH_TERMS = {
+    "mod", "mods", "best", "top", "popular", "recommended", "recommend",
+    "fun", "good", "latest", "new", "addon", "plugin", "game",
+}
+
+
+def _query_terms(value: Any, game_name: str = "") -> list[str]:
+    """Return conservative, meaningful terms from the actual source query."""
+    text = _text(value).casefold()
+    terms = []
+    # Upstream catalogues are predominantly English.  A Chinese-only query
+    # cannot be safely compared without translation, so it remains unfiltered
+    # rather than dropping valid English results.  The agent policy requires a
+    # precise English synonym when the user supplied a focused Chinese intent.
+    game_terms = set(re.findall(r"[a-z0-9]{2,}", _text(game_name).casefold()))
+    for token in re.findall(r"[a-z0-9]{2,}", text):
+        if token in _GENERIC_SEARCH_TERMS or token in game_terms or token in terms:
+            continue
+        terms.append(token)
+    return terms
+
+
+def _matches_source_query(item: dict, query: str, game_name: str = "") -> bool:
+    """Reject popularity/sidebar fallbacks unrelated to the real query."""
+    terms = _query_terms(query, game_name)
+    if not terms:
+        return True
+    # These queries contain only equivalent interface terms, not a named
+    # target. Use the shared evidence vocabulary so "UI" does not discard an
+    # actual overlay merely because its source uses the latter word.
+    if set(terms) <= {'ui', 'hud', 'interface', 'overlay'}:
+        return assess_goal(item, 'UI')['status'] == 'matched'
+    haystack = " ".join(
+        _text(item.get(key))
+        for key in (
+            "name", "full_name", "title", "summary", "description",
+            # Author/profile text is never functional evidence.  A repository
+            # authored by "Ghost Demonologist" once made an unrelated
+            # Zanzarah project look like a Demonologist money mod.
+            "content", "url", "category", "tags",
+        )
+    ).casefold()
+    compact = re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", haystack)
+    return any(
+        term in haystack
+        or re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", term) in compact
+        for term in terms
+    )
+
+
 def recommendations_from_tool_evidence(
     evidence: list[tuple[str, Any]], limit: int = 10, game_slug: str = "",
     mod_loader: str = "", target_name: str = "", target_version: str = "",
+    game_name: str = "", user_goal: str = "",
 ) -> dict:
     """Build the final Pro table from all search evidence in this turn."""
     broad = {source: [] for source in SOURCE_LABELS}
     verified = {source: [] for source in SOURCE_LABELS}
     saw_search = False
+    source_queries = {source: [] for source in SOURCE_LABELS}
 
     for tool_name, raw in evidence:
         payload = _decode_payload(raw)
         if tool_name == "mod_recommend":
             saw_search = True
             if isinstance(payload, dict):
+                query = _text(payload.get("query"))
+                if query:
+                    for source in source_queries:
+                        source_queries[source].append(query)
                 broad["nexus"].extend(_rows(payload, "recommendations", "nexus"))
                 for source in ("workshop", "thunderstore", "gamebanana", "github"):
                     broad[source].extend(_rows(payload, source))
@@ -1005,6 +1069,9 @@ def recommendations_from_tool_evidence(
         if tool_name in SEARCH_TOOL_SOURCES:
             saw_search = True
             source = SEARCH_TOOL_SOURCES[tool_name]
+            query = _text(payload.get("query")) if isinstance(payload, dict) else ""
+            if query:
+                source_queries[source].append(query)
             broad[source].extend(
                 _rows(payload, "results", source, "recommendations", "items")
             )
@@ -1023,6 +1090,14 @@ def recommendations_from_tool_evidence(
         )
         for source in SOURCE_LABELS
     }
+    for source, rows in combined.items():
+        queries = source_queries.get(source) or []
+        if not queries:
+            continue
+        combined[source] = [
+            item for item in rows
+            if any(_matches_source_query(item, query, game_name) for query in queries)
+        ]
     if target_name:
         combined = {
             source: [
@@ -1040,11 +1115,37 @@ def recommendations_from_tool_evidence(
         "thunderstore": combined["thunderstore"],
         "gamebanana": combined["gamebanana"],
         "github": combined["github"],
-    }, limit=limit, game_slug=game_slug, mod_loader=mod_loader)
+    }, limit=limit, game_slug=game_slug, mod_loader=mod_loader, user_goal=user_goal)
+
+
+def _candidate_rejection_reason(raw: dict, game_slug: str = "") -> str:
+    """Common negative-evidence gate, including budget-exhaustion fallback.
+
+    Lack of detail is not proof of invalidity. Explicit disqualification or
+    a conflicting source game is, and must not be hidden by positive keywords.
+    This is deliberately not a general-purpose semantic relevance classifier.
+    """
+    if raw.get("is_mod") is False or raw.get("candidate_valid") is False:
+        return "source_explicitly_disqualified"
+    prose = " ".join(_text(raw.get(k)) for k in ("name", "summary", "description", "content"))
+    if re.search(r"\bnot\s+(?:a\s+)?(?:real\s+)?(?:downloadable\s+)?mod\b|(?:并非|不是|非)\s*(?:真实|实际|可下载的?)*\s*(?:模组|mod)", prose, re.I):
+        return "source_explicitly_not_a_mod"
+    slug = _text(game_slug).casefold()
+    if slug and not slug.startswith("gi_"):
+        parsed = urlparse(_text(raw.get("url")))
+        if parsed.hostname in {"www.nexusmods.com", "nexusmods.com"}:
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) >= 3 and parts[1] == "mods" and parts[0].casefold() != slug:
+                return "source_game_mismatch"
+        explicit_slug = _text(raw.get("game_slug"))
+        if explicit_slug and explicit_slug.casefold() != slug:
+            return "source_game_mismatch"
+    return ""
 
 
 def normalize_recommendations(
     payload: Any, limit: int = 10, game_slug: str = "", mod_loader: str = "",
+    user_goal: str = "",
 ) -> dict:
     """Return a stable six-row payload for the Pro recommendation table."""
     if isinstance(payload, str):
@@ -1055,6 +1156,7 @@ def normalize_recommendations(
     if not isinstance(payload, dict):
         payload = {}
 
+    requirements = compile_goal(user_goal) if user_goal else None
     groups = {
         "nexus": payload.get("recommendations") or [],
         "workshop": payload.get("workshop") or [],
@@ -1071,12 +1173,24 @@ def normalize_recommendations(
         installed_mods = []
     installed_skipped = []
     normalized_groups = {}
+    rejected_candidates = []
     for source, rows in groups.items():
         normalized_groups[source] = []
         for raw in rows:
             if not isinstance(raw, dict):
                 continue
+            rejection = _candidate_rejection_reason(raw, game_slug)
+            if rejection:
+                rejected_candidates.append({"source": source, "name": _text(raw.get("name")), "reason": rejection})
+                continue
             item = _normalize_item(source, raw, mod_loader=mod_loader)
+            if user_goal:
+                fit = assess_goal(raw, requirements)
+                if fit['status'] == 'mismatch':
+                    rejected_candidates.append({'source': source, 'name': item['name'],
+                                                'reason': 'goal_mismatch', 'missing': fit['missing']})
+                    continue
+                item['goal_fit'] = fit
             installed = find_installed_duplicate(
                 game_slug,
                 source,
@@ -1120,6 +1234,13 @@ def normalize_recommendations(
                 })
             normalized_groups[source].append(item)
 
+        # Do this after source identity and local-install checks.  It only
+        # changes presentation/ranking, never treats two different upstream
+        # IDs as the same install target.
+        normalized_groups[source] = _collapse_candidate_families(
+            normalized_groups[source]
+        )
+
     # Round-robin sources so Nexus' first five rows cannot hide every other
     # source in a six-row table.
     normalized_limit = max(2, min(int(limit or 10), 20))
@@ -1153,6 +1274,7 @@ def normalize_recommendations(
         ):
             item["default_selected"] = True
             selected += 1
+    apply_selection(items, requirements)
     selected_target_names = {
         _text(item.get("localized_name") or item.get("name"))
         for item in items if item.get("default_selected")
@@ -1168,6 +1290,9 @@ def normalize_recommendations(
     return {
         "kind": "recommendation_set",
         "items": items,
+        "goal_reviewed": bool(user_goal),
+        "user_goal": user_goal,
+        "requirements": requirements.to_dict() if requirements else {},
         "selected_keys": [
             item["selection_key"] for item in items if item["default_selected"]
         ],
@@ -1182,6 +1307,7 @@ def normalize_recommendations(
         "installed_skipped": installed_skipped,
         "installed_skipped_count": len(installed_skipped),
         "source_counts": source_counts,
+        "rejected_candidates": rejected_candidates,
         "verification": {
             "target_ratio": 0.95,
             "total": len(items),
@@ -1237,16 +1363,35 @@ def promote_verified_recommendation(
 
     previous = items[matched_index]
     merged = dict(previous)
+    if payload.get('user_goal'):
+        # The old localized summary must not outlive contradictory new detail.
+        for field in ('summary', 'description', 'content', 'function_summary'):
+            merged.pop(field, None)
     for key, value in verified_detail.items():
         if value not in (None, "", [], {}):
             merged[key] = value
     merged["_detail_verified"] = True
     promoted = _normalize_item(source, merged, mod_loader=mod_loader)
+    if payload.get('user_goal'):
+        # Re-check fresh authoritative prose, not stale/generated table content.
+        promoted['goal_fit'] = assess_goal(verified_detail, compile_goal(payload['user_goal']))
+        for field in ('selection_reason', 'alternative_names'):
+            if previous.get(field):
+                promoted[field] = previous[field]
+        if promoted['goal_fit']['status'] == 'mismatch':
+            promoted['installable'] = False
+            promoted['resolution_kind'] = 'goal_mismatch'
+            promoted['resolution_actions'] = ['open_source']
+            promoted['resolution_title'] = '取得的新详情不支持原始需求；请调整目标，不会自动选中'
+        if promoted['goal_fit']['status'] != 'matched':
+            promoted['default_selected'] = False
+            promoted['selection_reason'] = '新详情未证实需求匹配，不会自动选中；请核对来源功能说明'
     promoted["selection_key"] = previous["selection_key"]
     if _text(previous.get("localized_name")):
         promoted["localized_name"] = previous["localized_name"]
     if (
-        _CHINESE_RE.search(_text(previous.get("content")))
+        not payload.get('user_goal')
+        and _CHINESE_RE.search(_text(previous.get("content")))
         and not _CHINESE_RE.search(_text(promoted.get("content")))
     ):
         promoted["content"] = previous["content"]
@@ -1269,11 +1414,12 @@ def promote_verified_recommendation(
         str(key) for key in (payload.get("wanted_keys") or []) if key
     ]
     promoted_key = promoted["selection_key"]
-    if promoted.get("installable") and promoted_key in wanted_keys:
+    fit_confirmed = not payload.get('user_goal') or promoted.get('goal_fit', {}).get('status') == 'matched'
+    if promoted.get("installable") and fit_confirmed and promoted_key in wanted_keys:
         wanted_keys = [key for key in wanted_keys if key != promoted_key]
         if promoted_key not in selected_keys:
             selected_keys.append(promoted_key)
-    elif not promoted.get("installable"):
+    elif not promoted.get("installable") or not fit_confirmed:
         selected_keys = [key for key in selected_keys if key != promoted_key]
         if promoted_key not in wanted_keys:
             wanted_keys.append(promoted_key)
@@ -1317,6 +1463,69 @@ def promote_verified_recommendation(
         "resolution_kind": promoted.get("resolution_kind"),
     }
     return result
+
+
+def _candidate_family_key(item: dict) -> str:
+    """Return a conservative family key for obvious reuploads/variants.
+
+    Source IDs must remain distinct for installation, but listing several
+    "20 seconds / 5 seconds / instant" reuploads of the same feature as
+    independent recommendations is not useful.  This is intentionally
+    conservative: a family is collapsed only when removing version/reupload
+    noise leaves a meaningful common title.
+    """
+    title = _text(item.get("name") or item.get("localized_name")).casefold()
+    if not title:
+        return ""
+    title = re.sub(r"\bv?\d+(?:\.\d+){1,4}\b", " ", title)
+    title = re.sub(r"\b\d+\s*(?:seconds?|secs?)\b|\d+\s*秒", " ", title, flags=re.I)
+    title = re.sub(
+        r"(?:\b(?:reupload|re-upload|updated?|reload(?:ed)?|instant|seconds|secs)\b|"
+        r"重上传|重新上传|重制|新版|旧版|瞬间|秒版|\d+\s*秒)",
+        " ", title, flags=re.I,
+    )
+    key = re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", title)
+    return key if len(key) >= 8 else ""
+
+
+def _collapse_candidate_families(items: list[dict]) -> list[dict]:
+    """Keep one best candidate per obvious source/title variant family."""
+    families: dict[str, list[dict]] = {}
+    passthrough: list[dict] = []
+    for item in items:
+        key = _candidate_family_key(item)
+        if not key:
+            passthrough.append(item)
+            continue
+        families.setdefault(key, []).append(item)
+
+    collapsed = list(passthrough)
+    for family in families.values():
+        family.sort(key=lambda item: (
+            bool(item.get("detail_verified")),
+            bool(item.get("has_function_summary")),
+            bool(item.get("installable")),
+            _version_identity(item.get("version")),
+        ), reverse=True)
+        primary = dict(family[0])
+        if len(family) > 1:
+            primary["variant_alternatives"] = [
+                {
+                    "selection_key": item.get("selection_key"),
+                    "name": item.get("name"),
+                    "localized_name": item.get("localized_name"),
+                    "version": item.get("version"),
+                    "source_id": item.get("source_id"),
+                    "url": item.get("url"),
+                }
+                for item in family[1:]
+            ]
+            primary["variant_family_note"] = (
+                f"已合并 {len(family) - 1} 个同功能的版本/重传候选；"
+                "如需特定变体，可从来源页再选。"
+            )
+        collapsed.append(primary)
+    return collapsed
 
 
 def merge_recommendation_resolution(

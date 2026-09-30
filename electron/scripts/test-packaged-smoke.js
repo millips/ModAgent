@@ -12,6 +12,7 @@ function option(name, fallback = '') {
 }
 
 const edition = option('--edition', 'subscription')
+const credentials = process.argv.includes('--credentials')
 const defaultExecutable = edition === 'free'
   ? path.resolve(__dirname, '..', 'release', 'free', 'win-unpacked', 'ModAgent.exe')
   : path.resolve(__dirname, '..', 'release', 'subscription', 'win-unpacked', 'ModAgentP.exe')
@@ -25,9 +26,18 @@ const dataDir = path.join(smokeRoot, 'data')
 const userDataDir = path.join(smokeRoot, 'user-data')
 fs.mkdirSync(dataDir, { recursive: true })
 fs.mkdirSync(userDataDir, { recursive: true })
+if (credentials) {
+  // Synthetic legacy profile only: never read a developer's real key store.
+  fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
+    llm_api_key: 'credential-smoke-fake-llm', nexus_api_key: 'credential-smoke-fake-nexus',
+    tavily_api_key: 'credential-smoke-fake-tavily', llm_endpoint: 'https://credentials.invalid/v1',
+    llm_model: 'credential-smoke-model',
+  }))
+}
 
+let passed = false
 try {
-  const result = spawnSync(executable, ['--smoke-test'], {
+  const result = spawnSync(executable, ['--smoke-test', ...(credentials ? ['--smoke-credentials'] : [])], {
     encoding: 'utf8',
     timeout: 90000,
     windowsHide: true,
@@ -56,6 +66,12 @@ try {
   const log = fs.readFileSync(logPath, 'utf8')
   assert(log.includes('ModAgent API ready'), 'Backend health check was not observed')
   assert(log.includes('Packaged smoke test passed'), 'Smoke-test success marker missing')
+  if (credentials) {
+    assert(log.includes('Credential reuse smoke passed'), 'Inherited credentials never reached backend/workspace')
+    const vault = fs.readFileSync(path.join(dataDir, 'smoke-credentials', 'credentials-v2.json'), 'utf8')
+    assert(!vault.includes('credential-smoke-fake'), 'Plaintext secret in encrypted vault')
+    assert(!log.includes('credential-smoke-fake'), 'Secret leaked to desktop log')
+  }
   // `did-finish-load` can still fire after a top-level React exception, leaving a
   // visually blank window. Treat renderer console errors as a failed package.
   const rendererErrors = log
@@ -75,7 +91,22 @@ try {
     0,
     `Backend log contains invalid UTF-8 replacement characters:\n${invalidUtf8Lines.join('\n')}`,
   )
+  if (credentials) {
+    // A second process must decrypt the persisted vault, not merely reuse the
+    // in-memory values from the first import.
+    const reopened = spawnSync(executable, ['--smoke-test', '--smoke-credentials'], {
+      encoding: 'utf8', timeout: 90000, windowsHide: true,
+      env: { ...process.env, MODAGENT_DATA_DIR: dataDir, MODAGENT_USER_DATA_DIR: userDataDir },
+    })
+    if (reopened.error) throw reopened.error
+    assert.strictEqual(reopened.status, 0, 'Encrypted credentials did not survive app restart')
+    const reopenedLog = fs.readFileSync(logPath, 'utf8')
+    assert(!reopenedLog.includes('credential-smoke-fake'), 'Secret leaked after restart')
+    console.log('CREDENTIAL IMPORT + ENCRYPTED RESTART + SETUP BYPASS PASSED')
+  }
   console.log(`PACKAGED ${edition.toUpperCase()} SMOKE TEST PASSED (${packageInfo.version})`)
+  passed = true
 } finally {
-  fs.rmSync(smokeRoot, { recursive: true, force: true })
+  if (passed) fs.rmSync(smokeRoot, { recursive: true, force: true })
+  else console.error(`Failed smoke fixtures retained for diagnosis: ${smokeRoot}`)
 }

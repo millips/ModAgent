@@ -464,13 +464,18 @@ def _parse(url: str):
     return None
 
 
-def download(url: str, game_slug: str, progress_callback=None) -> dict:
+def download(url: str, game_slug: str, progress_callback=None, *, expected_version: str = "") -> dict:
     p = _parse(url)
     if not p:
         raise RuntimeError("无法解析 Thunderstore 链接（需形如 thunderstore.io/c/<游戏>/p/<作者>/<包>/）")
     ns, name = p
     data = _http_json(f"https://thunderstore.io/api/experimental/package/{ns}/{name}/")
     latest = data.get("latest", {}) or {}
+    if expected_version and str(latest.get("version_number") or "") != str(expected_version):
+        raise downloader.DownloadFailure(
+            "来源当前下载版本与已选择版本不同，已停止；请重新核验计划，不能自动换成最新版。",
+            failure_kind="selected_version_changed", retryable=False, attempts=0,
+        )
     dlurl = latest.get("download_url")
     if not dlurl:
         raise RuntimeError("Thunderstore 包没有可下载版本")

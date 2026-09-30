@@ -76,6 +76,43 @@ def test_download_package_is_one_management_unit(tmp_path, monkeypatch):
     assert rows[0]["variant_count"] == 2
 
 
+def test_stellarblade_loose_variant_family_is_one_management_unit(tmp_path, monkeypatch):
+    """A legacy loose pack must not become one Mod row per outfit toggle."""
+    monkeypatch.setattr(db, "DB_FILE", str(tmp_path / "state.db"))
+    db.init_db()
+    game = tmp_path / "StellarBlade"
+    names = ("AddPubes", "HideChest", "HideGloves")
+    for index, suffix in enumerate(names):
+        files = []
+        for extension in (".pak", ".ucas", ".utoc"):
+            path = game / "SB" / "Content" / "Paks" / "~mods" / (
+                f"Addon_Nier_03_{suffix}_P{extension}"
+            )
+            _touch(str(path))
+            files.append(str(path))
+        db.add_mod(db.InstalledMod(
+            id=f"legacy_{index}", name=f"Addon Nier 03 {suffix}",
+            version="unknown", snapshot_id="", files_installed=json.dumps(files),
+            installed_by="imported", game_slug="stellarblade",
+        ))
+
+    merged = db.merge_duplicate_inventory_rows("stellarblade")
+    assert {item["reason"] for item in merged} == {"unreal_variant_family"}
+    rows = api.list_mods("stellarblade")
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Addon Nier 03"
+    assert rows[0]["file_count"] == 9
+    assert rows[0]["variant_count"] == 3
+
+    # The same grouping also occurs before a brand-new disk scan is imported.
+    monkeypatch.setattr(db, "DB_FILE", str(tmp_path / "fresh-state.db"))
+    db.init_db()
+    scan = scanner.scan_existing_mods(str(game), "stellarblade", "")
+    assert len(scan["identified"]) == 1
+    assert scan["identified"][0]["name"] == "Addon Nier 03"
+    assert len(scan["identified"][0]["files"]) == 9
+
+
 def test_package_subset_merge_stays_conservative_when_owner_is_ambiguous(
     tmp_path, monkeypatch,
 ):
@@ -110,6 +147,37 @@ def test_package_subset_merge_stays_conservative_when_owner_is_ambiguous(
     ))
     assert db.merge_duplicate_inventory_rows("game") == []
     assert len(db.get_installed_mods("game")) == 3
+
+
+def test_user_confirmed_package_merge_keeps_one_parent_record(tmp_path, monkeypatch):
+    """A user-approved component pack is one management unit without moving files."""
+    monkeypatch.setattr(db, "DB_FILE", str(tmp_path / "state.db"))
+    db.init_db()
+    files_by_row = []
+    for index, suffix in enumerate(("HideGloves", "HideChest", "HideSkirt")):
+        files = []
+        for extension in (".pak", ".ucas", ".utoc"):
+            path = tmp_path / f"Addon_Nier_03_{suffix}_P{extension}"
+            _touch(str(path))
+            files.append(str(path))
+        files_by_row.append(files)
+        db.add_mod(db.InstalledMod(
+            id=f"component_{index}", name=f"Addon Nier 03 {suffix}",
+            version="unknown", snapshot_id="", files_installed=json.dumps(files),
+            installed_by="imported", game_slug="stellarblade",
+        ))
+
+    result = db.merge_mod_rows_as_package(
+        "stellarblade", ["component_0", "component_1", "component_2"], "尼尔03组件包",
+    )
+    assert result["merged_count"] == 3
+    assert result["file_count"] == 9
+    rows = db.get_installed_mods("stellarblade")
+    assert len(rows) == 1
+    assert rows[0].name == "尼尔03组件包"
+    assert rows[0].installed_by == "package_group"
+    assert len(json.loads(rows[0].files_installed)) == 9
+    assert all(os.path.isfile(path) for files in files_by_row for path in files)
 
 
 def test_snapshot_guard_uses_install_instance_identity(tmp_path, monkeypatch):

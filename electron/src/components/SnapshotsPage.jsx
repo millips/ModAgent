@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react'
 import { Camera, RotateCcw, Clock, Shield, Trash2, Eye, X } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
+import { tr } from '../i18n'
 
-export default function SnapshotsPage({ toast, api, status, onRefresh }) {
+export default function SnapshotsPage({ toast, api, status, onRefresh, language = 'zh-CN' }) {
+  const t = key => tr(language, key)
   const [snaps, setSnaps] = useState([])
   const [storage, setStorage] = useState(null)
   const [actionLock, setActionLock] = useState(null)
@@ -160,13 +162,13 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
     <div className="flex-1 flex flex-col overflow-hidden">
       <div className="flex items-center justify-between px-4 py-3 border-b border-surface-600">
         <h2 className="text-base font-semibold flex items-center gap-2">
-          <Camera size={16} className="text-cyber-purple" /> 快照历史
+          <Camera size={16} className="text-cyber-purple" /> {t('snapshotHistory')}
           {storage && (
             <span
               className="px-2 py-0.5 rounded text-[10px] font-normal bg-cyber-purple/10 text-cyber-purple border border-cyber-purple/25"
               title={`普通目录统计会显示 ${formatBytes(storage.logical_bytes)}；硬链接去重后的实际数据约 ${formatBytes(storage.deduplicated_bytes)}`}
             >
-              实际占用约 {formatBytes(storage.deduplicated_bytes)}
+              {t('actualStorage')} {formatBytes(storage.deduplicated_bytes)}
             </span>
           )}
           {storage?.orphan_snapshot_count > 0 && (
@@ -180,11 +182,11 @@ export default function SnapshotsPage({ toast, api, status, onRefresh }) {
         </h2>
         <div className="flex gap-2">
           <button className="btn-ghost" onClick={reconcile} title="校验每个快照的磁盘文件是否还在,失效的标灰并禁用回滚">
-            <Eye size={14} /> 对账
+            <Eye size={14} /> {t('reconcileSnapshots')}
           </button>
-          <button className="btn-ghost" onClick={loadSnaps}><RotateCcw size={14} /> 刷新</button>
+          <button className="btn-ghost" onClick={loadSnaps}><RotateCcw size={14} /> {t('refreshMods')}</button>
           <button className="btn-cyber flex items-center gap-1.5" onClick={createSnap}>
-            <Shield size={14} /> 创建快照
+            <Shield size={14} /> {t('createSnapshot')}
           </button>
         </div>
       </div>

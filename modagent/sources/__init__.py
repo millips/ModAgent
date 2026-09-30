@@ -9,6 +9,7 @@ import time
 import urllib.request
 
 from .. import downloader
+from .. import task_control
 
 
 class RequestCancelled(RuntimeError):
@@ -19,7 +20,8 @@ def _http_json(
     url: str, headers: dict = None, *, timeout: int = 12,
     total_timeout: int = 60, cancel_check=None,
 ) -> dict:
-    ctx = ssl._create_unverified_context()
+    task_control.raise_if_cancelled()
+    ctx = ssl.create_default_context()
     h = {
         "User-Agent": "ModAgent/1.3",
         "Accept": "application/json",
@@ -34,6 +36,7 @@ def _http_json(
     chunks = []
     with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
         while True:
+            task_control.raise_if_cancelled()
             if cancel_check and cancel_check():
                 raise RequestCancelled("用户已取消当前网络任务")
             if total_timeout and time.monotonic() - started > total_timeout:
@@ -170,7 +173,7 @@ def detect_source(url: str) -> str:
     return ""
 
 
-def download_from_url(url: str, game_slug: str, progress_callback=None) -> dict:
+def download_from_url(url: str, game_slug: str, progress_callback=None, *, expected_version: str = "") -> dict:
     """根据链接自动识别来源并下载，返回 {local_path, name, source, version}。"""
     src = detect_source(url)
     if src == "github":
@@ -178,6 +181,8 @@ def download_from_url(url: str, game_slug: str, progress_callback=None) -> dict:
         return github.download(url, game_slug, progress_callback)
     if src == "thunderstore":
         from . import thunderstore
+        if expected_version:
+            return thunderstore.download(url, game_slug, progress_callback, expected_version=expected_version)
         return thunderstore.download(url, game_slug, progress_callback)
     if src == "gamebanana":
         from . import gamebanana

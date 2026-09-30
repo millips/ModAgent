@@ -22,7 +22,7 @@ gh._http_json = lambda url, headers=None: {"items": [
 ]}
 r = gh.search("minimap", "Palworld", limit=5)
 check("A1 github: irrelevant/archived result filtered", len(r) == 1)
-check("A2 github: summary truncated to 140", len(r[0]["summary"]) <= 140)
+check("A2 github: preserves source evidence beyond display excerpt", r[0]["summary"] == "A Palworld mod " + "x" * 200)
 check("A3 github: stars/updated/archived", r[0]["stars"] == 42
       and r[0]["updated_at"] == "2026-05-21" and r[0]["archived"] is False)
 check("A4 github: relevant result retained", r[0]["name"] == "PalMod")

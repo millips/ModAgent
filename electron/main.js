@@ -1,6 +1,6 @@
 const {
   app, BrowserWindow, Menu, ipcMain, shell, dialog, crashReporter,
-  Notification, clipboard, safeStorage,
+  Notification, clipboard, safeStorage, net,
 } = require('electron');
 const { spawn, exec } = require('child_process');
 const path = require('path');
@@ -10,7 +10,8 @@ const crypto = require('crypto');
 const os = require('os');
 const fs = require('fs');
 const { getAppIdentity } = require('./appIdentity');
-const { createSecurityStore } = require('./securityStore');
+const { candidateProfile } = require('./candidateProfile');
+const { createCredentialBroker, credentialOptions } = require('./credentialBroker');
 const { createLicenseStore, canUsePBenefits } = require('./licenseStore');
 const { createRuntimeDiagnostics, buildDiagnosticReport } = require('./runtimeDiagnostics');
 const { setupAutoUpdater } = require('./updater');
@@ -20,6 +21,8 @@ const PACKAGE_INFO = require('./package.json');
 const IDENTITY = getAppIdentity(PACKAGE_INFO);
 const APP_EDITION = IDENTITY.edition;
 const IS_SMOKE_TEST = process.argv.includes('--smoke-test');
+if (IS_SMOKE_TEST && !process.env.MODAGENT_DATA_DIR) throw new Error('Smoke tests require an explicit isolated data directory');
+const TEST_PROFILE = candidateProfile(PACKAGE_INFO, APP_EDITION, app.getPath('appData'), process.env, IS_SMOKE_TEST);
 // Packaged smoke tests run without a user-visible desktop session on some
 // builders. Chromium's GPU subprocess can fail there before the renderer is
 // created, which is unrelated to the packaged app's backend/renderer health.
@@ -38,11 +41,11 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 // rollback ledger.  Keeping a separate folder here made a perfectly ordinary
 // channel switch look like data loss.
 const DEFAULT_DATA_FOLDER = '.modagent';
-const DATA_DIR = path.resolve(process.env.MODAGENT_DATA_DIR || path.join(os.homedir(), DEFAULT_DATA_FOLDER));
+const DATA_DIR = TEST_PROFILE?.dataDir || path.resolve(process.env.MODAGENT_DATA_DIR || path.join(os.homedir(), DEFAULT_DATA_FOLDER));
 const BG_DIR = path.join(DATA_DIR, 'editions', APP_EDITION, 'bg');
-const APP_USER_DATA = IS_SMOKE_TEST && process.env.MODAGENT_USER_DATA_DIR
+const APP_USER_DATA = TEST_PROFILE?.userDataDir || (IS_SMOKE_TEST && process.env.MODAGENT_USER_DATA_DIR
   ? path.resolve(process.env.MODAGENT_USER_DATA_DIR)
-  : path.join(app.getPath('appData'), IDENTITY.userDataFolder);
+  : path.join(app.getPath('appData'), IDENTITY.userDataFolder));
 const TRUSTED_EXTERNAL_HOSTS = new Set([
   'www.nexusmods.com',
   'steamcommunity.com',
@@ -89,7 +92,11 @@ const diagnostics = createRuntimeDiagnostics({
   version: PACKAGE_INFO.version,
 });
 const { logger } = diagnostics;
-const securityStore = createSecurityStore(DATA_DIR, logger);
+const securityStore = createCredentialBroker({
+  ...credentialOptions({ dataDir: DATA_DIR, appData: app.getPath('appData'),
+    homeDir: os.homedir(), candidate: TEST_PROFILE, smoke: IS_SMOKE_TEST }),
+  safeStorage,
+});
 const pLicenseStore = createLicenseStore({
   dataDir: DATA_DIR,
   edition: APP_EDITION,
@@ -117,7 +124,7 @@ let replyAttentionPending = false;
 let activeSecrets = {};
 let API_PORT = 18890;
 let API_BASE = `http://127.0.0.1:${API_PORT}`;
-const CDP_PORT = 18888;
+let CDP_PORT = 18888;
 const API_TOKEN = crypto.randomBytes(32).toString('hex');
 
 process.env.MODAGENT_API_TOKEN = API_TOKEN;
@@ -125,8 +132,13 @@ process.env.MODAGENT_DATA_DIR = DATA_DIR;
 process.env.MODAGENT_EDITION = APP_EDITION;
 process.env.MODAGENT_CHANNEL = IDENTITY.channel;
 process.env.MODAGENT_SECURE_SECRETS = '1';
+if (TEST_PROFILE) process.env.MODAGENT_AGENT_CORE_V2 = TEST_PROFILE.coreMode;
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock({ edition: APP_EDITION });
+// A packaged smoke run has an isolated user-data directory and must be able to
+// start beside the normal desktop client.  Keeping the normal single-instance
+// lock here made a valid build look unhealthy whenever the user happened to
+// have P Beta open while CI/local packaging verified it.
+const gotSingleInstanceLock = IS_SMOKE_TEST || app.requestSingleInstanceLock({ edition: APP_EDITION });
 if (!gotSingleInstanceLock) {
   if (IS_SMOKE_TEST) process.exitCode = 1;
   app.quit();
@@ -188,6 +200,26 @@ function fetchPublicGitHubJson(apiPath) {
   });
 }
 
+async function fetchPublicGitHubJsonViaElectronNet(apiPath) {
+  // Chromium uses the Windows certificate/proxy stack. This is a safe
+  // fallback for networks where Node rejects a trusted proxy root. Never
+  // disable TLS verification just to make status syncing work.
+  const response = await net.fetch(`https://api.github.com${apiPath}`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': `${IDENTITY.productName} p-share-status`,
+    },
+  });
+  const body = await response.text();
+  if (!response.ok) {
+    const hint = response.status === 403
+      ? 'GitHub 403：公开 API 可能限流，请稍后重试或直接打开 Issue 查看。'
+      : `GitHub ${response.status || '请求失败'}`;
+    throw new Error(hint);
+  }
+  try { return JSON.parse(body); } catch (_) { throw new Error('GitHub returned invalid JSON'); }
+}
+
 function fetchPublicOfficialShareIndex() {
   return new Promise((resolve, reject) => {
     const request = https.get({
@@ -211,11 +243,27 @@ function fetchPublicOfficialShareIndex() {
 
 async function fetchPublicGitHubIssue(issueNumber) {
   const issuePath = `/repos/millips/ModAgent-Share/issues/${issueNumber}`;
-  const issue = await fetchPublicGitHubJson(issuePath);
+  let issue;
+  try {
+    issue = await fetchPublicGitHubJson(issuePath);
+  } catch (error) {
+    if (!/certificate|unable to verify|self signed|unable to get local issuer/i.test(
+      String(error?.message || error),
+    )) throw error;
+    issue = await fetchPublicGitHubJsonViaElectronNet(issuePath);
+  }
   // The official code is normally written to the approval comment rather than
   // the user-authored Issue body.  Read both so the creator can see it locally.
   try {
-    const comments = await fetchPublicGitHubJson(`${issuePath}/comments?per_page=100`);
+    let comments;
+    try {
+      comments = await fetchPublicGitHubJson(`${issuePath}/comments?per_page=100`);
+    } catch (error) {
+      if (!/certificate|unable to verify|self signed|unable to get local issuer/i.test(
+        String(error?.message || error),
+      )) throw error;
+      comments = await fetchPublicGitHubJsonViaElectronNet(`${issuePath}/comments?per_page=100`);
+    }
     issue.modagent_comments = Array.isArray(comments) ? comments.map(item => String(item?.body || '')) : [];
   } catch (_) {
     issue.modagent_comments = [];
@@ -246,6 +294,9 @@ function findAvailableApiPort(preferredPort) {
 }
 
 function killStaleCdpBrowser(callback) {
+  // A candidate owns a fresh debugging port and must never close another
+  // build's browser session merely because it is running beside it.
+  if (TEST_PROFILE) { callback(); return; }
   const ps = "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe','msedge.exe','brave.exe') -and $_.CommandLine -like '*remote-debugging-port=" + CDP_PORT + "*' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }";
   exec(`powershell -NoProfile -Command "${ps}"`, () => callback());
 }
@@ -345,7 +396,9 @@ function waitForAPI(retries = 30) {
     let attempts = 0;
     const check = () => {
       attempts += 1;
-      const req = http.get(`${API_BASE}/health`, response => {
+      // /health is public and could belong to another concurrently launched
+      // edition. Only this run's token can authenticate its own backend.
+      const req = http.get(`${API_BASE}/status`, { headers: { 'X-ModAgent-Token': API_TOKEN } }, response => {
         response.resume();
         if (response.statusCode === 200) return resolve();
         if (attempts < retries) setTimeout(check, 1000);
@@ -385,6 +438,61 @@ function markHealthyWhenReady() {
   if (!backendReady || !rendererReady || healthMarkScheduled) return;
   healthMarkScheduled = true;
   if (IS_SMOKE_TEST) {
+    if (process.argv.includes('--smoke-credential-setup')) {
+      // Exercise the actual first-run UI and save-secrets IPC, not just a
+      // pre-seeded config. Available only in the isolated smoke entry point.
+      mainWindow.webContents.executeJavaScript(`(async () => {
+        const wait = async predicate => {
+          for (let i = 0; i < 150; i++) {
+            if (predicate()) return;
+            await new Promise(r => setTimeout(r, 100));
+          }
+          throw Error('setup_smoke_timeout');
+        };
+        const workspace = () => document.querySelector('.is-workspace .app-page-layer');
+        await wait(() => workspace() || document.querySelectorAll('input[type="password"]').length === 3);
+        if (!workspace()) {
+          const field = [...document.querySelectorAll('input[type="password"]')].at(-1);
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, 'credential-setup-fake-key');
+          field.dispatchEvent(new Event('input', { bubbles: true }));
+          await new Promise(r => setTimeout(r, 100));
+          [...document.querySelectorAll('button')].find(b => /下一步|Next/.test(b.textContent)).click();
+          await wait(() => [...document.querySelectorAll('button')].some(b => /保存并进入|Save.*Enter/i.test(b.textContent)));
+          [...document.querySelectorAll('button')].find(b => /保存并进入|Save.*Enter/i.test(b.textContent)).click();
+          await wait(workspace);
+        }
+        const status = await fetch(${JSON.stringify(API_BASE)} + '/status').then(r => r.json());
+        const vault = await window.modagent.getCredentialStatus();
+        return Boolean(workspace()) && status.llm_set
+          && status.llm_endpoint === 'https://api.deepseek.com/v1'
+          && vault.origin === 'local' && vault.shared_warning === 'credential_shared_unavailable';
+      })()`).then(ok => {
+        if (!ok) return finishSmokeTest(false, 'credential setup fallback failed');
+        logger.info('Credential setup fallback smoke passed');
+        diagnostics.markHealthy();
+        finishSmokeTest(true);
+      }).catch(() => finishSmokeTest(false, 'credential setup fallback failed'));
+      return;
+    }
+    if (process.argv.includes('--smoke-credentials')) {
+      mainWindow.webContents.executeJavaScript(`(async () => {
+        for (let i = 0; i < 100; i++) {
+          if (document.querySelector('.is-workspace .app-page-layer')) break;
+          await new Promise(r => setTimeout(r, 100));
+        }
+        const status = await fetch(${JSON.stringify(API_BASE)} + '/status').then(r => r.json());
+        return Boolean(document.querySelector('.is-workspace .app-page-layer'))
+          && status.llm_set && status.api_key_set && status.tavily_set
+          && status.llm_endpoint === 'https://credentials.invalid/v1'
+          && status.llm_model === 'credential-smoke-model';
+      })()`).then(ok => {
+        if (!ok) return finishSmokeTest(false, 'credential reuse or setup bypass failed');
+        logger.info('Credential reuse smoke passed');
+        diagnostics.markHealthy();
+        finishSmokeTest(true);
+      }).catch(() => finishSmokeTest(false, 'credential reuse smoke failed'));
+      return;
+    }
     diagnostics.markHealthy();
     finishSmokeTest(true);
     return;
@@ -528,10 +636,23 @@ if (gotSingleInstanceLock) {
       else app.quit();
       return;
     }
-    activeSecrets = securityStore.migratePlaintextConfig();
+    try {
+      activeSecrets = securityStore.load();
+      if (securityStore.status().shared_warning) logger.info('Shared credentials unavailable; local profile remains usable.');
+    }
+    catch (_) {
+      // Never print decryption errors, secret values, or imported config paths.
+      logger.error('Credential reuse unavailable; existing stores were preserved.');
+      activeSecrets = {};
+    }
     securityStore.applyToEnvironment(activeSecrets, process.env);
-    API_PORT = await findAvailableApiPort(API_PORT);
+    API_PORT = await findAvailableApiPort(TEST_PROFILE || IS_SMOKE_TEST ? 0 : API_PORT);
     API_BASE = `http://127.0.0.1:${API_PORT}`;
+    if (TEST_PROFILE) {
+      CDP_PORT = await findAvailableApiPort(0);
+      process.env.MODAGENT_CHROME_CDP_PORT = String(CDP_PORT);
+      logger.info('Isolated Core Safety candidate', { id: TEST_PROFILE.id, coreMode: TEST_PROFILE.coreMode });
+    }
     if (IS_SMOKE_TEST) {
       smokeTestTimeout = setTimeout(
         () => finishSmokeTest(false, 'renderer and backend did not become healthy within 45 seconds'),
@@ -586,6 +707,18 @@ ipcMain.on('get-p-license-status-sync', event => {
   event.returnValue = pLicenseStore.status();
 });
 ipcMain.handle('get-p-license-status', () => pLicenseStore.status());
+ipcMain.handle('start-p-trial', () => {
+  try {
+    const status = pLicenseStore.startTrial();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('p-license-status', status);
+    }
+    return { ok: true, status };
+  } catch (error) {
+    logger.warn('ModAgent P trial start failed', error.message);
+    return { ok: false, error: error.message || '无法开始 P 试用' };
+  }
+});
 ipcMain.handle('activate-p-license', (_, code) => {
   try {
     const status = pLicenseStore.activate(code);
@@ -834,14 +967,36 @@ ipcMain.handle('select-game-executable', async () => {
     suggestedName: path.basename(executable, path.extname(executable)),
   };
 });
-ipcMain.handle('save-secrets', (_, updates = {}) => {
+ipcMain.handle('credential-status', () => securityStore.status());
+ipcMain.handle('save-secrets', async (event, updates = {}) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'untrusted_window' };
   const allowed = {};
-  for (const key of ['nexus_api_key', 'llm_api_key', 'tavily_api_key']) {
+  for (const key of ['nexus_api_key', 'llm_api_key', 'tavily_api_key', 'llm_endpoint', 'llm_model']) {
     if (Object.prototype.hasOwnProperty.call(updates, key)) allowed[key] = updates[key];
   }
-  activeSecrets = securityStore.save(allowed);
-  securityStore.applyToEnvironment(activeSecrets, process.env);
-  return { ok: true };
+  try {
+    activeSecrets = securityStore.save(allowed);
+    securityStore.applyToEnvironment(activeSecrets, process.env);
+    // Resolve inherited keys in the main process, not in the renderer. This is
+    // a fixed loopback request with no redirect handling and no external call.
+    await new Promise((resolve, reject) => {
+      const request = http.request({ hostname: '127.0.0.1', port: API_PORT, path: '/config', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-ModAgent-Token': API_TOKEN } }, response => {
+        response.resume();
+        response.on('end', () => response.statusCode === 200 ? resolve() : reject(new Error('credential_backend_unavailable')));
+        response.on('error', () => reject(new Error('credential_backend_unavailable')));
+      });
+      request.setTimeout(5000, () => request.destroy(new Error('credential_backend_unavailable')));
+      request.on('error', () => reject(new Error('credential_backend_unavailable')));
+      request.end(JSON.stringify(activeSecrets));
+    });
+    return { ok: true, ...securityStore.status() };
+  } catch (error) {
+    const code = String(error.message || '');
+    const safeCode = /^credential_[a-z_]+$/.test(code) ? code : 'credential_save_failed';
+    logger.error('Credential save failed', { code: safeCode });
+    return { ok: false, error: safeCode };
+  }
 });
 ipcMain.handle('open-diagnostics-folder', () => shell.openPath(diagnostics.logsDir));
 ipcMain.handle('open-maintenance-folder', (_, kind) => {

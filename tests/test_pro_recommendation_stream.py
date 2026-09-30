@@ -104,10 +104,27 @@ class MultiSearchAgent(FakeAgent):
         })
 
 
+class ExhaustedSearchAgent(MultiSearchAgent):
+    """The model never emits prose; accumulated evidence must still render."""
+
+    def _stream(self, _messages, _tools):
+        self.round += 1
+        search_call = type("ToolCall", (), {
+            "index": 0,
+            "id": f"exhausted-search-{self.round}",
+            "function": type("Function", (), {
+                "name": "nexus_search",
+                "arguments": json.dumps({"query": f"mai costume {self.round}"}),
+            })(),
+        })()
+        return [chunk(tool_calls=[search_call])]
+
+
 old_prompt = agent_module.build_prompt
 old_tools = agent_module.build_tools_definitions
 old_report = agent_module.ENABLE_REPORT_VALIDATION
 old_state = agent_module.ENABLE_STATE_CHECK
+old_max_rounds = agent_module.MAX_ROUNDS
 old_edition = os.environ.get("MODAGENT_EDITION")
 agent_module.build_prompt = lambda _cfg: "system"
 agent_module.build_tools_definitions = lambda _tier: [
@@ -140,6 +157,17 @@ try:
         "中文功能介绍" in item["content"]
         for item in recommendation_events[0]["recommendations"]["items"]
     )
+    # Low-level tool calls may stay quiet in the transcript, but every long
+    # turn must still expose a trustworthy user-visible phase event.
+    assert any(
+        event.get("progress", {}).get("label")
+        for event in pro_events
+    )
+    structured_plan = agent_module.structured_plan_footer(
+        "请逐项回复 ①A、②B，并确认按此计划安装 (y/n)"
+    )
+    assert "①A" not in structured_plan
+    assert "安装确认卡" in structured_plan
 
     os.environ["MODAGENT_EDITION"] = "free"
     free_events = [json.loads(value) for value in FakeAgent("free").chat_stream("recommend")]
@@ -154,11 +182,25 @@ try:
     multi_recommendations = [event for event in multi_events if "recommendations" in event]
     assert len(multi_recommendations) == 1
     assert len(multi_recommendations[0]["recommendations"]["items"]) == 3
+
+    # Exhausting the tool loop is not allowed to erase successfully fetched
+    # search results or leave only an internal stop message.
+    agent_module.MAX_ROUNDS = 2
+    exhausted_events = [
+        json.loads(value) for value in ExhaustedSearchAgent().chat_stream("mai costumes")
+    ]
+    exhausted_recommendations = [
+        event for event in exhausted_events if "recommendations" in event
+    ]
+    assert len(exhausted_recommendations) == 1
+    assert len(exhausted_recommendations[0]["recommendations"]["items"]) == 2
+    assert any("搜索已达到本轮上限" in event.get("chunk", "") for event in exhausted_events)
 finally:
     agent_module.build_prompt = old_prompt
     agent_module.build_tools_definitions = old_tools
     agent_module.ENABLE_REPORT_VALIDATION = old_report
     agent_module.ENABLE_STATE_CHECK = old_state
+    agent_module.MAX_ROUNDS = old_max_rounds
     if old_edition is None:
         os.environ.pop("MODAGENT_EDITION", None)
     else:

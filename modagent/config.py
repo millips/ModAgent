@@ -66,6 +66,9 @@ class Config:
     tavily_api_key: str = ""
     workshop_dir: str = ""
     recommendation_limit: int = 10
+    # UI and assistant response language.  Kept in the local profile so a
+    # single packaged build can serve Chinese and English players.
+    language: str = "zh-CN"
     # GitHub Raw index for reviewed ma-xxxxxx collections. Kept configurable
     # for a future repository move without changing shipped clients.
     official_share_index_url: str = "https://raw.githubusercontent.com/millips/ModAgent-Share/main/index.json"
@@ -73,6 +76,10 @@ class Config:
     # Per-game Vortex/MO2/Fluffy/custom mod roots.
     manual_mod_dirs: dict[str, list[str]] = field(default_factory=dict)
     dev_mode: bool = False          # 开发者模式:开启后记录 trace 并暴露 /debug 端点
+    # Agent Core v2 rollout switch. ``shadow`` records routing/task events but
+    # leaves the legacy prompt and tool loop authoritative; ``on`` enforces the
+    # v2 prompt and per-mode tool policy.
+    agent_core_v2: str = "off"
 
 
 def ensure_config_dir():
@@ -112,12 +119,37 @@ def load() -> Config:
         cfg.recommendation_limit = max(2, min(int(cfg.recommendation_limit), 20))
     except (TypeError, ValueError):
         cfg.recommendation_limit = 10
+    cfg.language = "en" if str(getattr(cfg, "language", "")).lower() in {
+        "en", "en-us", "en-gb"
+    } else "zh-CN"
+    feature_mode = str(
+        os.environ.get("MODAGENT_AGENT_CORE_V2")
+        or getattr(cfg, "agent_core_v2", "off")
+        or "off"
+    ).strip().lower()
+    cfg.agent_core_v2 = feature_mode if feature_mode in {"off", "shadow", "on"} else "off"
+    # The isolated desktop candidate allocates its own browser debugging port.
+    # Do not attach its source tools to a production browser on the default port.
+    browser_port = os.environ.get("MODAGENT_CHROME_CDP_PORT", "")
+    if browser_port:
+        parsed_port = int(browser_port)
+        if not 1 <= parsed_port <= 65535:
+            raise ValueError("Invalid configured browser debugging port")
+        cfg.chrome_cdp_port = parsed_port
     # Edition is authoritative: stale config cannot downgrade Pro or unlock free.
     cfg.tier = entitlement_tier()
+    # Endpoint-bound desktop credentials override legacy plaintext, including
+    # empty keys after failed decryption or a provider change.
+    bound_credentials = os.environ.get("MODAGENT_CREDENTIAL_ROUTE") == "1"
+    if bound_credentials:
+        for field in ("llm_endpoint", "llm_model"):
+            value = os.environ.get("MODAGENT_" + field.upper())
+            if value:
+                setattr(cfg, field, value)
     for field, env_name in _SECRET_ENV.items():
         value = os.environ.get(env_name)
-        if value:
-            setattr(cfg, field, value)
+        if value or bound_credentials:
+            setattr(cfg, field, value or "")
     return cfg
 
 

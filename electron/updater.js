@@ -101,6 +101,14 @@ function setupManualUpdateChecker({ identity, diagnostics, getMainWindow }) {
 }
 
 function setupAutoUpdater({ identity, diagnostics, getMainWindow }) {
+  if (identity.candidateId) {
+    diagnostics.logger.info('All application update checks disabled for isolated test candidate');
+    ipcMain.handle('check-for-app-update', async () => ({
+      ok: true, available: false, disabled: true,
+      message: '独立测试包不自动更新，请使用单独提供的新测试包。',
+    }));
+    return null;
+  }
   if (!app.isPackaged) return null;
   if (!hasUpdateConfiguration(process.resourcesPath)) {
     diagnostics.logger.info('Automatic updater disabled; manual update manifest enabled', {

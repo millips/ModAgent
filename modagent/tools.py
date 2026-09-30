@@ -4,7 +4,10 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import time
+import urllib.error
+from functools import wraps
 from typing import Optional
 
 from .config import Config, Tier, game_storage_id
@@ -41,6 +44,35 @@ _DOWNLOAD_PHASE_LABELS = {
     "verifying": "正在校验压缩包",
     "download_complete": "下载并校验完成",
 }
+_SOURCE_RETRY_DELAYS = (1.0, 3.0)
+
+
+def _is_transient_source_error(exc: Exception) -> bool:
+    if isinstance(exc, nexus.NexusSearchUnavailable):
+        return str(getattr(exc, "status", "")) == "source_unavailable"
+    if isinstance(exc, (TimeoutError, ConnectionResetError, ssl.SSLError, urllib.error.URLError)):
+        return True
+    message = str(exc or "").casefold()
+    transient_markers = (
+        "timed out", "timeout", "connection reset", "connection aborted",
+        "handshake operation", "temporarily unavailable", "tls handshake",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+def _source_call_with_retry(callable_, *args, enabled: bool = False, **kwargs):
+    """Retry one transient source independently; never retry auth/config gates."""
+    delays = _SOURCE_RETRY_DELAYS if enabled else ()
+    for attempt in range(len(delays) + 1):
+        try:
+            return callable_(*args, **kwargs)
+        except Exception as exc:
+            if attempt >= len(delays) or not _is_transient_source_error(exc):
+                raise
+            deadline = time.monotonic() + delays[attempt]
+            while time.monotonic() < deadline:
+                task_control.raise_if_cancelled()
+                time.sleep(min(.1, max(0.0, deadline - time.monotonic())))
 
 
 def _publish_download_phase(mod_id: str, phase: str, detail: str = "") -> None:
@@ -231,6 +263,7 @@ def refresh_local_inventory(cfg: Config) -> dict:
     if not root or not slug or not os.path.isdir(root):
         return {"detected": 0, "imported": 0}
     storage_id = str(getattr(cfg, "game_instance_id", "") or slug)
+    bindings_backfilled = db.backfill_custom_nexus_bindings(storage_id)
     aliases_merged = db.merge_duplicate_inventory_rows(storage_id)
     manual_roots = getattr(cfg, "manual_mod_dirs", {}) or {}
     extra = manual_roots.get(storage_id, manual_roots.get(slug, []))
@@ -238,8 +271,14 @@ def refresh_local_inventory(cfg: Config) -> dict:
         root, slug, "", extra, game_instance_id=storage_id,
     )
     result["imported"] = scanner.import_mods(result.get("identified", []))
+    # A scanner candidate can legitimately contain generated config/log files
+    # in addition to the files recorded at installation time.  Merge again
+    # after import so that such a row never survives one UI refresh as a
+    # duplicate of the ModAgent-installed package.
+    aliases_merged.extend(db.merge_duplicate_inventory_rows(storage_id))
     result["aliases_merged"] = aliases_merged
     result["aliases_merged_count"] = len(aliases_merged)
+    result["source_bindings_backfilled"] = bindings_backfilled
     return result
 
 
@@ -277,7 +316,13 @@ def _url_source_identity(url: str) -> tuple[str, str, str]:
 
 
 def _download_source_provenance(path: str, game_slug: str) -> dict:
-    """Return validated non-Nexus source identity carried by a download."""
+    """Return validated source identity carried by a ModAgent download.
+
+    Nexus archives deliberately carry only their numeric Mod ID in the local
+    download sidecar.  That is still a stable identity, so treating Nexus as
+    "unbound" after a successful ModAgent install loses provenance and makes
+    the next inventory scan look like a separate local Mod.
+    """
     metadata = downloader.read_download_provenance(path)
     if not metadata:
         return {}
@@ -287,13 +332,22 @@ def _download_source_provenance(path: str, game_slug: str) -> dict:
     source = str(metadata.get("source") or "").casefold()
     source_key = str(metadata.get("source_key") or "")
     source_url = str(metadata.get("source_url") or "")
+    if not source or not source_key:
+        return {}
     parsed_source, parsed_key, parsed_name = _url_source_identity(source_url)
-    if (
-        not source
-        or source == "nexus"
-        or source != parsed_source
-        or source_key != parsed_key
-    ):
+    if source == "nexus":
+        if not source_key.isdigit():
+            return {}
+        # The downloader records the exact numeric ID before an optional
+        # website/detail lookup.  Rebuild the canonical page URL locally when
+        # the sidecar predates source_url support.
+        if not source_url:
+            nexus_slug = recorded_game or str(game_slug or "")
+            if nexus_slug and not nexus_slug.startswith("local_"):
+                source_url = (
+                    f"https://www.nexusmods.com/{nexus_slug}/mods/{source_key}"
+                )
+    elif source != parsed_source or source_key != parsed_key:
         return {}
     return {
         "source": source,
@@ -409,6 +463,7 @@ def build_tools_definitions(tier: str) -> list[dict]:
            ["query"]),
         _t("workshop_install", "订阅安装 Steam 创意工坊 mod（Steam 客户端会自动下载到本地）。⚠️ 安装前必须先征得用户确认。需要 Steam 客户端在运行且浏览器已登录 Steam。",
            {"workshop_id": {"type": "string", "description": "工坊物品 ID（纯数字）"},
+            "name": {"type": "string", "description": "可选：保留 workshop_search 或用户选中条目返回的标题，用于本地清单显示"},
             "dependencies": {"type": "array", "items": {"type": "string"},
                              "description": "可选：该 Mod 实际依赖的已安装本地 Mod ID"}},
            ["workshop_id"]),
@@ -607,11 +662,12 @@ def build_tools_definitions(tier: str) -> list[dict]:
             "include_config_metadata": {"type": "boolean", "description": "Reserve configuration metadata; config contents are never exported automatically."}}, []),
         _t("share_import", "Parse a pasted ModAgent share JSON, offline share link, GitHub Raw link, or Gist Raw link and return a reviewable installation preview. This tool NEVER installs, writes files, changes enabled state, or trusts dependencies without normal verification. Use it before preparing the normal installation plan.",
            {"share": {"type": "string", "description": "Pasted JSON, data: offline link, raw.githubusercontent.com link, or gist.githubusercontent.com link."}}, ["share"]),
-        _t("official_share_catalog", "Browse/search the reviewed official ModAgent collection library. Official collections have stable ma-xxxxxx IDs and are loaded from the project's GitHub Raw index. The list is read-only and does not install anything.",
+        _t("official_share_catalog", "Browse/search the reviewed official ModAgent collection library. Official collections have stable ma-xxxxxx IDs and are loaded from the project's GitHub Raw index with a GitHub API and verified local-cache fallback. The list is read-only and does not install anything.",
            {"query": {"type": "string", "description": "Optional title, tag, or collection ID search."},
             "all_games": {"type": "boolean", "description": "When true, do not filter by the currently selected game."}}, []),
         _t("official_share_import", "Open a reviewed official ma-xxxxxx collection and return its verification/install-plan preview. This NEVER installs automatically; normal source, dependency, conflict, loader, duplicate, and game compatibility checks remain mandatory.",
            {"share_id": {"type": "string", "description": "Official collection code, for example ma-repo-000001."}}, ["share_id"]),
+        _t("official_share_network_diagnostics", "Read-only diagnostics for the official collection library. Test GitHub Raw, the equivalent GitHub Contents API, and whether a verified local catalogue cache is available. Never changes installation, configuration, or credentials.", {}, []),
         _t("game_file_check", "只读诊断:检查游戏目录内某文件/文件夹是否存在,返回大小与修改时间;"
            "对文本文件可读取末尾若干行(如查看 SB/Binaries/Win64/ue4ss/UE4SS.log 判断 UE4SS 是否被游戏加载)。"
            "path 为相对游戏根目录的路径,禁止越界。",
@@ -774,6 +830,19 @@ def _execute_toggle_plan(
     return {"details": details, "external_configs": config_result}
 
 
+def _serialize_game_writes(function):
+    @wraps(function)
+    def wrapped(name, args, cfg):
+        if name in {"mod_install", "mod_install_custom", "mod_install_batch", "mod_uninstall",
+                    "mod_disable", "mod_enable", "mod_update", "snapshot_restore"}:
+            with task_control.game_write_scope(getattr(cfg, "game_root", "")):
+                return function(name, args, cfg)
+        task_control.raise_if_cancelled()
+        return function(name, args, cfg)
+    return wrapped
+
+
+@_serialize_game_writes
 def execute(name: str, args: dict, cfg: Config) -> str:
     api_key = cfg.nexus_api_key
     slug = cfg.game_slug
@@ -840,13 +909,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         configured = canonical_loader(getattr(cfg, "mod_loader", ""))
         if configured:
             detected.append(configured)
-        checks = (
-            ("BepInEx", os.path.join(root, "BepInEx")),
-            ("MelonLoader", os.path.join(root, "MelonLoader")),
-            ("SMAPI", os.path.join(root, "StardewModdingAPI.exe")),
-        )
-        for loader, path in checks:
-            if os.path.exists(path) and loader not in detected:
+        from .runtime_detection import active_loaders as detect_active_loaders
+        for loader in detect_active_loaders(root):
+            if loader not in detected:
                 detected.append(loader)
         return detected
 
@@ -1212,8 +1277,8 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             game_instance_id=storage_slug,
         )
         identified = result.get("identified", [])
-        if identified:
-            scanner.import_mods(identified)
+        imported = scanner.import_mods(identified) if identified else 0
+        aliases_merged = db.merge_duplicate_inventory_rows(storage_slug)
         # Never inject thousands of absolute file paths into the model context.
         # The full inventory is already persisted; the tool response is a bounded report.
         public_items = [{
@@ -1225,9 +1290,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         } for item in identified[:500]]
         return json.dumps({
             "detected": result.get("detected", 0),
-            "imported": len(identified),
+            "imported": imported,
             "identified": public_items,
             "identified_total": len(identified),
+            "aliases_merged": aliases_merged,
+            "aliases_merged_count": len(aliases_merged),
             "truncated": len(identified) > len(public_items),
             "unidentified_count": len(result.get("unidentified") or []),
             "scanned_roots": result.get("scanned_roots", []),
@@ -1276,11 +1343,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             except Exception as e:
                 return json.dumps({"error": f"按 ID/链接获取详情失败: {e}"}, ensure_ascii=False)
         try:
-            results = nexus.search(
+            results = _source_call_with_retry(
+                nexus.search,
                 q, effective_slug, api_key,
                 cdp_port=cfg.chrome_cdp_port,
                 game_id=effective_gid,
                 tavily_key=cfg.tavily_api_key,
+                enabled=str(getattr(cfg, "agent_core_v2", "off")) == "on",
             )
         except nexus.NexusSearchUnavailable as e:
             return json.dumps({
@@ -1325,6 +1394,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "status": "ok",
             "searched": True,
             "source": "nexus",
+            "query": q,
             "game_slug": effective_slug,
             "tool_query_global_checked": nexus.is_tool_query(q),
             "results": [{
@@ -1404,6 +1474,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "status": "ok",
             "searched": True,
             "source": "thunderstore",
+            "query": q,
             "community": comm,
             "attempts": attempts,
             "query_attempts": [q] if q else [],
@@ -1417,12 +1488,19 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not appid:
             return json.dumps({"error": "无法解析当前游戏的 Steam AppID（可能不是 Steam 安装，或未选游戏）"}, ensure_ascii=False)
         try:
-            results = asyncio.run(sw.search(args.get("query", ""), appid, cfg.chrome_cdp_port))
+            results = _source_call_with_retry(
+                lambda: asyncio.run(sw.search(args.get("query", ""), appid, cfg.chrome_cdp_port)),
+                enabled=str(getattr(cfg, "agent_core_v2", "off")) == "on",
+            )
         except Exception as e:
             return json.dumps({"error": f"工坊搜索失败: {e}"}, ensure_ascii=False)
         if not results:
             return json.dumps({"appid": appid, "results": [], "note": "没搜到（或该游戏没有创意工坊内容）"}, ensure_ascii=False)
-        return json.dumps({"appid": appid, "results": results}, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "appid": appid,
+            "query": str(args.get("query") or "").strip(),
+            "results": results,
+        }, ensure_ascii=False, indent=2)
 
     elif name == "github_search":
         from .sources import github as gh
@@ -1430,15 +1508,18 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not q:
             return json.dumps({"error": "请提供搜索关键词"}, ensure_ascii=False)
         try:
-            results = gh.search(q, getattr(cfg, "game_name", "") or slug)
+            results = _source_call_with_retry(
+                gh.search, q, getattr(cfg, "game_name", "") or slug,
+                enabled=str(getattr(cfg, "agent_core_v2", "off")) == "on",
+            )
         except RuntimeError as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
         if not results:
             return json.dumps({"status": "search_empty",
-                               "note": f"GitHub 已先按当前游戏限定搜索，并自动用原关键词做全局回退；本次仍未搜到「{q}」相关仓库。这不等于仓库不存在。",
+                               "note": f"GitHub 本次未找到同时具有当前游戏与 Mod 证据的「{q}」仓库；普通功能搜索不会扩展到其他游戏。这不等于仓库不存在。",
                                "results": []}, ensure_ascii=False)
-        return json.dumps({"results": results,
-                           "note": "游戏限定为空时已自动回退全局搜索。结果可能混入非 mod 仓库(工具/教程),凭 summary/星数判断后再推荐;"
+        return json.dumps({"query": q, "results": results,
+                           "note": "仅明确指定的官方通用加载器可跨游戏查询；其他候选需具有当前游戏与功能证据。星数不能证明功能或兼容性。"
                                    "archived=true 表示作者已弃更。下载:download_from_url 直接吃仓库链接。"},
                           ensure_ascii=False, indent=1)
 
@@ -1451,13 +1532,16 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             return json.dumps({"note": f"GameBanana 没匹配到游戏「{game_name}」(未收录或站点不可达),"
                                        "换其他来源搜吧。", "results": []}, ensure_ascii=False)
         try:
-            results = gb.search(gid, q)
+            results = _source_call_with_retry(
+                gb.search, gid, q,
+                enabled=str(getattr(cfg, "agent_core_v2", "off")) == "on",
+            )
         except Exception as e:
             return json.dumps({"error": f"GameBanana 搜索失败: {e}"}, ensure_ascii=False)
         if not results:
             return json.dumps({"note": f"GameBanana 的「{game_name}」板块没搜到「{q}」。",
                                "results": [], "game_id": gid}, ensure_ascii=False)
-        return json.dumps({"game_id": gid, "results": results,
+        return json.dumps({"game_id": gid, "query": q, "results": results,
                            "note": "has_files=false 的条目没有可下载文件;下载:download_from_url 吃 url。"},
                           ensure_ascii=False, indent=1)
 
@@ -1480,6 +1564,16 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "subscription_skipped": True, "workshop_id": wid,
                 "installed_id": str(existing_workshop.id),
                 "name": existing_workshop.name,
+                "results": [{
+                    "mod_id": "ws_" + wid,
+                    "name": existing_workshop.name,
+                    "ok": True,
+                    "status": "already_installed",
+                    "version": existing_workshop.version or "",
+                    "files_installed": [],
+                    "dependencies": [],
+                    "warnings": [],
+                }],
                 "message": "该创意工坊项目已在当前游戏中，未重复订阅。",
             }, ensure_ascii=False)
         explicit_deps = None
@@ -1496,26 +1590,80 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not sub.get("ok"):
             return json.dumps({"error": f"订阅失败（status={sub.get('status')} {sub.get('error', '')}）。请确认 Chrome 已登录 Steam 且账号拥有该游戏。"}, ensure_ascii=False)
         key = "ws_" + wid
+        requested_name = str(args.get("name") or args.get("title") or "").strip()
+        # Preserve the title from the selected result. If it was not supplied,
+        # resolve Steam's public metadata as a best-effort fallback only.
+        if not requested_name:
+            try:
+                requested_name = str(sw.get_titles([wid]).get(wid) or "").strip()
+            except Exception:
+                requested_name = ""
+        display_name = requested_name or f"Workshop {wid}"
         progress.start([{
             "mod_id": key,
-            "name": f"工坊项目 {wid}",
+            "name": display_name,
             "source": "workshop",
         }])
         progress.set_status(key, "downloading")
-        dl = asyncio.run(sw.wait_for_download(root, appid, wid, timeout=180,
+        # Steam accepts a subscription immediately, but its client can take
+        # much longer to transfer large Workshop content.  Keep the common
+        # fast path responsive; afterwards report a pending subscription.
+        dl = asyncio.run(sw.wait_for_download(root, appid, wid, timeout=45,
                                               progress_callback=lambda f: progress.set_pct(key, int(f * 100))))
         progress.set_status(key, "done" if dl.get("downloaded") else "failed",
                             "" if dl.get("downloaded") else "Steam 未在限时内下完，请确认 Steam 客户端在运行")
         progress.finish()
+        if not dl.get("downloaded"):
+            # Steam accepted the subscription, but it has not installed the
+            # content yet. Never create a fake installed record in this state.
+            return json.dumps({
+                "status": "steam_download_pending",
+                "workshop_id": wid,
+                "name": display_name,
+                "subscribed": True,
+                "downloaded": False,
+                "path": dl.get("path", ""),
+                "files": 0,
+                "results": [{
+                    "mod_id": key,
+                    "name": display_name,
+                    "ok": False,
+                    "status": "steam_download_pending",
+                    "version": "",
+                    "files_installed": [],
+                    "dependencies": explicit_deps or [],
+                    "warnings": ["Steam subscription accepted; content directory is not ready"],
+                    "error": "Steam did not finish within 45 seconds; keep Steam running and rescan later.",
+                }],
+                "message": "Steam subscription accepted but download is still pending; no installed record was written.",
+                "user_action": "Keep Steam running. When its download finishes, click Scan Existing Mods.",
+            }, ensure_ascii=False)
+        try:
+            from .scanner import _workshop_local_meta
+            local_name, local_version = _workshop_local_meta(str(dl.get("path") or ""))
+            display_name = local_name or display_name
+        except Exception:
+            local_version = ""
         mod = db.InstalledMod(
-            id=key, name=f"Workshop {wid}", version="", snapshot_id="",
+            id=key, name=display_name, version=local_version, snapshot_id="",
             load_order=db.get_max_load_order(slug) + 1, file_id=int(wid) if wid.isdigit() else 0,
             files_installed=json.dumps(dl.get("files", [])),
             dependencies=json.dumps(explicit_deps or []),
             installed_by="steam_workshop", game_slug=slug)
         db.add_mod(mod)
-        return json.dumps({"workshop_id": wid, "subscribed": True, "downloaded": dl.get("downloaded", False),
+        return json.dumps({"status": "completed", "workshop_id": wid, "name": display_name,
+                           "subscribed": True, "downloaded": True,
                            "files": len(dl.get("files", [])), "path": dl.get("path", ""),
+                           "results": [{
+                               "mod_id": key,
+                               "name": display_name,
+                               "ok": True,
+                               "status": "installed",
+                               "version": local_version,
+                               "files_installed": dl.get("files", []),
+                               "dependencies": explicit_deps or [],
+                               "warnings": [],
+                           }],
                            "note": "工坊 mod 由 Steam 管理,存放在 steamapps\\workshop\\content\\ 下,不在游戏目录;"
                                    "撤销方式是退订(workshop_uninstall)。快照会记录订阅清单,回滚时自动同步订阅状态。"},
                           ensure_ascii=False)
@@ -1550,8 +1698,14 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             }, ensure_ascii=False)
         preflight = _refresh_local_inventory(cfg)
         source_name, source_key, name_hint = _url_source_identity(url)
+        expected_version = str(args.get("expected_version") or "").strip()
         existing = _installed_duplicate(slug, source_name, source_key, name_hint) if source_key else None
         if existing:
+            if expected_version and str(existing.version or "") != expected_version:
+                return json.dumps({"status": "plan_revalidation_required",
+                    "error": "installed_version_differs", "expected_version": expected_version,
+                    "installed_version": existing.version, "download_skipped": True,
+                    "message": "已装版本与所选版本不同，不能标记为已完成；请核验更新计划。"}, ensure_ascii=False)
             if not db.get_mod_by_source(slug, source_name, source_key):
                 db.upsert_mod_source_binding(
                     slug, str(existing.id), source_name, source_key, url,
@@ -1573,6 +1727,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 return json.dumps({"error": f"GitHub 链接解析失败: {gh_meta['error']}。"
                                    f"你也可以直接粘贴 releases 页面里 .zip 资产的下载地址。"}, ensure_ascii=False)
             url = gh_meta["url"]
+            if expected_version and str(gh_meta.get("version") or "") != expected_version:
+                return json.dumps({"status": "plan_revalidation_required",
+                    "error": "selected_version_changed", "expected_version": expected_version,
+                    "available_version": gh_meta.get("version"), "download_skipped": True,
+                    "message": "来源版本与所选版本不同，已停止下载，请重新核验计划。"}, ensure_ascii=False)
         key = "url"
         progress.start([{
             "mod_id": key,
@@ -1581,7 +1740,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         }])
         progress.set_status(key, "downloading")
         try:
-            r = sources.download_from_url(url, slug, progress_callback=lambda f: progress.set_pct(key, int(f * 100)))
+            version_args = ({"expected_version": expected_version}
+                            if source_name == "thunderstore" and expected_version else {})
+            r = sources.download_from_url(url, slug, progress_callback=lambda f: progress.set_pct(key, int(f * 100)), **version_args)
         except Exception as e:
             progress.set_status(key, "failed", str(e))
             progress.finish()
@@ -1691,8 +1852,20 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not nexus_gid:
             return json.dumps({
                 "error": "nexus_game_id_missing",
+                "status": "nexus_game_id_missing",
                 "nexus_slug": nexus_slug,
                 "note": "无法解析该 Nexus 来源的数字 game_id，已在打开下载页之前停止，避免重复开页。请稍后重试或检查 Nexus API Key。",
+                "stop_further_downloads": True,
+                "continue_other_items": False,
+            }, ensure_ascii=False)
+        if not api_key:
+            return json.dumps({
+                "error": "nexus_api_key_missing",
+                "status": "nexus_api_key_missing",
+                "nexus_slug": nexus_slug,
+                "message": "Nexus 下载需要用户在设置中填写自己的 Nexus API Key。本轮未打开下载页、未写入任何游戏文件。",
+                "stop_further_downloads": True,
+                "continue_other_items": False,
             }, ensure_ascii=False)
         # A local import initially has no Nexus ID. Resolve only the requested
         # item and use a strict name match to prevent installing a second copy.
@@ -1925,6 +2098,31 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "error": "game_mapping_missing",
                 "status": discovery.get("status", "not_detected"),
                 "reason": discovery.get("reason", "Nexus game page was not resolved"),
+            }, ensure_ascii=False)
+        if not nexus_gid:
+            return json.dumps({
+                "error": "nexus_game_id_missing",
+                "status": "nexus_game_id_missing",
+                "nexus_slug": nexus_slug,
+                "failed": [{
+                    "mod_id": item.get("mod_id"),
+                    "status": "nexus_game_id_missing",
+                } for item in mods],
+                "message": "无法解析当前游戏的 Nexus 数字 game_id。本批次未打开下载页、未开始下载。",
+                "stop_further_downloads": True,
+                "continue_other_items": False,
+            }, ensure_ascii=False)
+        if not api_key:
+            return json.dumps({
+                "error": "nexus_api_key_missing",
+                "status": "nexus_api_key_missing",
+                "failed": [{
+                    "mod_id": item.get("mod_id"),
+                    "status": "nexus_api_key_missing",
+                } for item in mods],
+                "message": "Nexus 下载需要用户在设置中填写自己的 Nexus API Key。本批次未打开下载页、未开始下载。",
+                "stop_further_downloads": True,
+                "continue_other_items": False,
             }, ensure_ascii=False)
         success, failed = [], []
         progress.start([{
@@ -2200,9 +2398,27 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "mod_id": mid,
                 "snapshot_id": batch_snap,
                 "local_path": local_path,
+                "require_verified_preflight": bool(
+                    args.get("require_verified_preflight")
+                ),
+                "_batch_preflight_approved": bool(
+                    args.get("_batch_preflight_approved")
+                ),
             }
             r = json.loads(execute("mod_install", call_args, cfg))
-            if "error" in r or r.get("status") == "installation_guidance_required":
+            if (
+                "error" in r
+                or r.get("install_blocked")
+                or r.get("status") in {
+                    "installation_guidance_required",
+                    "preinstall_confirmation_required",
+                    "compatibility_confirmation_required",
+                    "missing_dependencies",
+                    "dependency_blocked",
+                    "conflict_blocked",
+                    "download_incomplete",
+                }
+            ):
                 results.append({
                     "mod_id": mid,
                     "file_id": item.get("file_id"),
@@ -2314,35 +2530,16 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                         "更正为真实安装位置(可用游戏体检/重新检测),确认能找到游戏本体 exe 后再安装。",
             }, ensure_ascii=False)
 
-        source_preflight = download_install_preflight(local_path)
-        if source_preflight.get("install_blocked"):
-            return json.dumps({
-                **source_preflight,
-                "message": (
-                    "安装前来源详情、加载器或必要前置核验未通过；"
-                    "尚未创建快照，也未写入游戏目录。"
-                ),
-            }, ensure_ascii=False, indent=2)
-        if (
-            source_preflight.get("compatibility_confirmation_required")
-            and not args.get("compatibility_confirmed")
-        ):
-            return json.dumps({
-                **source_preflight,
-                "requires_confirmation": True,
-                "message": (
-                    "该 Mod 较长时间未更新，来源没有声明适配当前游戏构建；"
-                    "请先向用户展示依赖核验与兼容性风险，得到明确同意后再安装。"
-                ),
-            }, ensure_ascii=False, indent=2)
-
+        # 先识别同一物理 Mod，再进行只对“新增写盘”有意义的加载器与依赖核验。
+        # 否则旧版/手工导入的本地别名虽然已经指向同一文件，仍可能因为没有
+        # 单独登记 BepInEx 等基础环境而被误报为 dependency_blocked。
         if str(mid).isdigit() and args.get("require_verified_preflight"):
-            nexus_preflight = nexus_install_preflight(mid)
-            if nexus_preflight.get("install_blocked"):
-                return json.dumps(nexus_preflight, ensure_ascii=False, indent=2)
+            duplicate_hint = (
+                download_provenance.get("name")
+                or os.path.splitext(os.path.basename(local_path))[0]
+            )
             installed = find_installed_duplicate(
-                slug, "nexus", str(mid),
-                target_name=str(nexus_preflight.get("name") or ""),
+                slug, "nexus", str(mid), target_name=str(duplicate_hint or ""),
             )
             if installed:
                 cache_cleanup = downloader.cleanup_installed_archive(local_path)
@@ -2360,6 +2557,34 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                         "未创建快照，也未写入第二份文件。"
                     ),
                 }, ensure_ascii=False)
+
+        source_preflight = download_install_preflight(local_path)
+        if source_preflight.get("install_blocked"):
+            return json.dumps({
+                **source_preflight,
+                "message": (
+                    "安装前来源详情、加载器或必要前置核验未通过；"
+                    "尚未创建快照，也未写入游戏目录。"
+                ),
+            }, ensure_ascii=False, indent=2)
+        if (
+            source_preflight.get("compatibility_confirmation_required")
+            and not args.get("compatibility_confirmed")
+            and not args.get("_batch_preflight_approved")
+        ):
+            return json.dumps({
+                **source_preflight,
+                "requires_confirmation": True,
+                "message": (
+                    "该 Mod 较长时间未更新，来源没有声明适配当前游戏构建；"
+                    "请先向用户展示依赖核验与兼容性风险，得到明确同意后再安装。"
+                ),
+            }, ensure_ascii=False, indent=2)
+
+        if str(mid).isdigit() and args.get("require_verified_preflight"):
+            nexus_preflight = nexus_install_preflight(mid)
+            if nexus_preflight.get("install_blocked"):
+                return json.dumps(nexus_preflight, ensure_ascii=False, indent=2)
 
         try:
             dependency_preflight = stardew.archive_dependency_preflight(
@@ -2748,7 +2973,15 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 ensure_ascii=False,
             ).encode("utf-8")
         ).hexdigest()
-        if require_preflight and not args.get("preflight_confirmed"):
+        # This private flag is supplied only by mod_install_batch after the
+        # Agent received a clear confirmation for the whole visible plan.
+        # It is deliberately absent from the public tool schema.
+        batch_preflight_approved = bool(args.get("_batch_preflight_approved"))
+        if (
+            require_preflight
+            and not args.get("preflight_confirmed")
+            and not batch_preflight_approved
+        ):
             return json.dumps({
                 "status": "preinstall_confirmation_required",
                 "requires_confirmation": True,
@@ -2768,10 +3001,14 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     "只有用户随后明确确认，才可继续写盘。"
                 ),
             }, ensure_ascii=False, indent=2)
-        if require_preflight and not confirmation.consume(
+        if (
+            require_preflight
+            and not batch_preflight_approved
+            and not confirmation.consume(
             args.get("preflight_confirmation_token", ""),
             "mod_install_preflight",
             preflight_target,
+            )
         ):
             return json.dumps({
                 "error": "preinstall_confirmation_invalid",
@@ -2913,16 +3150,44 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     res = asyncio.run(sw.unsubscribe(wid, appid, cfg.chrome_cdp_port))
                 except Exception as e:
                     return json.dumps({"error": f"取消订阅失败: {e}"}, ensure_ascii=False)
-            db.remove_mod(mid, slug)
-            return json.dumps({"workshop_id": wid, "unsubscribed": res.get("ok", False),
-                               "note": "已从 Steam 取消订阅" if res.get("ok") else "已移除记录（取消订阅可能未生效，请确认已登录 Steam）"}, ensure_ascii=False)
+            if res.get("ok"):
+                db.remove_mod(mid, slug)
+            return json.dumps({"status": "completed" if res.get("ok") else "blocked",
+                               "workshop_id": wid, "unsubscribed": bool(res.get("ok")),
+                               "record_retained": not bool(res.get("ok")),
+                               "note": "已从 Steam 取消订阅" if res.get("ok") else "未能确认 Steam 退订成功，管理记录已保留；请检查登录状态后重新预览。"}, ensure_ascii=False)
         files = json.loads(mod.files_installed) if isinstance(mod.files_installed, str) else (mod.files_installed or [])
-        snap_id = snapshot.snapshot_create(root, slug, trigger_mod_name=f"{mod.name} 卸载前")
+        # A batch operation creates one explicit snapshot up front and passes
+        # its ID here.  Validate it belongs to this exact game root; otherwise
+        # fall back to the normal per-Mod snapshot rather than risking an
+        # unprotected delete.
+        snap_id = str(args.get("snapshot_id") or "")
+        if snap_id and not snapshot.snapshot_belongs_to_root(snap_id, root):
+            return json.dumps({"error": "批量卸载快照不属于当前游戏目录，已拒绝删除"}, ensure_ascii=False)
+        if not snap_id:
+            snap_id = snapshot.snapshot_create(root, slug, trigger_mod_name=f"{mod.name} 卸载前")
         shared = db.get_shared_files(mid, files, slug)
-        result = installer.uninstall_mod(mid, root, files, game_slug=slug, shared_files=shared)
-        external_cleanup = user_config.uninstall_mod_configs(slug, str(mid))
-        db.remove_mod(mid, slug)
-        return json.dumps({"removed": len(result["removed"]),
+        result = installer.uninstall_mod(mid, root, files, game_slug=slug, shared_files=shared,
+                                         retain_backups=True)
+        incomplete = bool(result.get("errors") or result.get("blocked_unsafe")
+                          or result.get("pending") or result.get("status") == "cancelled")
+        cancelled = task_control.is_cancelled() or result.get("status") == "cancelled"
+        external_cleanup = {"complete": False, "skipped": True}
+        if not incomplete and not cancelled:
+            try:
+                external_cleanup = user_config.uninstall_mod_configs(slug, str(mid))
+            except Exception as exc:
+                external_cleanup = {"complete": False, "failed": [{"error": str(exc)}]}
+        complete = not incomplete and not cancelled and external_cleanup.get("complete") is True
+        if complete:
+            db.remove_mod(mid, slug)
+            installer.cleanup_uninstall_backups(result)
+        return json.dumps({"status": "completed" if complete else "cancelled" if cancelled else "partial",
+                           "record_retained": not complete,
+                           "message": ("卸载完成，已核验文件移除和原文件恢复。" if complete else
+                                       "卸载未全部完成；管理记录和恢复备份已保留，请检查未完成项后重新预览。"),
+                           "retryable": False,
+                           "removed": len(result["removed"]),
                            "kept_shared": len(result.get("kept_shared", [])),
                            "snapshot_id": snap_id,
                            "dependents_warned": [d["name"] for d in deps],
@@ -2993,6 +3258,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if (
             _snap is not None and _snap.game_slug
             and game_storage_id(cfg, _snap.game_slug) != storage_slug
+            and not snapshot.snapshot_belongs_to_root(args["snapshot_id"], root)
         ):
             return json.dumps({
                 "error": f"快照 {args['snapshot_id']} 不属于当前安装目录。"
@@ -3080,6 +3346,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if (
             _snap.game_slug
             and game_storage_id(cfg, _snap.game_slug) != storage_slug
+            and not snapshot.snapshot_belongs_to_root(args["snapshot_id"], root)
         ):
             return json.dumps({
                 "error": f"快照 {args['snapshot_id']} 不属于当前安装目录。"
@@ -3932,6 +4199,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "next_step": "Check the ma-xxxxxx code, selected game, and network connection; no local changes were made.",
             }, indent=2, ensure_ascii=False)
 
+    elif name == "official_share_network_diagnostics":
+        return json.dumps(
+            official_shares.connectivity_diagnostics(cfg),
+            indent=2,
+            ensure_ascii=False,
+        )
+
     elif name == "mod_dependency_set":
         mod = db.get_mod(args["mod_id"], slug)
         if not mod:
@@ -3963,6 +4237,25 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         mod = db.get_mod(args["mod_id"], slug)
         if not mod:
             return json.dumps({"error": f"未找到 Mod: {args['mod_id']}"}, ensure_ascii=False)
+        if str(mod.installed_by or "") == "steam_workshop" or str(mod.id).startswith("ws_"):
+            from .sources import steam_workshop as sw
+            appid = sw.resolve_appid(root)
+            return json.dumps({
+                "blocked": True,
+                "requires_external_manager": True,
+                "action": "steam_workshop_local_toggle",
+                "target": _toggle_mod_info(mod),
+                "workshop_id": str(mod.id).removeprefix("ws_"),
+                "steam_appid": appid,
+                "subscription_changed": False,
+                "files_changed": False,
+                "note": (
+                    "该项目由 Steam 创意工坊托管。Steam 客户端确实提供本地启用复选框，"
+                    "但当前公开接口没有为独立管理器提供可靠的通用写入方式；ModAgent 已停止普通文件禁用，"
+                    "不会把‘退订/删除’冒充‘临时禁用’，也不会改写 Steam 内部配置。"
+                ),
+                "user_action": "请在 Steam → 该游戏属性 → 创意工坊中取消该项目的启用勾选。",
+            }, indent=2, ensure_ascii=False)
         dependents = db.get_dependent_chain(mod.id, slug)
         full_plan = dependents + [mod]
         plan = [item for item in full_plan if not installer.is_mod_disabled(_mod_files(item))]
@@ -4019,6 +4312,21 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         mod = db.get_mod(args["mod_id"], slug)
         if not mod:
             return json.dumps({"error": f"未找到 Mod: {args['mod_id']}"}, ensure_ascii=False)
+        if str(mod.installed_by or "") == "steam_workshop" or str(mod.id).startswith("ws_"):
+            from .sources import steam_workshop as sw
+            appid = sw.resolve_appid(root)
+            return json.dumps({
+                "blocked": True,
+                "requires_external_manager": True,
+                "action": "steam_workshop_local_toggle",
+                "target": _toggle_mod_info(mod),
+                "workshop_id": str(mod.id).removeprefix("ws_"),
+                "steam_appid": appid,
+                "subscription_changed": False,
+                "files_changed": False,
+                "note": "该项目由 Steam 创意工坊托管；ModAgent 不会通过移动工坊文件来伪造启用状态。",
+                "user_action": "请在 Steam → 该游戏属性 → 创意工坊中勾选启用该项目。",
+            }, indent=2, ensure_ascii=False)
         dependencies, missing = db.get_dependency_chain(mod.id, slug)
         loaders = set(active_loaders())
         missing = [
@@ -4146,6 +4454,8 @@ def _recommend_nexus(
 ) -> dict:
     """Search Nexus, then verify usable results through the detail endpoint."""
     import concurrent.futures as cf
+    from . import task_control
+    cache = task_control.read_cache()
 
     import inspect
     search_parameters = inspect.signature(nexus.search).parameters
@@ -4190,7 +4500,10 @@ def _recommend_nexus(
 
     def verify(row):
         mod_id = int(row["mod_id"])
+        key = ('nexus_detail', slug, mod_id)
         try:
+            if cache is not None and key in cache:
+                return mod_id, cache[key], ''
             detail_parameters = inspect.signature(nexus.get_detail).parameters
             if "cdp_port" in detail_parameters or any(
                 parameter.kind == inspect.Parameter.VAR_KEYWORD
@@ -4201,6 +4514,8 @@ def _recommend_nexus(
                 )
             else:
                 detail = nexus.get_detail(mod_id, slug, api_key)
+            if cache is not None and detail:
+                cache[key] = detail
             return mod_id, detail, ""
         except Exception as exc:
             return mod_id, {}, (str(exc) or type(exc).__name__)[:160]
@@ -4210,13 +4525,18 @@ def _recommend_nexus(
             max_workers=min(8, len(recs)),
             thread_name_prefix="recommend-detail",
         )
-        futures = [pool.submit(verify, row) for row in recs]
-        for future in cf.as_completed(futures):
+        futures = [pool.submit(task_control.scoped_worker(verify, row)) for row in recs]
+        for index, future in enumerate(cf.as_completed(futures), 1):
+            task_control.raise_if_cancelled()
             mod_id, detail, error = future.result()
             if detail:
                 verified_by_id[mod_id] = detail
             elif error:
                 errors[mod_id] = error
+            task_control.report_progress(stage='source_detail', tool='mod_recommend',
+                label=f'Nexus 详情核验已返回 {index}/{len(recs)} 项',
+                label_en=f'Nexus detail responses: {index}/{len(recs)}',
+                completed=index, total=len(recs))
         pool.shutdown(wait=True)
 
     enriched = []
@@ -4282,36 +4602,54 @@ def _recommend(query: str, cfg: Config) -> dict:
     effective_slug = src.get("nexus") or ""
 
     import concurrent.futures as cf
+    import time
+    from . import task_control
+    started = time.monotonic()
+    retry_enabled = str(getattr(cfg, "agent_core_v2", "off")) == "on"
     tasks = {}
     ex = cf.ThreadPoolExecutor(max_workers=5)
+    def submit(function, *args, **kwargs):
+        return ex.submit(task_control.scoped_worker(function, *args, **kwargs))
     if effective_slug:
-        tasks["nexus"] = ex.submit(
+        tasks["nexus"] = submit(
+            _source_call_with_retry,
             _recommend_nexus, query, effective_slug, api_key, per_source_limit,
-            cfg.chrome_cdp_port,
+            cfg.chrome_cdp_port, enabled=retry_enabled,
         )
     if src.get("workshop"):
         from .sources import steam_workshop as sw
-        tasks["workshop"] = ex.submit(
+        tasks["workshop"] = submit(
+            _source_call_with_retry,
             lambda: asyncio.run(
                 sw.search(query, src["workshop"], cfg.chrome_cdp_port)
-            )[:per_source_limit]
+            )[:per_source_limit],
+            enabled=retry_enabled,
         )
     if src.get("thunderstore"):
-        tasks["thunderstore"] = ex.submit(
-            _recommend_thunderstore, src["thunderstore"], query, per_source_limit
+        tasks["thunderstore"] = submit(
+            _source_call_with_retry,
+            _recommend_thunderstore, src["thunderstore"], query, per_source_limit,
+            enabled=retry_enabled,
         )
     if src.get("gamebanana"):
         from .sources import gamebanana as gb
-        tasks["gamebanana"] = ex.submit(
-            gb.search, src["gamebanana"], query, per_source_limit
+        tasks["gamebanana"] = submit(
+            _source_call_with_retry,
+            gb.search, src["gamebanana"], query, per_source_limit,
+            enabled=retry_enabled,
         )
     from .sources import github as gh
-    tasks["github"] = ex.submit(
-        gh.search, query, cfg.game_name or slug or "", per_source_limit
+    tasks["github"] = submit(
+        _source_call_with_retry,
+        gh.search, query, cfg.game_name or slug or "", per_source_limit,
+        enabled=retry_enabled,
     )
 
     source_status = src.get("source_status", {})
     out = {"recommendations": [], "install_plan": [],
+           # Keep the exact query used by every source.  The structured
+           # recommendation layer uses it to remove unrelated popular items.
+           "query": str(query or "").strip(),
            "sources_attempted": list(tasks),
            "sources_consulted": [], "sources_empty": [],
            "sources_failed": {}, "sources_skipped": {},
@@ -4327,8 +4665,21 @@ def _recommend(query: str, cfg: Config) -> dict:
     # requests retain their own finite network timeouts, while completed
     # sources are preserved independently.
     future_names = {future: name for name, future in tasks.items()}
+    waiting = set(tasks)
+    out['source_elapsed_seconds'] = {}
+    def notify_sources():
+        pending = ', '.join(sorted(waiting)) or '—'
+        task_control.report_progress(stage='source_search', tool='mod_recommend',
+            label=f'来源已返回 {len(tasks)-len(waiting)}/{len(tasks)}；等待：{pending}',
+            label_en=f'Sources returned {len(tasks)-len(waiting)}/{len(tasks)}; waiting: {pending}',
+            completed=len(tasks)-len(waiting), total=len(tasks))
+    notify_sources()
     for fut in cf.as_completed(future_names):
+        task_control.raise_if_cancelled()
         name = future_names[fut]
+        waiting.discard(name)
+        out['source_elapsed_seconds'][name] = round(time.monotonic()-started, 2)
+        notify_sources()
         try:
             r = fut.result()
         except Exception as e:
@@ -4346,6 +4697,7 @@ def _recommend(query: str, cfg: Config) -> dict:
             if not r:
                 out["sources_empty"].append(name)
     ex.shutdown(wait=True)
+    out['elapsed_seconds'] = round(time.monotonic()-started, 2)
 
     source_order = (
         "nexus", "workshop", "thunderstore", "gamebanana", "github",

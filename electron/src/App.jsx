@@ -12,6 +12,7 @@ import Toast from './components/Toast'
 import DownloadPanel from './components/DownloadPanel'
 import { emitFeedback } from './feedback/feedbackBus'
 import { applyEditionDefaultBackground } from '@edition'
+import { tr } from './i18n'
 
 const exposedApiBase = window.modagent?.getApiBase?.()
 const API = typeof exposedApiBase === 'string' ? exposedApiBase : 'http://127.0.0.1:18890'
@@ -23,6 +24,7 @@ export default function App() {
   const [status, setStatus] = useState({ online: false, game: '', mods: null, snaps: null, game_root: '', game_slug: '', game_instance_id: '', bg: null })
   const [games, setGames] = useState([])
   const [configured, setConfigured] = useState(null)
+  const [language, setLanguage] = useState('zh-CN')
   const [toasts, setToasts] = useState([])
   const nextToastId = useRef(0)
   const gameChangeSeq = useRef(0)
@@ -55,6 +57,7 @@ export default function App() {
             game_instance_id: s.game_instance_id || '',
             bg: s.bg || null,
           }))
+          if (s.language === 'en' || s.language === 'zh-CN') setLanguage(s.language)
           if (s.bg) document.body.classList.add('has-bg')
           setConfigured(Boolean(s.llm_set))
           if (!window.__gamesDetected) {
@@ -136,6 +139,10 @@ export default function App() {
       delete document.body.dataset.maPage
     }
   }, [page])
+
+  useEffect(() => {
+    document.documentElement.lang = language
+  }, [language])
 
   const onGameChange = async (g) => {
     const changeId = ++gameChangeSeq.current
@@ -232,17 +239,17 @@ export default function App() {
       configured === false ? 'is-setup' : 'is-workspace'
     }`}>
       {configured === false ? (
-        <SetupPage onDone={() => setConfigured(true)} toast={toast} api={API} />
+        <SetupPage onDone={() => setConfigured(true)} toast={toast} api={API} language={language} onLanguageChange={setLanguage} />
       ) : (
         <>
-          <Sidebar page={page} onNav={setPage} status={status} reviewerAllowed={reviewerAccess.allowed} />
+          <Sidebar page={page} onNav={setPage} status={status} reviewerAllowed={reviewerAccess.allowed} language={language} />
           <main className="app-page-stage flex-1 overflow-hidden bg-surface-900">
             {status.online ? (
               <>
-                <div aria-hidden={page !== 'chat'} className={`app-page-layer ${page === 'chat' ? 'is-active' : ''}`}><ChatPage status={status} games={games} onGameChange={onGameChange} onGameImport={onGameImport} onGamesRefresh={refreshGames} toast={toast} api={API} onRefresh={doRefresh} /></div>
-                <div aria-hidden={page !== 'mods'} className={`app-page-layer ${page === 'mods' ? 'is-active' : ''}`}><ModsPage toast={toast} api={API} onRefresh={doRefresh} refreshKey={refreshKey} status={status} /></div>
-                <div aria-hidden={page !== 'snaps'} className={`app-page-layer ${page === 'snaps' ? 'is-active' : ''}`}><SnapshotsPage toast={toast} api={API} status={status} onRefresh={doRefresh} /></div>
-                <div aria-hidden={page !== 'settings'} className={`app-page-layer ${page === 'settings' ? 'is-active' : ''}`}><SettingsPage toast={toast} api={API} onStartSharePlan={(request) => {
+                <div aria-hidden={page !== 'chat'} className={`app-page-layer ${page === 'chat' ? 'is-active' : ''}`}><ChatPage status={status} games={games} onGameChange={onGameChange} onGameImport={onGameImport} onGamesRefresh={refreshGames} toast={toast} api={API} onRefresh={doRefresh} language={language} /></div>
+                <div aria-hidden={page !== 'mods'} className={`app-page-layer ${page === 'mods' ? 'is-active' : ''}`}><ModsPage toast={toast} api={API} onRefresh={doRefresh} refreshKey={refreshKey} status={status} language={language} /></div>
+                <div aria-hidden={page !== 'snaps'} className={`app-page-layer ${page === 'snaps' ? 'is-active' : ''}`}><SnapshotsPage toast={toast} api={API} status={status} onRefresh={doRefresh} language={language} /></div>
+                <div aria-hidden={page !== 'settings'} className={`app-page-layer ${page === 'settings' ? 'is-active' : ''}`}><SettingsPage toast={toast} api={API} language={language} onLanguageChange={setLanguage} onStartSharePlan={(request) => {
                   setPage('chat')
                   window.dispatchEvent(new CustomEvent('modagent:share-plan', {
                     detail: typeof request === 'string' ? { share: request } : request,
@@ -251,7 +258,7 @@ export default function App() {
                   setPage('pshare')
                   setShowPShareActivation(true)
                 }} /></div>
-                <div aria-hidden={page !== 'pshare'} className={`app-page-layer ${page === 'pshare' ? 'is-active' : ''}`}><PSharePage toast={toast} /></div>
+                <div aria-hidden={page !== 'pshare'} className={`app-page-layer ${page === 'pshare' ? 'is-active' : ''}`}><PSharePage toast={toast} language={language} /></div>
                 {reviewerAccess.allowed && <div aria-hidden={page !== 'reviewer'} className={`app-page-layer ${page === 'reviewer' ? 'is-active' : ''}`}><ReviewerConsole toast={toast} /></div>}
                 <div key={page} className={`app-page-atmosphere atmosphere-${page}`} aria-hidden="true" />
               </>
@@ -260,8 +267,8 @@ export default function App() {
                 <div className="flex flex-col items-center gap-4 text-center">
                   <div className="w-12 h-12 rounded-full border-2 border-cyber-cyan/20 border-t-cyber-cyan animate-spin" />
                   <div>
-                    <div className="text-sm text-white">ModAgent 正在启动</div>
-                    <div className="text-xs text-surface-500 mt-1">正在连接本地服务并读取游戏数据…</div>
+                    <div className="text-sm text-white">{tr(language, 'startingApp')}</div>
+                    <div className="text-xs text-surface-500 mt-1">{tr(language, 'startingDetail')}</div>
                   </div>
                 </div>
               </div>

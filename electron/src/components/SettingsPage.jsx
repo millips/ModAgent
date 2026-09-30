@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react'
+import { saveCredentialSettings, credentialErrorMessage } from '../credentialSettings.mjs'
 import {
   BookOpen, Copy, Cpu, FileDown, FileText, FolderCog, FolderOpen,
   Github, Globe, HardDrive, Image, Info, Key, PanelLeft, RefreshCw,
@@ -12,6 +13,7 @@ import {
   readLayoutPreference,
   saveLayoutPreference,
 } from '../theme/layoutPreference'
+import { LANGUAGES, tr } from '../i18n'
 
 const COMMON_LEGAL_DOCUMENTS = [
   { file: 'LICENSE.md', label: '软件许可证' },
@@ -39,7 +41,7 @@ const MODEL_OPTIONS = [
   ['custom', '自定义模型名'],
 ]
 
-export default function SettingsPage({ toast, api, onStartSharePlan, onPShareActivated }) {
+export default function SettingsPage({ toast, api, language = 'zh-CN', onLanguageChange, onStartSharePlan, onPShareActivated }) {
   const pLicense = usePLicenseStatus()
   const pShareProfile = usePShareProfile()
   const identity = window.modagent?.getAppIdentity?.() || {
@@ -48,6 +50,8 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
     channel: 'stable',
   }
   const [cfg, setCfg] = useState({})
+  const [credentialStatus, setCredentialStatus] = useState(null)
+  const [savingCredentials, setSavingCredentials] = useState(false)
   const [nexusKey, setNexusKey] = useState('')
   const [llmKey, setLlmKey] = useState('')
   const [tavilyKey, setTavilyKey] = useState('')
@@ -58,6 +62,7 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
   const [customModel, setCustomModel] = useState('')
   const [endpoint, setEndpoint] = useState('https://api.deepseek.com/v1')
   const [recommendationLimit, setRecommendationLimit] = useState(10)
+  const [agentCoreMode, setAgentCoreMode] = useState('off')
   const [layoutMode, setLayoutMode] = useState(readLayoutPreference)
   const [bg, setBg] = useState(null)
   const [bgUrl, setBgUrl] = useState(null)
@@ -82,14 +87,17 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
   }
 
   useEffect(() => {
+    window.modagent?.getCredentialStatus?.().then(setCredentialStatus).catch(() => {})
     fetch(api + '/status').then(r => r.json()).then(s => {
-      setCfg(s)
+    setCfg(s)
+      if (s.language === 'en' || s.language === 'zh-CN') onLanguageChange?.(s.language)
       const loadedModel = s.llm_model || 'deepseek-v4-pro'
       const knownModel = MODEL_OPTIONS.some(([value]) => value === loadedModel)
       setModel(knownModel ? loadedModel : 'custom')
       setCustomModel(knownModel ? '' : loadedModel)
       setEndpoint(s.llm_endpoint || 'https://api.deepseek.com/v1')
       setRecommendationLimit(Math.max(2, Math.min(Number(s.recommendation_limit) || 10, 20)))
+      setAgentCoreMode(['off', 'shadow', 'on'].includes(s.agent_core_v2) ? s.agent_core_v2 : 'off')
       setBg(s.bg || null)
       if (s.bg) window.modagent.getBgDataUrl(s.bg).then(setBgUrl).catch(() => {})
     }).catch(() => {})
@@ -242,8 +250,30 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
       const result = await callShareTool('official_share_catalog', { query: officialQuery.trim() })
       if (result.error) throw new Error(result.error)
       setOfficialCatalog(result)
-      if (!result.fetched) toast('官方库暂时无法联网读取，已使用本地空白索引。', 'error')
+      if (result.source === 'local_cache') {
+        const age = Number(result.cache_age_seconds || 0)
+        const ageText = age >= 3600 ? `${Math.floor(age / 3600)} 小时前` : '刚才'
+        toast(`官方库网络暂不可用，已使用 ${ageText} 保存的本地验证缓存。`, 'warn')
+      } else if (!result.available) {
+        toast('官方库暂时无法读取，且本机没有可用缓存；未修改任何本地安装。', 'error')
+      }
     } catch (error) { toast(error?.message || '读取官方分享库失败', 'error') }
+    finally { setOfficialBusy(false) }
+  }
+
+  const diagnoseOfficialCatalogNetwork = async () => {
+    setOfficialBusy(true)
+    try {
+      const result = await callShareTool('official_share_network_diagnostics')
+      const working = (result.checks || []).filter(item => item.ok).map(item => item.endpoint)
+      if (working.length) {
+        toast(`官方库连接可用：${working.join(' / ')}。`, 'success')
+      } else if (result.cache_available) {
+        toast('官方库网络暂不可达，但本机仍有可用验证缓存。', 'warn')
+      } else {
+        toast('Raw、GitHub API 和 GitHub 网页文件入口均不可达，且本机没有缓存。', 'error')
+      }
+    } catch (error) { toast(error?.message || '官方库网络诊断失败', 'error') }
     finally { setOfficialBusy(false) }
   }
 
@@ -268,6 +298,7 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
   }
 
   const save = async () => {
+    if (savingCredentials) return
     const effectiveModel = model === 'custom' ? customModel.trim() : model
     if (!effectiveModel) {
       toast('请填写模型名', 'error')
@@ -281,47 +312,74 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
       llm_model: effectiveModel,
       llm_endpoint: endpoint.trim(),
       recommendation_limit: Math.max(2, Math.min(Number(recommendationLimit) || 10, 20)),
+      language,
+      agent_core_v2: agentCoreMode,
     }
     const secrets = {}
     if (nexusKey && nexusKey !== '********') { body.api_key = nexusKey; secrets.nexus_api_key = nexusKey }
     if (llmKey && llmKey !== '********') { body.llm_api_key = llmKey; secrets.llm_api_key = llmKey }
     if (tavilyKey && tavilyKey !== '********') { body.tavily_api_key = tavilyKey; secrets.tavily_api_key = tavilyKey }
-    if (Object.keys(secrets).length && window.modagent?.saveSecrets) {
-      await window.modagent.saveSecrets(secrets)
-    }
-    await fetch(api + '/config', {
+    setSavingCredentials(true)
+    try {
+    const saved = await saveCredentialSettings(body, window.modagent?.saveSecrets)
+    if (saved.status) setCredentialStatus(saved.status)
+    const response = await fetch(api + '/config', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(saved.body),
     })
+    if (!response.ok) throw new Error('config_save_failed')
     await fetch(api + '/chat/reset', { method: 'POST' })
     setCfg(prev => ({
       ...prev,
-      api_key_set: prev.api_key_set || Boolean(nexusKey),
-      tavily_set: prev.tavily_set || Boolean(tavilyKey),
-      llm_set: prev.llm_set || Boolean(llmKey),
+      api_key_set: saved.status?.api_key_set ?? (prev.api_key_set || Boolean(nexusKey)),
+      tavily_set: saved.status?.tavily_set ?? (prev.tavily_set || Boolean(tavilyKey)),
+      llm_set: saved.status?.llm_set ?? (prev.llm_set || Boolean(llmKey)),
     }))
     setNexusKey('')
     setTavilyKey('')
     setLlmKey('')
     setEditingKeys({ nexus: false, tavily: false, llm: false })
     emitFeedback('success', { source: 'settings' })
-    toast('设置已保存')
+    toast(tr(language, 'languageSaved'))
+    } catch (error) {
+      toast(credentialErrorMessage(error, language), 'error')
+    } finally {
+      setSavingCredentials(false)
+    }
   }
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       <div className="flex items-center px-4 py-3 border-b border-surface-600">
         <h2 className="text-base font-semibold flex items-center gap-2">
-          <Cpu size={16} className="text-cyber-cyan" /> 设置
+          <Cpu size={16} className="text-cyber-cyan" /> {tr(language, 'settingsTitle')}
         </h2>
       </div>
 
       <div className="flex-1 overflow-y-auto p-6 max-w-lg space-y-5">
+        <div className="card-cyber space-y-2">
+          <div className="flex items-center gap-2">
+            <Globe size={14} className="text-cyber-cyan" />
+            <span className="text-sm font-medium">{tr(language, 'language')}</span>
+          </div>
+          <select className="input-cyber" value={language} onChange={e => onLanguageChange?.(e.target.value)}>
+            {LANGUAGES.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}
+          </select>
+          <p className="text-[11px] leading-relaxed text-surface-500">{tr(language, 'languageHelp')}</p>
+        </div>
         <div className="card-cyber space-y-3">
           <div className="flex items-center gap-2 mb-1">
             <Key size={14} className="text-cyber-yellow" />
-            <span className="text-sm font-medium">API 密钥</span>
+            <span className="text-sm font-medium">{tr(language, 'apiKeys')}</span>
           </div>
+          {credentialStatus && <p className="text-xs text-surface-500">
+            {language === 'en'
+              ? (credentialStatus.origin === 'shared' ? 'Using shared encrypted credentials. ' : 'Using this profile’s credentials. ')
+              : (credentialStatus.origin === 'shared' ? '正在复用本机加密凭据。' : '正在使用当前配置的凭据。')}
+            {credentialStatus.localOnly
+              ? (language === 'en' ? 'Changes in this test build stay local.' : '测试版修改仅保存在当前测试配置，不影响正式版。')
+              : (language === 'en' ? 'Saved credentials are reusable by supported versions on this Windows account.' : '保存后，同一 Windows 用户下支持此功能的版本可复用。')}
+          </p>}
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-xs text-surface-500">Nexus Mods API Key</label>
@@ -378,7 +436,7 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
         <div className="card-cyber space-y-3">
           <div className="flex items-center gap-2 mb-1">
             <Cpu size={14} className="text-cyber-cyan" />
-            <span className="text-sm font-medium">LLM 设置</span>
+            <span className="text-sm font-medium">{tr(language, 'llmSettings')}</span>
           </div>
           <div>
             <label className="text-xs text-surface-500 block mb-1">服务商快捷预设</label>
@@ -402,6 +460,21 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
                 </button>
               ))}
             </div>
+          </div>
+          <div>
+            <label className="text-xs text-surface-500 block mb-1">
+              {language === 'en' ? 'Agent Core' : 'Agent 新内核（测试）'}
+            </label>
+            <select className="input-cyber" value={agentCoreMode} onChange={e => setAgentCoreMode(e.target.value)}>
+              <option value="off">{language === 'en' ? 'Legacy · compatibility' : '旧版 · 兼容模式'}</option>
+              <option value="shadow">{language === 'en' ? 'Observe · no behavior change' : '观察模式 · 不改变现有行为'}</option>
+              <option value="on">{language === 'en' ? 'Agent Core v2 · enable' : 'Agent Core v2 · 启用新版'}</option>
+            </select>
+            <p className="mt-1 text-[11px] leading-relaxed text-surface-500">
+              {language === 'en'
+                ? 'Observe records task routing without changing tool behavior. v2 enforces task-specific tool permissions and can be switched back at any time.'
+                : '观察模式只记录任务判断，不改变工具行为；启用新版后会按任务限制工具权限，出现问题可随时切回旧版。'}
+            </p>
           </div>
           <div>
             <label className="text-xs text-surface-500 block mb-1">模型</label>
@@ -593,6 +666,9 @@ export default function SettingsPage({ toast, api, onStartSharePlan, onPShareAct
             />
             <button type="button" disabled={officialBusy} onClick={loadOfficialCatalog} className="btn-ghost shrink-0 text-xs">
               浏览
+            </button>
+            <button type="button" disabled={officialBusy} onClick={diagnoseOfficialCatalogNetwork} className="btn-ghost shrink-0 text-xs" title="检查 GitHub Raw、Contents API、网页文件入口和本地缓存">
+              网络诊断
             </button>
           </div>
           {officialCatalog && (

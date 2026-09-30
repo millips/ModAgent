@@ -106,6 +106,12 @@ zipE = os.path.join(
     downloader.DOWNLOADS_DIR, "palworld", "ts_Zichen_ModsUp_1.0.5.zip",
 )
 os.makedirs(os.path.join(G, "BepInEx", "plugins"), exist_ok=True)
+# A plugins folder alone may be an abandoned shell.  The production runtime
+# detector intentionally requires a real framework marker before it lets a
+# BepInEx package pass dependency preflight.
+os.makedirs(os.path.join(G, "BepInEx", "core"), exist_ok=True)
+with open(os.path.join(G, "BepInEx", "core", "BepInEx.Core.dll"), "wb") as handle:
+    handle.write(b"runtime")
 source_url = "https://thunderstore.io/c/repo/p/Zichen/ModsUp/"
 real_download_from_url = sources.download_from_url
 def fake_download_from_url(_url, _slug, progress_callback=None):

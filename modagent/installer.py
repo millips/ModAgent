@@ -8,6 +8,7 @@ import subprocess
 import hashlib
 import uuid
 from typing import Optional
+from . import task_control
 
 
 class UnsupportedInstallLayout(RuntimeError):
@@ -30,7 +31,7 @@ class UnsupportedInstallLayout(RuntimeError):
         self.install_notes = str(install_notes or "")
         super().__init__(message)
 
-from .config import CONFIG_DIR
+from .config import CONFIG_DIR, make_game_instance_id
 
 # C-0:集中备份区。原地 .modagent_bak 兄弟文件是在逃 bug ——
 # CNS 等 mod 框架用非锚定子串扫描配置(string.find(name,'dekcns.json')),
@@ -97,6 +98,7 @@ def _commit_files_transactionally(operations: list[dict], game_root: str,
     moved into place with ``os.replace``, and every committed file is re-hashed. Any
     failure restores all previous files and removes newly-created files.
     """
+    task_control.raise_if_cancelled()
     if not operations:
         return []
     real_root = os.path.realpath(game_root)
@@ -127,12 +129,14 @@ def _commit_files_transactionally(operations: list[dict], game_root: str,
         os.makedirs(rollback_root, exist_ok=False)
         for index, operation in enumerate(operations):
             staged = os.path.join(stage_root, str(index))
+            task_control.raise_if_cancelled()
             shutil.copy2(operation["src"], staged)
             operation["staged"] = staged
             operation["fingerprint"] = _file_fingerprint(staged)
 
         for index, operation in enumerate(operations):
             dest = operation["dest"]
+            task_control.raise_if_cancelled()
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             existed = os.path.exists(dest)
             operation["existed"] = existed
@@ -146,6 +150,7 @@ def _commit_files_transactionally(operations: list[dict], game_root: str,
             if _file_fingerprint(dest) != operation["fingerprint"]:
                 raise RuntimeError(f"安装落盘复核失败: {dest}")
 
+        task_control.raise_if_cancelled()
         installed = []
         for operation in operations:
             record = dict(operation.get("record", {}))
@@ -184,33 +189,66 @@ def _commit_files_transactionally(operations: list[dict], game_root: str,
             shutil.rmtree(transaction_root, ignore_errors=True)
 
 
+def _backup_relative(dest: str, game_root: str) -> str:
+    managed, reason = resolve_managed_game_path(dest, game_root)
+    if not managed:
+        raise ValueError(reason)
+    return os.path.relpath(os.path.realpath(managed), os.path.realpath(game_root))
+
+
+def _central_backup_path(*parts: str) -> str:
+    path, reason = resolve_managed_game_path(os.path.join(BACKUPS_DIR, *parts), BACKUPS_DIR)
+    if not path:
+        raise ValueError("backup_path_unsafe: " + reason)
+    return path
+
+
 def _backup_file(dest: str, game_root: str, game_slug: str) -> None:
-    """覆盖前把原文件备份到集中区(~/.modagent/backups/<slug>/<相对路径>)。
-    保留首份(最原始版本)。备份失败不阻塞安装——快照才是第一还原手段。"""
+    """Keep the first original for this physical installation, or fail closed.
+
+    A failed/partial backup must never become a valid restore candidate. Stage
+    and verify before publication; unknown legacy ownership requires review.
+    """
+    rel = _backup_relative(dest, game_root)
+    if _backup_lookup(dest, game_root, game_slug):
+        return
+    bak = _central_backup_path('_instances', make_game_instance_id(game_root), rel)
+    os.makedirs(os.path.dirname(bak), exist_ok=True)
+    fd, staged = tempfile.mkstemp(prefix='.backup-stage-', dir=os.path.dirname(bak))
+    os.close(fd)
     try:
-        rel = os.path.relpath(dest, game_root)
-        if rel.startswith(".."):
-            rel = os.path.basename(dest)
-        bak = os.path.join(BACKUPS_DIR, game_slug or "_unknown", rel)
-        if not os.path.exists(bak):
-            os.makedirs(os.path.dirname(bak), exist_ok=True)
-            shutil.copy2(dest, bak)
-    except Exception:
-        pass
+        shutil.copy2(dest, staged)
+        if _file_fingerprint(staged) != _file_fingerprint(dest):
+            raise OSError('backup_verification_failed')
+        os.replace(staged, bak)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
 
 
 def _backup_lookup(f: str, game_root: str, game_slug: str) -> str:
-    """查文件对应的备份:优先集中区,其次旧版原地 .modagent_bak(迁移期兼容)。无则返回空串。"""
-    try:
-        rel = os.path.relpath(f, game_root)
-        if not rel.startswith(".."):
-            central = os.path.join(BACKUPS_DIR, game_slug or "_unknown", rel)
-            if os.path.exists(central):
-                return central
-    except ValueError:
-        pass
-    legacy = f + ".modagent_bak"
-    return legacy if os.path.exists(legacy) else ""
+    """Only restore backups bound to this install; preserve ambiguous legacy data."""
+    rel = _backup_relative(f, game_root)
+    instance = make_game_instance_id(game_root)
+    scoped = _central_backup_path('_instances', instance, rel)
+    legacy_scoped = _central_backup_path(instance, rel)
+    legacy, reason = resolve_managed_game_path(f + '.modagent_bak', game_root)
+    if not legacy:
+        raise ValueError('backup_path_unsafe: ' + reason)
+    for candidate in (scoped, legacy_scoped, legacy):
+        if os.path.lexists(candidate):
+            if not os.path.isfile(candidate):
+                raise ValueError('backup_not_a_file')
+            return candidate
+    # Old catalogue buckets lack root identity. Do not adopt whichever copy
+    # happens to be present, even when only one install is currently visible.
+    bucket = str(game_slug or '_unknown')
+    if not re.fullmatch(r'[\w.-]+', bucket) or bucket in {'.', '..'}:
+        raise ValueError('backup_bucket_unsafe')
+    old = _central_backup_path(bucket, rel)
+    if os.path.lexists(old):
+        raise RuntimeError('backup_ownership_unknown: 旧备份未记录安装目录；已保留，请核验来源或使用匹配当前目录的快照。')
+    return ''
 
 # ─────────────────────────────────────────────────────────────
 # C-6①:框架级 layout 生成器
@@ -746,6 +784,7 @@ _TS_DIRS = {
 }
 
 
+@task_control.serialized_game_operation
 def install_mod(
     archive_path: str,
     game_root: str,
@@ -807,7 +846,7 @@ def install_mod(
     return result
 
 
-def _install_bepinex(archive_path: str, game_root: str, game_slug: str = "") -> dict:
+def _install_bepinex(archive_path: str, game_root: str, game_slug: str = "", *, preview: bool = False) -> dict:
     """Thunderstore/BepInEx 通用安装,遵循 r2modman 默认安装规则:
       · 包含 BepInEx/(BepInExPack 或按 BepInEx 结构打包的 mod)→ 原样合并到游戏根
       · 包根的 plugins/ patchers/ monomod/ → BepInEx/<该目录>/<包名>/(按包名分层)
@@ -916,7 +955,11 @@ def _install_bepinex(archive_path: str, game_root: str, game_slug: str = "") -> 
                 "record": {"file": member},
             })
 
-        result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
+        if preview:
+            # The read-only conflict check uses exactly the same routing as commit.
+            result["planned_files"] = [operation["dest"] for operation in operations]
+        else:
+            result["installed"] = _commit_files_transactionally(operations, game_root, game_slug)
 
         if not has_bep and not game_has_loader:
             result.setdefault("notes", []).append(
@@ -1048,6 +1091,7 @@ def preview_custom_install(
     }
 
 
+@task_control.serialized_game_operation
 def install_mod_custom(archive_path: str, game_root: str, game_slug: str,
                        mapping: dict) -> dict:
     """T2 通用安装:按 agent 产出的显式 mapping(包内相对路径 → 游戏内相对路径)落位。
@@ -1175,8 +1219,10 @@ def read_readme_zip(archive_path: str) -> str:
         return _read_install_notes_from_tree(tmp)
 
 
+@task_control.serialized_game_operation
 def uninstall_mod(mod_id: str, game_root: str, files_installed: list[str],
-                  game_slug: str = "", shared_files: set = None) -> dict:
+                  game_slug: str = "", shared_files: set = None,
+                  retain_backups: bool = False) -> dict:
     """卸载 mod。
     shared_files: 被其他已装 mod 也拥有的文件(绝对路径、normcase)。这些文件只从本 mod
                   记录移除,【绝不删磁盘】,防止卸载 A 时删掉 B 依赖的共享文件
@@ -1184,11 +1230,18 @@ def uninstall_mod(mod_id: str, game_root: str, files_installed: list[str],
     """
     result = {
         "removed": [], "kept_shared": [], "not_found": [],
-        "blocked_unsafe": [], "errors": [],
+        "blocked_unsafe": [], "errors": [], "pending": [],
+        "restored_original": [], "restoration_backups": [],
     }
     shared = shared_files or set()
 
-    for f in files_installed:
+    for index, f in enumerate(files_installed):
+        # Finish an in-flight file restoration safely, but never begin the next
+        # file after cancellation. Return receipts so the caller keeps the ledger.
+        if task_control.is_cancelled():
+            result["pending"] = list(files_installed[index:])
+            result["status"] = "cancelled"
+            break
         managed_path, unsafe_reason = resolve_managed_game_path(f, game_root)
         if not managed_path:
             result["blocked_unsafe"].append({
@@ -1202,34 +1255,76 @@ def uninstall_mod(mod_id: str, game_root: str, files_installed: list[str],
             result["kept_shared"].append(f)
             continue
 
-        backup = _backup_lookup(f, game_root, game_slug)
-        if os.path.exists(f):
-            try:
-                os.remove(f)
-                result["removed"].append(f)
-            except Exception as e:
-                result["errors"].append({"file": f, "error": str(e)})
-        elif backup:
-            # 文件已不在,备份成了孤儿账 → 清掉
-            try:
-                os.remove(backup)
-                result["removed"].append(backup)
-                backup = ""
-            except Exception as e:
-                result["errors"].append({"file": f, "error": str(e)})
-        else:
-            result["not_found"].append(f)
+        disabled, reason = resolve_managed_game_path(f + ".disabled", game_root)
+        if not disabled:
+            result["blocked_unsafe"].append({"file": f + ".disabled", "reason": reason})
+            continue
+        if os.path.exists(f) and os.path.exists(disabled):
+            result["errors"].append({"file": f, "error": "启用和禁用文件同时存在，无法确认所有权；未删除。"})
+            continue
+        try:
+            backup = _backup_lookup(f, game_root, game_slug)
+        except (ValueError, RuntimeError, OSError) as exc:
+            result['errors'].append({'file': f, 'error': str(exc)})
+            continue
+        current = disabled if os.path.exists(disabled) else f
+        staged = ""
+        try:
+            if backup:
+                # Stage on the destination volume, verify, then atomically
+                # replace. Do not consume the only backup before DB/config work
+                # succeeds; retries may need to restore this same file again.
+                os.makedirs(os.path.dirname(f), exist_ok=True)
+                descriptor, staged = tempfile.mkstemp(prefix=".modagent-restore-", dir=os.path.dirname(f))
+                os.close(descriptor)
+                shutil.copy2(backup, staged)
+                fingerprint = _file_fingerprint(backup)
+                if _file_fingerprint(staged) != fingerprint:
+                    raise OSError("原文件恢复校验失败")
+                if current == disabled:
+                    os.remove(disabled)
+                    result["removed"].append(disabled)
+                existed = os.path.exists(f)
+                os.replace(staged, f)
+                staged = ""
+                if _file_fingerprint(f) != fingerprint:
+                    raise OSError("原文件落盘校验失败")
+                if existed:
+                    result["removed"].append(f)
+                result["restored_original"].append(f)
+                result["restoration_backups"].append(backup)
+            elif os.path.exists(current):
+                os.remove(current)
+                result["removed"].append(current)
+            else:
+                result["not_found"].append(f)
+        except Exception as exc:
+            result["errors"].append({"file": f, "error": str(exc)})
+        finally:
+            if staged and os.path.exists(staged):
+                try:
+                    os.remove(staged)
+                except OSError as exc:
+                    result["errors"].append({"file": staged, "error": str(exc)})
 
-        # 卸载后把被覆盖的原文件还原回去。
-        # 注意用 shutil.move 而非 os.rename:集中备份区在 C 盘,游戏可能在其他盘,跨设备 rename 会炸。
-        if backup and os.path.exists(backup):
-            try:
-                shutil.move(backup, f)
-                result.setdefault("restored_original", []).append(f)
-            except Exception:
-                pass
-
+    result.setdefault("status", "partial" if result["errors"] or result["blocked_unsafe"] else "completed")
+    if not retain_backups and result["status"] == "completed":
+        cleanup_uninstall_backups(result)
     return result
+
+
+def cleanup_uninstall_backups(result: dict) -> None:
+    """Consume only backups restored by this call, after the owning commit.
+
+    The argument is an internal receipt, never client/tool-supplied input.
+    Failure is a retained backup, not a failed uninstall or lost original.
+    """
+    for backup in dict.fromkeys(result.get("restoration_backups", [])):
+        try:
+            if os.path.isfile(backup):
+                os.remove(backup)
+        except OSError as exc:
+            result.setdefault("backup_cleanup_warnings", []).append(str(exc))
 
 
 def conflict_check(archive_path: str, game_root: str, game_slug: str) -> dict:
@@ -1279,7 +1374,18 @@ def conflict_check(archive_path: str, game_root: str, game_slug: str) -> dict:
             _ff7r_dest(member, plugin_roots, game_root) for member in archive_contents
         ) if d]
 
-    if not patterns:
+    generic_preview = None
+    if not patterns and not layout.get("handler"):
+        try:
+            generic_preview = _install_bepinex(archive_path, game_root, game_slug, preview=True)
+            incoming_files = generic_preview.get("planned_files", [])
+        except UnsupportedInstallLayout:
+            pass
+        except Exception as exc:
+            return {"conflicts": [], "missing_deps": [], "incoming_files_count": 0,
+                    "safe_to_install": False, "error": f"安装落位预览失败: {exc}"}
+
+    if not patterns and generic_preview is None:
         return {
             "conflicts": [], "missing_deps": [], "incoming_files_count": 0,
             "archive_contents": archive_contents[:200],
@@ -1301,7 +1407,9 @@ def conflict_check(archive_path: str, game_root: str, game_slug: str) -> dict:
         "archive_contents": archive_contents[:200],
         "archive_file_count": len(archive_contents),
         "stripped_top_dir": strip_note,
-        "safe_to_install": len(conflicts) == 0,
+        "safe_to_install": bool(incoming_files) and len(conflicts) == 0,
+        "planned_files": incoming_files,
+        "scope": "file_path_conflicts_only",
     }
 
 
@@ -1319,6 +1427,7 @@ def _get_installed_files_map(game_slug: str = "") -> dict[str, str]:
     return result
 
 
+@task_control.serialized_game_operation
 def disable_mod(files_installed: list[str], game_root: str) -> dict:
     """禁用 mod：重命名文件加 .disabled 后缀"""
     result = {
@@ -1358,6 +1467,7 @@ def is_mod_disabled(files_installed: list[str]) -> bool:
     return True
 
 
+@task_control.serialized_game_operation
 def enable_mod(files_installed: list[str], game_root: str) -> dict:
     """启用 mod：去掉 .disabled 后缀"""
     result = {

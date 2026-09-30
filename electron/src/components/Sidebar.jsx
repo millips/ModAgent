@@ -3,19 +3,20 @@ import { MessageSquare, Package, Camera, Settings, Sparkles, ShieldCheck, Wifi, 
 import { SidebarEditionAddon, SidebarNavArtwork } from '@edition'
 import { usePLicenseStatus, isPAccessEnabled } from '../license/pLicense'
 import { usePShareProfile } from '../pshare/pShareStore'
+import { tr } from '../i18n'
 
 const NAV = [
-  { id: 'chat', label: '对话', icon: MessageSquare },
-  { id: 'mods', label: 'Mod 管理', icon: Package },
-  { id: 'snaps', label: '快照', icon: Camera },
-  { id: 'settings', label: '设置', icon: Settings },
+  { id: 'chat', labelKey: 'chat', icon: MessageSquare },
+  { id: 'mods', labelKey: 'mods', icon: Package },
+  { id: 'snaps', labelKey: 'snapshots', icon: Camera },
+  { id: 'settings', labelKey: 'settings', icon: Settings },
 ]
 
-export default function Sidebar({ page, onNav, status, reviewerAllowed = false }) {
+export default function Sidebar({ page, onNav, status, reviewerAllowed = false, language = 'zh-CN' }) {
   const pLicense = usePLicenseStatus()
   const pShareProfile = usePShareProfile()
   const navItems = __MODAGENT_SUBSCRIPTION__ && isPAccessEnabled(pLicense) && pShareProfile
-    ? [...NAV, { id: 'pshare', label: 'P Share', icon: Sparkles }, ...(reviewerAllowed ? [{ id: 'reviewer', label: '审核台', icon: ShieldCheck }] : [])]
+    ? [...NAV, { id: 'pshare', labelKey: 'pshare', icon: Sparkles }, ...(reviewerAllowed ? [{ id: 'reviewer', labelKey: 'reviewer', icon: ShieldCheck }] : [])]
     : NAV
   const connecting = !status.online && status.mods == null && status.snaps == null
   return (
@@ -33,7 +34,7 @@ export default function Sidebar({ page, onNav, status, reviewerAllowed = false }
           <button
             key={n.id}
             onClick={() => onNav(n.id)}
-            title={n.label}
+            title={tr(language, n.labelKey)}
             className={`nav-item flex items-center gap-3 px-3 py-2.5 rounded-md text-sm transition-all duration-150
               ${page === n.id
                 ? 'nav-item-active bg-cyber-blue/15 text-cyber-cyan border border-cyber-cyan/20'
@@ -42,7 +43,7 @@ export default function Sidebar({ page, onNav, status, reviewerAllowed = false }
             <span className="nav-energy-scan" aria-hidden="true" />
             <n.icon size={16} className="nav-default-icon" />
             <SidebarNavArtwork id={n.id} />
-            <span className="nav-item-label">{n.label}</span>
+            <span className="nav-item-label">{tr(language, n.labelKey)}</span>
           </button>
         ))}
       </nav>
@@ -55,8 +56,8 @@ export default function Sidebar({ page, onNav, status, reviewerAllowed = false }
         {status.online
           ? <Wifi size={12} className="text-cyber-green" />
           : <WifiOff size={12} className="text-cyber-red" />}
-        <span className="sidebar-connection-label">{status.online ? '已连接' : connecting ? '正在启动…' : '连接中断'}</span>
-        <button onClick={() => window.location.reload()} className="ml-auto p-1 rounded hover:bg-surface-700" title="刷新界面">
+        <span className="sidebar-connection-label">{status.online ? tr(language, 'connected') : connecting ? tr(language, 'starting') : tr(language, 'disconnected')}</span>
+        <button onClick={() => window.location.reload()} className="ml-auto p-1 rounded hover:bg-surface-700" title={tr(language, 'refresh')}>
           <RefreshCw size={12} />
         </button>
       </div>

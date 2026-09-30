@@ -290,6 +290,19 @@ def _has_explicit_nexus_restriction_evidence(persist: list[dict]) -> bool:
 
 def validate_search_report(report_text: str, persist: list[dict]) -> ValidationResult:
     """Reject source claims that are stronger than this turn's tool evidence."""
+    violations = []
+    # Check local assertions, not unrelated words anywhere in the answer.
+    for sentence in re.split(r'[。；;\n]', report_text or ''):
+        sentence = re.sub(
+            r'(?:不能证明|无法证明|不代表|不意味着|不等于|不能据此判断|没有(?:重新)?(?:搜索|查询)|尚未(?:搜索|查询))[^，,。；;\n]*',
+            '', sentence)
+        # Detail verification is not a discovery/search claim.
+        sentence = re.sub(r'(?:详情|依赖|安装计划)\s*(?:已查(?:询)?|查过)|(?:已查(?:询)?|查过)\s*(?:详情|依赖|安装计划)', '', sentence)
+        violations.extend(_validate_search_assertions(sentence, persist).violations)
+    return ValidationResult(ok=not violations, violations=violations)
+
+
+def _validate_search_assertions(report_text: str, persist: list[dict]) -> ValidationResult:
     text = (report_text or "").casefold()
     ledger = _search_ledger(persist)
     violations: list[ReportViolation] = []
@@ -356,6 +369,10 @@ def build_search_correction_message(result: ValidationResult) -> dict:
 def build_search_fallback(persist: list[dict]) -> str:
     """Deterministic safe report used when the model ignores correction."""
     ledger = _search_ledger(persist)
+    if not any(ledger[key] for key in ('attempted', 'consulted', 'failed', 'skipped')):
+        return ('刚才的来源判断缺少可核验依据，不能当作搜索结论。'
+                '本轮没有新的搜索记录；这不代表没有相关 Mod。'
+                '如果你在询问安装计划，请以待确认清单及任务状态为准，不要据此继续安装。')
     labels = {
         "nexus": "Nexus",
         "workshop": "Steam 创意工坊",

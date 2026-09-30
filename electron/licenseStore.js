@@ -8,6 +8,17 @@ const TRIAL_DAYS = 3
 const CLOCK_ROLLBACK_GRACE_MS = 6 * 60 * 60 * 1000
 const DAY_MS = 24 * 60 * 60 * 1000
 const PERMANENT_ENTITLEMENT = 'permanent'
+const LEGACY_CONTENT_PACK = 'legacy-collection-2026'
+
+function normalizeContentPacks(value) {
+  if (value == null) return []
+  if (!Array.isArray(value) || value.length > 20) throw new Error('内容包权益无效')
+  const packs = [...new Set(value.map(item => String(item || '').trim()))]
+  if (packs.some(item => !/^[a-z0-9][a-z0-9_-]{2,63}$/.test(item))) {
+    throw new Error('内容包编号无效')
+  }
+  return packs
+}
 
 function atomicWriteJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true })
@@ -57,6 +68,7 @@ function decodeToken(rawToken, publicKey) {
         ...payload,
         permanent: true,
         days: null,
+        content_packs: normalizeContentPacks(payload.content_packs),
       },
     }
   }
@@ -67,7 +79,7 @@ function decodeToken(rawToken, publicKey) {
   if (!Number.isInteger(days) || days < 1 || days > 366) {
     throw new Error('兑换码有效期无效')
   }
-  return { token, payload: { ...payload, days } }
+  return { token, payload: { ...payload, days, content_packs: normalizeContentPacks(payload.content_packs) } }
 }
 
 function createLicenseStore({
@@ -107,10 +119,10 @@ function createLicenseStore({
   function initialState(timestamp) {
     return {
       version: 1,
-      trial_started_at: timestamp,
       last_seen_at: timestamp,
       activations: {},
       current_token: '',
+      content_packs: [],
     }
   }
 
@@ -128,6 +140,21 @@ function createLicenseStore({
       encryptState(state)
     }
     return { state }
+  }
+
+  // A safeStorage envelope can become unreadable after a legacy build,
+  // profile restoration, or operating-system credential change. Do not alter
+  // it during a normal status check: recovery must be a deliberate action.
+  function recoverUnreadableState() {
+    const timestamp = now()
+    if (fs.existsSync(licenseFile)) {
+      const backup = `${licenseFile}.unreadable-${timestamp}.bak`
+      fs.renameSync(licenseFile, backup)
+      logger.warn('Archived unreadable ModAgent P license state', backup)
+    }
+    const state = initialState(timestamp)
+    encryptState(state)
+    return state
   }
 
   function evaluateState(state, { touch = true } = {}) {
@@ -199,7 +226,17 @@ function createLicenseStore({
       }
     }
 
-    const trialStartedAt = Number(state.trial_started_at || timestamp)
+    const trialStartedAt = Number(state.trial_started_at || 0)
+    if (!trialStartedAt) {
+      return {
+        edition: 'subscription',
+        state: 'trial_available',
+        entitled: false,
+        trial: false,
+        days_remaining: TRIAL_DAYS,
+        content_packs: [],
+      }
+    }
     const trialExpiresAt = trialStartedAt + TRIAL_DAYS * DAY_MS
     if (timestamp < trialExpiresAt) {
       return {
@@ -222,6 +259,23 @@ function createLicenseStore({
     }
   }
 
+  function ownedContentPacks(state) {
+    const packs = new Set(Array.isArray(state?.content_packs) ? state.content_packs : [])
+    for (const activation of Object.values(state?.activations || {})) {
+      const activationPacks = Array.isArray(activation?.content_packs)
+        ? activation.content_packs
+        // Pre-content-pack codes were sold with the launch collection. Keep
+        // that collection permanently for every early supporter.
+        : activation?.activated_at ? [LEGACY_CONTENT_PACK] : []
+      activationPacks.forEach(pack => packs.add(pack))
+    }
+    return [...packs].sort()
+  }
+
+  function withContentPacks(status, state) {
+    return { ...status, content_packs: ownedContentPacks(state) }
+  }
+
   function status() {
     if (edition !== 'subscription') {
       return { edition, state: 'not_applicable', entitled: false }
@@ -234,23 +288,55 @@ function createLicenseStore({
         message: 'Windows 加密存储不可用，无法启用 P 会员',
       }
     }
-    const loaded = loadState()
+    const loaded = loadState({ create: false })
     if (loaded.error) {
       return { edition, state: 'invalid', entitled: false, message: loaded.error }
     }
-    return evaluateState(loaded.state)
+    if (!loaded.state) {
+      return {
+        edition,
+        state: 'trial_available',
+        entitled: false,
+        trial: false,
+        days_remaining: TRIAL_DAYS,
+      }
+    }
+    return withContentPacks(evaluateState(loaded.state), loaded.state)
+  }
+
+  function startTrial() {
+    if (edition !== 'subscription') throw new Error('普通版不支持 P 试用')
+    if (!encryptionReady()) {
+      return {
+        edition,
+        state: 'unavailable',
+        entitled: false,
+        message: 'Windows 加密存储不可用，无法启用 P 会员',
+      }
+    }
+    const loaded = loadState()
+    if (loaded.error) throw new Error(loaded.error)
+    const state = loaded.state
+    const currentStatus = evaluateState(state, { touch: false })
+    if (currentStatus.state !== 'trial_available') return withContentPacks(currentStatus, state)
+    const timestamp = now()
+    state.trial_started_at = timestamp
+    state.last_seen_at = Math.max(Number(state.last_seen_at || 0), timestamp)
+    encryptState(state)
+    return withContentPacks(evaluateState(state, { touch: false }), state)
   }
 
   function activate(rawToken) {
     if (edition !== 'subscription') throw new Error('普通版不支持 P 会员兑换码')
     const { token, payload } = decodeToken(rawToken, getPublicKey())
     const loaded = loadState()
-    if (loaded.error) throw new Error(loaded.error)
-    const state = loaded.state
+    // The token has already passed signature verification above. Only then may
+    // an unreadable old envelope be archived and rebuilt for this device.
+    const state = loaded.error ? recoverUnreadableState() : loaded.state
     const timestamp = now()
     const currentStatus = evaluateState(state, { touch: false })
     if (currentStatus.state === 'permanent' && !payload.permanent) {
-      return currentStatus
+      return withContentPacks(currentStatus, state)
     }
     const existing = state.activations?.[payload.id]
     const activatedAt = existing?.activated_at
@@ -265,18 +351,20 @@ function createLicenseStore({
       ...(state.activations || {}),
       [payload.id]: {
         activated_at: activatedAt,
+        content_packs: payload.content_packs.length ? payload.content_packs : [LEGACY_CONTENT_PACK],
         ...(payload.permanent
           ? { entitlement: PERMANENT_ENTITLEMENT }
           : { duration_days: payload.days }),
       },
     }
+    state.content_packs = ownedContentPacks(state)
     state.current_token = token
     state.last_seen_at = Math.max(Number(state.last_seen_at || 0), timestamp)
     encryptState(state)
-    return evaluateState(state, { touch: false })
+    return withContentPacks(evaluateState(state, { touch: false }), state)
   }
 
-  return { status, activate, licenseFile }
+  return { status, startTrial, activate, licenseFile }
 }
 
 module.exports = {
@@ -287,5 +375,6 @@ module.exports = {
   TRIAL_DAYS,
   DAY_MS,
   PERMANENT_ENTITLEMENT,
+  LEGACY_CONTENT_PACK,
   canUsePBenefits,
 }

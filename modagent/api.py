@@ -25,6 +25,10 @@ from modagent import db, games, installer, scanner, downloader, __version__
 from modagent import snapshot, confirmation        # ← 快照预览 + 一次性回滚确认令牌
 from modagent.tools import execute, build_tools_definitions
 from modagent.agent import Agent
+from modagent.orchestration import AgentCoreRuntime, TaskSpec, TaskState, route_message
+from modagent.orchestration import store as task_store
+from modagent.orchestration.recovery import preview_recovery, RecoveryRejected
+from modagent.orchestration.authorization import authorize_execution, ExecutionGrantRejected
 from modagent.startup_checks import run_startup_checks
 from modagent.prompts import build_prompt
 from modagent import debug_trace
@@ -53,6 +57,15 @@ def _cancel_chat_task_locked(task: dict, reason: str) -> bool:
     task["cancel_reason"] = str(reason or "用户已停止")
     task["done"] = True
     task["updated"] = time.time()
+    runtime = task.get("core_runtime")
+    if runtime is not None:
+        try:
+            runtime.cancel(
+                str(reason or "用户已停止"),
+                replaced="替代" in str(reason or ""),
+            )
+        except Exception:
+            pass
     pending = list(task.get("pending_history") or [])
     if pending:
         pending.append({
@@ -76,7 +89,7 @@ PROMPT_REFERENCED_TOOLS = {
     "list_local_mods", "tool_extract",
     "get_installed", "read_readme", "game_diagnose", "game_file_check",
     "share_export", "share_import",
-    "official_share_catalog", "official_share_import",
+    "official_share_catalog", "official_share_import", "official_share_network_diagnostics",
     "stardew_smapi_status", "mod_patch", "game_config_write",
     "scan_games", "scan_existing_mods", "import_existing_mods",
     "collection_view", "download_from_url", "thunderstore_search",
@@ -240,6 +253,12 @@ class ChatRequest(BaseModel):
     completed_effects: list[str] = Field(default_factory=list)
     recommendation_selection: list[dict] = Field(default_factory=list)
     selection_action: str = ""
+    # Only the explicit resume action may supply this field. Ordinary chat
+    # messages always create a new task and invalidate an older running turn.
+    resume_task_id: str = ""
+    recovery_task_id: str = ""
+    plan_task_id: str = ""
+    plan_revision_id: str = ""
 
 
 class SessionCreate(BaseModel):
@@ -275,6 +294,8 @@ class ConfigUpdate(BaseModel):
     tavily_api_key: Optional[str] = None
     dev_mode: Optional[bool] = None
     recommendation_limit: Optional[int] = Field(default=None, ge=2, le=20)
+    language: Optional[str] = None
+    agent_core_v2: Optional[str] = None
 
 
 def _get_agent(session_id: str) -> Agent:
@@ -311,9 +332,11 @@ def get_status():
         "bg": bg,
         "tavily_set": bool(cfg.tavily_api_key),
         "dev_mode": bool(getattr(cfg, "dev_mode", False)),
+        "language": getattr(cfg, "language", "zh-CN"),
         "recommendation_limit": max(
             2, min(int(getattr(cfg, "recommendation_limit", 10) or 10), 20)
         ),
+        "agent_core_v2": str(getattr(cfg, "agent_core_v2", "off") or "off"),
     }
 
 
@@ -356,6 +379,12 @@ class GameImport(BaseModel):
 
 class ModDirectoryImport(BaseModel):
     path: str
+
+
+class ModPackageMerge(BaseModel):
+    mod_ids: list[str] = Field(default_factory=list, max_length=120)
+    package_name: str = Field(default="", min_length=1, max_length=160)
+    game_slug: str = ""
 
 
 def _public_scan_result(result: dict, imported: int = 0) -> dict:
@@ -554,13 +583,35 @@ def mod_scan_status(game_instance_id: str = "", game_slug: str = ""):
 @app.post("/config")
 def update_config(body: ConfigUpdate):
     data = body.model_dump(exclude_none=True)
+    from .networking import CredentialFormatError, validate_api_key
+    # Validate the entire edit before mutating config, environment or storage.
+    for field in ("api_key", "nexus_api_key", "llm_api_key", "tavily_api_key"):
+        if field in data:
+            try:
+                data[field] = validate_api_key(data[field], "nexus_api_key" if field == "api_key" else field)
+            except CredentialFormatError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from None
+    # Browser/legacy clients cannot silently reuse a key at a new endpoint.
+    if ("llm_endpoint" in data
+            and str(data["llm_endpoint"]).rstrip("/") != str(cfg.llm_endpoint).rstrip("/")
+            and "llm_api_key" not in data):
+        data["llm_api_key"] = ""
     rebuild_llm_client = any(
         key in data for key in ("llm_api_key", "llm_endpoint", "llm_model")
     )
     if "api_key" in data:
         cfg.nexus_api_key = data.pop("api_key")
+    if "language" in data:
+        requested_language = str(data.pop("language") or "").lower()
+        cfg.language = "en" if requested_language in {"en", "en-us", "en-gb"} else "zh-CN"
+    if "agent_core_v2" in data:
+        requested_core = str(data.pop("agent_core_v2") or "off").strip().lower()
+        cfg.agent_core_v2 = requested_core if requested_core in {"off", "shadow", "on"} else "off"
     for key, value in data.items():
         setattr(cfg, key, value)
+        if (os.environ.get("MODAGENT_CREDENTIAL_ROUTE") == "1"
+                and key in {"llm_endpoint", "llm_model", "llm_api_key", "nexus_api_key", "tavily_api_key"}):
+            os.environ["MODAGENT_" + key.upper()] = str(value)
     cfg.tier = entitlement_tier()
     if cfg.game_slug and cfg.game_instance_id:
         db.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
@@ -602,10 +653,25 @@ def list_mods(game_slug: str = ""):
             1 for extensions in unreal_parts.values()
             if {".pak", ".utoc", ".ucas"} <= extensions
         )
+        variants = []
+        for base, extensions in sorted(unreal_parts.items()):
+            if not {".pak", ".utoc", ".ucas"} <= extensions:
+                continue
+            variant_files = [
+                path for path in files
+                if os.path.splitext(str(path or "").replace("\\", "/"))[0].casefold() == base
+            ]
+            variants.append({
+                "key": base,
+                "name": os.path.basename(base),
+                "file_count": len(variant_files),
+                "disabled": installer.is_mod_disabled(variant_files),
+            })
         return {
             "file_count": len(files),
             "variant_count": max(1, complete_unreal_variants)
             if files else 0,
+            "variants": variants,
             "management_unit": "package",
         }
 
@@ -613,6 +679,7 @@ def list_mods(game_slug: str = ""):
         "id": m.id, "name": m.name, "version": m.version,
         "load_order": m.load_order, "snapshot_id": m.snapshot_id,
         "installed_at": m.installed_at, "installed_by": m.installed_by,
+        "management_provider": "steam_workshop" if m.installed_by == "steam_workshop" or str(m.id).startswith("ws_") else "local_files",
         "game_slug": m.game_slug,
         "disabled": installer.is_mod_disabled(_mod_files(m)),
         "localized_name": (notes.get(str(m.id)) or {}).get("localized_name", ""),
@@ -627,6 +694,17 @@ def list_mods(game_slug: str = ""):
         "dependencies": db.parse_dependencies(m.dependencies),
         **package_shape(m),
     } for m in mods]
+
+
+@app.post("/mods/package-merge")
+def merge_mods_as_package(req: ModPackageMerge):
+    """Record a user-confirmed local package grouping without touching files."""
+    scope = req.game_slug or game_storage_id(cfg)
+    try:
+        result = db.merge_mod_rows_as_package(scope, req.mod_ids, req.package_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, **result}
 
 
 @app.post("/mods/enrich")
@@ -662,7 +740,7 @@ def enrich_mod_catalog(game_slug: str = "", force: bool = False):
         try:
             agent = _get_agent("__catalog_enrichment__")
             generated = generate_catalog_notes(
-                agent.client, cfg.llm_model, pending,
+                agent.client, cfg.llm_model, pending, getattr(cfg, "language", "zh-CN"),
             )
         except Exception as exc:
             return {
@@ -787,12 +865,19 @@ def snapshots_reconcile(game_slug: str = "", clean: bool = False):
 
 
 @app.post("/mods/reconcile")
-def mods_reconcile(game_slug: str = ""):
-    """Reconcile physical files and duplicate inventory aliases."""
+def mods_reconcile(game_slug: str = "", sync_missing: bool = False):
+    """Reconcile physical files and duplicate inventory aliases.
+
+    ``sync_missing`` is deliberately opt-in: an explicit user-triggered
+    reconciliation may remove a ledger row only when *all* files recorded for
+    that Mod are gone.  A partial/failed scan must never silently erase the
+    management record.
+    """
     slug = game_slug or cfg.game_slug
     merged_aliases = db.merge_duplicate_inventory_rows(slug)
     mods = db.get_installed_mods(slug) if slug else db.get_installed_mods()
     issues = []
+    removed_missing = []
     for m in mods:
         try:
             files = json.loads(m.files_installed or "[]")
@@ -801,6 +886,13 @@ def mods_reconcile(game_slug: str = ""):
         # A disabled copy is still present and managed; do not report it as a
         # missing file during ledger reconciliation.
         missing = [f for f in files if not os.path.exists(f) and not os.path.exists(f + ".disabled")]
+        if files and len(missing) == len(files) and sync_missing:
+            # The user explicitly asked to synchronise the list and every
+            # managed file is absent (including a possible .disabled copy).
+            # This is the safe definition of an externally deleted Mod.
+            db.remove_mod(m.id, slug)
+            removed_missing.append({"mod_id": m.id, "name": m.name})
+            continue
         if not files or missing:
             issues.append({"mod_id": m.id, "name": m.name,
                            "total": len(files), "missing": len(missing),
@@ -809,6 +901,7 @@ def mods_reconcile(game_slug: str = ""):
     return {
         "checked": len(mods),
         "issues": issues,
+        "removed_missing": removed_missing,
         "duplicates_merged": len(merged_aliases),
         "merged_aliases": merged_aliases,
     }
@@ -848,11 +941,52 @@ def chat(req: ChatRequest):
         return {"reply": reply, "session_id": session_id}
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={
+            "error": type(e).__name__, "status": "failed",
+            "reply": "本轮处理失败，未能得到完整结果；请核实已完成操作后重新核验计划，不会自动续跑。",
+        })
 
 
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest):
+    feature_mode = str(getattr(cfg, "agent_core_v2", "off") or "off")
+    execution_grant = None
+    if req.resume_task_id:
+        # Legacy task records contain neither an approved plan revision nor
+        # a fenced execution attempt. Fail before altering session/history.
+        raise HTTPException(status_code=409, detail={
+            "code": "plan_revalidation_required",
+            "message": "旧任务缺少可验证的计划检查点，请重新核验并确认计划；没有恢复执行。",
+        })
+    if req.recovery_task_id:
+        try:
+            recovery = preview_recovery(req.recovery_task_id, cfg)
+        except RecoveryRejected as exc:
+            raise HTTPException(409, detail={"code": str(exc)}) from exc
+        if req.regenerate or (req.session_id and req.session_id != recovery['session_id']):
+            raise HTTPException(409, detail={"code": "recovery_session_mismatch"})
+        req.session_id = recovery['session_id']
+        req.message = recovery['message']
+        req.selection_action = 'plan'
+        req.recommendation_selection = recovery['recommendation_selection']
+        req.completed_effects = []
+    if req.selection_action.strip().lower() == "confirm" and feature_mode == "on":
+        try:
+            execution_grant = authorize_execution(
+                plan_task_id=req.plan_task_id,
+                plan_revision_id=req.plan_revision_id,
+                session_id=req.session_id,
+                game_id=game_storage_id(cfg),
+                submitted_targets=req.recommendation_selection,
+            )
+        except ExecutionGrantRejected as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": str(exc),
+                "message": "安装确认与服务端冻结计划不一致，未授予执行权限；请重新核验计划。",
+            }) from exc
+        # Client rows are only a choice within the frozen plan. Execute the
+        # server-normalized identities, never arbitrary client metadata.
+        req.recommendation_selection = [dict(item) for item in execution_grant.targets]
     session_id = req.session_id
     if not session_id:
         session_id = _new_session_id()
@@ -883,9 +1017,44 @@ def chat_stream(req: ChatRequest):
         pending = list(ag.history)
         pending.append({"role": "user", "content": req.message})
         db.update_session_messages(session_id, pending)
+        route = route_message(
+            req.message,
+            selection_action=req.selection_action,
+            regenerate=req.regenerate,
+            has_selection=bool(req.recommendation_selection),
+            execution_granted=bool(execution_grant) or feature_mode != "on",
+            history=ag.history if (existing or {}).get("game_slug") == game_storage_id(cfg) else [],
+        )
+        spec = TaskSpec.create(
+            session_id=session_id,
+            game_id=game_storage_id(cfg),
+            intent=route.intent,
+            user_goal=req.message,
+            targets=req.recommendation_selection,
+            constraints={
+                "current_game_only": True,
+                "read_only": route.read_only,
+                "regenerate": bool(req.regenerate),
+                "search_goal": route.search_goal,
+                "game_instance_id": make_game_instance_id(getattr(cfg, 'game_root', '')),
+                "recovery_parent": req.recovery_task_id,
+                "plan_task_id": req.plan_task_id,
+                "plan_revision_id": req.plan_revision_id,
+                "execution_grant_id": execution_grant.grant_id if execution_grant else "",
+            },
+            authorization={
+                "install": route.install_authorized,
+                "destructive": route.destructive_authorized,
+            },
+            language=getattr(cfg, "language", "zh-CN"),
+            confidence=route.confidence,
+            route_reason=route.reason,
+        )
+
         cancel_event = threading.Event()
         task = {
-            "task_id": uuid.uuid4().hex,
+            "task_id": spec.task_id,
+            "turn_id": spec.turn_id,
             "session_id": session_id,
             "game_slug": game_storage_id(cfg),
             "events": [],
@@ -897,11 +1066,50 @@ def chat_stream(req: ChatRequest):
             "error": "",
             "started": time.time(),
             "updated": time.time(),
+            "task_spec": spec,
+            "core_runtime": None,
         }
         _chat_tasks[session_id] = task
 
+        status_reply = None
+        if feature_mode == 'on' and route.reason == 'recorded_process_status':
+            from .orchestration.status_report import process_report
+            status_reply = process_report(session_id, game_storage_id(cfg), getattr(cfg, 'language', 'zh-CN'))
+        core_runtime = None
+        if feature_mode in {"shadow", "on"}:
+            def emit_core_event(event: dict):
+                encoded = json.dumps({"task_event": event}, ensure_ascii=False)
+                with _chat_tasks_lock:
+                    if _chat_tasks.get(session_id) is task and not task.get("cancelled"):
+                        task["events"].append(encoded)
+                        task["updated"] = time.time()
+
+            core_runtime = AgentCoreRuntime(
+                spec, feature_mode=feature_mode, event_sink=emit_core_event,
+            )
+            task["core_runtime"] = core_runtime
+            core_runtime.start()
+
         def run_task():
+            from . import task_control
+            def source_progress(progress):
+                encoded = json.dumps({'progress': {**progress, 'task_id': spec.task_id, 'turn_id': spec.turn_id}}, ensure_ascii=False)
+                with _chat_tasks_lock:
+                    if _chat_tasks.get(session_id) is task and not task.get('cancelled') and not task.get('done'):
+                        task['events'].append(encoded)
+                        task['updated'] = time.time()
+            observer = task_control.observe_progress(source_progress)
+            observer.__enter__()
             try:
+                if status_reply is not None:
+                    with _chat_tasks_lock:
+                        if task.get('cancelled') or _chat_tasks.get(session_id) is not task:
+                            return
+                        ag.history = [*pending, {'role': 'assistant', 'content': status_reply}]
+                        task['events'].append(json.dumps({'chunk': status_reply}, ensure_ascii=False))
+                        core_runtime.finalize_from_text(status_reply)
+                        task['events'].append(json.dumps({'done': True}))
+                    return
                 for chunk in ag.chat_stream(
                     req.message,
                     regenerate=req.regenerate,
@@ -909,6 +1117,9 @@ def chat_stream(req: ChatRequest):
                     recommendation_selection=req.recommendation_selection,
                     selection_action=req.selection_action,
                     cancel_check=cancel_event.is_set,
+                    task_spec=spec if core_runtime is not None else None,
+                    core_runtime=core_runtime,
+                    core_mode=feature_mode,
                 ):
                     with _chat_tasks_lock:
                         if (
@@ -919,15 +1130,30 @@ def chat_stream(req: ChatRequest):
                         task["events"].append(chunk)
                         task["updated"] = time.time()
             except Exception as exc:
-                error_event = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                summary = (
+                    "本轮处理已中断，未继续执行后续操作。已完成项需要按工具记录核实；"
+                    "请重新核验计划后决定是否重试。"
+                )
+                error_event = json.dumps({"error": type(exc).__name__}, ensure_ascii=False)
                 with _chat_tasks_lock:
                     if (
                         not task.get("cancelled")
                         and _chat_tasks.get(session_id) is task
                     ):
                         task["events"].append(error_event)
+                        task["events"].append(json.dumps({"chunk": summary}, ensure_ascii=False))
+                        user_index = len(pending) - 1
+                        if len(ag.history) <= user_index or ag.history[user_index] != pending[user_index]:
+                            ag.history = list(pending)
+                        ag.history.append({"role": "assistant", "content": summary})
                         task["error"] = str(exc)
+                if core_runtime is not None:
+                    try:
+                        core_runtime.interrupt(summary, retryable=False)
+                    except Exception:
+                        pass
             finally:
+                observer.__exit__(None, None, None)
                 with _chat_tasks_lock:
                     current = (
                         _chat_tasks.get(session_id) is task
@@ -953,6 +1179,7 @@ def chat_stream(req: ChatRequest):
 
     def generate(after: int = 0):
         cursor = max(0, int(after))
+        last_visible_update = time.monotonic()
         while True:
             with _chat_tasks_lock:
                 events = list(task["events"][cursor:])
@@ -960,8 +1187,21 @@ def chat_stream(req: ChatRequest):
             for chunk in events:
                 yield f"data: {chunk}\n\n"
                 cursor += 1
+                last_visible_update = time.monotonic()
             if done and cursor >= len(task["events"]):
                 break
+            if time.monotonic() - last_visible_update >= 10.0:
+                heartbeat = json.dumps({
+                    "progress": {
+                        "stage": "heartbeat",
+                        "label": "任务仍在进行，等待当前步骤返回",
+                        "label_en": "Task is running; waiting for the current step",
+                        "elapsed_seconds": int(time.time() - task.get("started", time.time())),
+                        "task_id": task.get("task_id", ""),
+                    }
+                }, ensure_ascii=False)
+                yield f"data: {heartbeat}\n\n"
+                last_visible_update = time.monotonic()
             time.sleep(.12)
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers={
@@ -1226,6 +1466,70 @@ def cancel_active_task(body: dict = None):
             if cancelled else "没有可取消的匹配任务"
         ),
     }
+
+
+@app.get("/tasks/{task_id}")
+def get_agent_task(task_id: str):
+    task = task_store.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+@app.get("/tasks/{task_id}/events")
+def get_agent_task_events(task_id: str, after: int = 0):
+    if task_store.get_task(task_id) is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {
+        "task_id": task_id,
+        "events": task_store.list_events(task_id, after=after),
+    }
+
+
+@app.post("/tasks/{task_id}/cancel")
+def cancel_agent_task(task_id: str):
+    stored = task_store.get_task(task_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    with _chat_tasks_lock:
+        active = next(
+            (
+                item for item in _chat_tasks.values()
+                if str(item.get("task_id") or "") == task_id
+                and not item.get("done")
+            ),
+            None,
+        )
+        if active is not None:
+            _cancel_chat_task_locked(active, "用户点击了停止")
+            return {"ok": True, "task_id": task_id, "state": "CANCELLED"}
+    if str(stored.get("state") or "") in {
+        "COMPLETED", "PARTIAL", "BLOCKED", "FAILED", "CANCELLED",
+        "PAUSED_BY_NEW_TURN",
+    }:
+        return {"ok": False, "task_id": task_id, "state": stored.get("state")}
+    cancelled = task_store.cancel_task(task_id, "用户点击了停止")
+    return {
+        "ok": cancelled,
+        "task_id": task_id,
+        "state": "CANCELLED" if cancelled else stored.get("state"),
+    }
+
+
+@app.post("/tasks/{task_id}/resume")
+def prepare_agent_task_resume(task_id: str, body: dict = None):
+    """Validate an explicit resume action; the renderer reconnects via chat SSE."""
+    stored = task_store.get_task(task_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    try:
+        return preview_recovery(task_id, cfg)
+    except RecoveryRejected as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "plan_revalidation_required",
+            "reason": str(exc),
+            "message": "无法安全恢复原计划，请重新选择并核验；没有恢复执行。",
+        }) from exc
 
 
 @app.get("/static/bg/{filename}")

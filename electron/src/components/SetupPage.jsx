@@ -1,6 +1,8 @@
 import React, { useState } from 'react'
 import { Zap, ArrowRight, ArrowLeft, ExternalLink } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
+import { LANGUAGES, tr } from '../i18n'
+import { saveCredentialSettings, credentialErrorMessage } from '../credentialSettings.mjs'
 
 const MODELS = [
   { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro（推荐）' },
@@ -62,7 +64,7 @@ const KEY_GUIDES = [
   },
 ]
 
-export default function SetupPage({ onDone, api, toast }) {
+export default function SetupPage({ onDone, api, toast, language = 'zh-CN', onLanguageChange }) {
   const [step, setStep] = useState(0)
   const [nexusKey, setNexusKey] = useState('')
   const [tavilyKey, setTavilyKey] = useState('')
@@ -83,6 +85,7 @@ export default function SetupPage({ onDone, api, toast }) {
   const changeProvider = (nextProvider) => {
     const preset = LLM_PROVIDERS.find(item => item.id === nextProvider) || LLM_PROVIDERS[0]
     setProvider(preset.id)
+    setLlmKey('')
     setEndpoint(preset.endpoint)
     setModel(preset.model || 'custom')
     setCustomModel(preset.model || '')
@@ -118,21 +121,20 @@ export default function SetupPage({ onDone, api, toast }) {
       }
       if (nexusKey.trim()) secrets.nexus_api_key = nexusKey.trim()
       if (tavilyKey.trim()) secrets.tavily_api_key = tavilyKey.trim()
-      const stored = await window.modagent?.saveSecrets?.(secrets)
-      if (!stored?.ok) throw new Error('secure storage unavailable')
-
       const body = {
         llm_api_key: secrets.llm_api_key,
         llm_model: effectiveModel,
         llm_endpoint: endpoint.trim(),
+        language,
       }
       if (secrets.nexus_api_key) body.api_key = secrets.nexus_api_key
       if (secrets.tavily_api_key) body.tavily_api_key = secrets.tavily_api_key
+      const saved = await saveCredentialSettings(body, window.modagent?.saveSecrets)
 
       const response = await fetch(api + '/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(saved.body),
       })
       if (!response.ok) throw new Error(`config failed: ${response.status}`)
 
@@ -140,9 +142,9 @@ export default function SetupPage({ onDone, api, toast }) {
       emitFeedback('success', { source: 'setup' })
       toast('配置已安全保存，正在扫描本机游戏')
       onDone()
-    } catch (_) {
+    } catch (error) {
       emitFeedback('error', { source: 'setup' })
-      toast('保存失败，请检查后端是否启动或稍后重试', 'error')
+      toast(credentialErrorMessage(error, language), 'error')
     } finally {
       setSaving(false)
     }
@@ -153,16 +155,23 @@ export default function SetupPage({ onDone, api, toast }) {
       <div className="bg-surface-800 border border-surface-600 rounded-xl p-8 w-[480px] max-h-[92vh] overflow-y-auto">
         <div className="flex items-center gap-2 mb-1">
           <Zap size={20} className="text-cyber-cyan" />
-          <h2 className="text-lg font-bold text-white">ModAgent 首次配置</h2>
+          <h2 className="text-lg font-bold text-white">{tr(language, 'setupTitle')}</h2>
         </div>
         <p className="text-xs text-surface-500 mb-6">
-          当前 v{__MODAGENT_VERSION__} 只要求配置一个大模型 API。DeepSeek 是默认推荐；Nexus 和 Tavily 均可跳过并稍后补充，已填写的 Key 会保存在本机 Windows 加密存储中。
+          {tr(language, 'setupIntro')}
         </p>
 
         {step === 0 && (
           <div className="space-y-4">
             <div>
-              <label className="text-xs text-surface-400 font-medium block mb-1">大模型服务商</label>
+              <label className="text-xs text-surface-400 font-medium block mb-1">{tr(language, 'language')}</label>
+              <select className="input-cyber" value={language} onChange={e => onLanguageChange?.(e.target.value)}>
+                {LANGUAGES.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </select>
+              <p className="mt-1 text-[11px] text-surface-500">{tr(language, 'languageHelp')}</p>
+            </div>
+            <div>
+              <label className="text-xs text-surface-400 font-medium block mb-1">{tr(language, 'provider')}</label>
               <select className="input-cyber" value={provider} onChange={e => changeProvider(e.target.value)}>
                 {LLM_PROVIDERS.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
               </select>
@@ -172,7 +181,7 @@ export default function SetupPage({ onDone, api, toast }) {
                 <div className="flex items-center justify-between mb-1">
                   <label className="text-xs text-surface-400 font-medium">
                     {item.id === 'llm' ? selectedProvider.keyLabel : item.label}
-                    {item.optional && <span className="ml-1 text-[10px] text-surface-500">可选</span>}
+                    {item.optional && <span className="ml-1 text-[10px] text-surface-500">{tr(language, 'optional')}</span>}
                   </label>
                   {(item.id === 'llm' ? selectedProvider.guideUrl : item.url) && (
                     <button
@@ -180,7 +189,7 @@ export default function SetupPage({ onDone, api, toast }) {
                       className="text-[11px] text-cyber-cyan hover:text-white flex items-center gap-1"
                       onClick={() => openGuide(item.id === 'llm' ? selectedProvider.guideUrl : item.url)}
                     >
-                      获取 Key <ExternalLink size={11} />
+                      {tr(language, 'getKey')} <ExternalLink size={11} />
                     </button>
                   )}
                 </div>
@@ -195,10 +204,10 @@ export default function SetupPage({ onDone, api, toast }) {
               </div>
             ))}
             <p className="text-[11px] leading-relaxed text-surface-500">
-              LLM 用于中文对话、推荐和安装计划；Nexus 用于读取和下载 Nexus Mods；Tavily 用于增强跨网站搜索。当前支持 OpenAI-compatible 接口，原生 Claude/Gemini 等专用协议会放到后续版本。
+              {tr(language, 'llmExplanation')}
             </p>
             <button onClick={next} className="btn-cyber w-full flex items-center justify-center gap-2 mt-2">
-              下一步 <ArrowRight size={14} />
+              {tr(language, 'next')} <ArrowRight size={14} />
             </button>
           </div>
         )}
@@ -206,14 +215,14 @@ export default function SetupPage({ onDone, api, toast }) {
         {step === 1 && (
           <div className="space-y-4">
             <div>
-              <label className="text-xs text-surface-500 block mb-1 font-medium">模型</label>
+              <label className="text-xs text-surface-500 block mb-1 font-medium">{tr(language, 'model')}</label>
               <select className="input-cyber" value={model} onChange={e => setModel(e.target.value)}>
                 {MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
               </select>
             </div>
             {model === 'custom' && (
               <div>
-                <label className="text-xs text-surface-500 block mb-1 font-medium">自定义模型名</label>
+                <label className="text-xs text-surface-500 block mb-1 font-medium">{tr(language, 'customModel')}</label>
                 <input
                   className="input-cyber"
                   value={customModel}
@@ -223,7 +232,7 @@ export default function SetupPage({ onDone, api, toast }) {
               </div>
             )}
             <div>
-              <label className="text-xs text-surface-500 block mb-1 font-medium">接口地址</label>
+              <label className="text-xs text-surface-500 block mb-1 font-medium">{tr(language, 'endpoint')}</label>
               <input
                 className="input-cyber"
                 value={endpoint}
@@ -232,18 +241,18 @@ export default function SetupPage({ onDone, api, toast }) {
               />
             </div>
             <div className="rounded-lg border border-surface-600 bg-surface-900/60 p-3 text-xs text-surface-400">
-              完成后 ModAgent 会自动扫描 Steam 游戏。进入主界面后选择游戏，即可开始聊天、搜索和安装 Mod。
+              {tr(language, 'setupDetail')}
             </div>
             <div className="flex gap-2 mt-2">
               <button onClick={() => setStep(0)} className="btn-ghost flex items-center justify-center gap-1 flex-1">
-                <ArrowLeft size={14} /> 上一步
+                <ArrowLeft size={14} /> {tr(language, 'previous')}
               </button>
               <button
                 onClick={finish}
                 disabled={saving}
                 className="btn-cyber flex items-center justify-center gap-2 flex-1 disabled:opacity-50"
               >
-                <Zap size={14} /> {saving ? '保存中…' : '保存并进入'}
+                <Zap size={14} /> {saving ? tr(language, 'saving') : tr(language, 'saveAndEnter')}
               </button>
             </div>
           </div>

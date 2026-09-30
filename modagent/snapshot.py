@@ -100,6 +100,7 @@ def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
 # 每游戏快照保留上限,超出自动淘汰最老的(最早的原版基线除外)。
 # 硬链接方案下删旧快照是安全的:文件 inode 引用计数还在,新快照不受影响。
 MAX_SNAPSHOTS = 20
+SNAPSHOT_DEDUPE_WINDOW_SECONDS = 5 * 60
 
 # ─────────────────────────────────────────────────────────────
 # 快照域(snapshot domain)= ModAgent 有能力写入的文件集合
@@ -391,6 +392,49 @@ def _path_in_specs(rel: str, specs: list[dict]) -> bool:
     return False
 
 
+def _reuse_recent_identical_snapshot(game_root: str, game_instance_id: str,
+                                     rel_files: list[str], workshop_state,
+                                     trigger_mod_id: str,
+                                     trigger_mod_name: str) -> str:
+    """Reuse a genuinely identical, very recent pre-operation snapshot.
+
+    Failed retries used to create another snapshot even when no managed file
+    had changed. Reuse is deliberately narrow: same game, same trigger, same
+    Workshop set, and byte-identical managed files. A real change still gets a
+    new rollback point.
+    """
+    from .db import list_snapshots
+
+    now = time.time()
+    for row in list_snapshots(game_instance_id)[:3]:
+        if now - float(row.timestamp or 0) > SNAPSHOT_DEDUPE_WINDOW_SECONDS:
+            break
+        if str(row.trigger_mod_id or "") != str(trigger_mod_id or ""):
+            continue
+        if str(row.trigger_mod_name or "") != str(trigger_mod_name or ""):
+            continue
+        snap_dir = find_snapshot_dir(str(row.id), game_instance_id)
+        manifest_path = os.path.join(snap_dir, "manifest.json") if snap_dir else ""
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            continue
+        if sorted(manifest.get("files") or []) != rel_files:
+            continue
+        if (manifest.get("workshop") or None) != (workshop_state or None):
+            continue
+        if all(
+            _same_content(
+                os.path.join(game_root, rel.replace("/", os.sep)),
+                os.path.join(snap_dir, rel.replace("/", os.sep)),
+            )
+            for rel in rel_files
+        ):
+            return str(row.id)
+    return ""
+
+
 def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
                     trigger_mod_name: str = "") -> str:
     """
@@ -408,10 +452,13 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
     if not os.path.isdir(game_root):
         raise FileNotFoundError(f"游戏目录不存在: {game_root}")
 
-    from .config import load as load_config, game_storage_id
-    game_instance_id = game_storage_id(load_config(), game_slug)
+    # 调用方已经把目录对应的安装实例 ID 传进来；这里不能再次读取全局
+    # “当前游戏”配置。否则为另一目录/测试目录创建快照时，恰好同名的
+    # 当前游戏会把快照错误归到自己的实例下，随后跨游戏安全守卫会拒绝恢复。
+    game_instance_id = str(game_slug or "")
     specs = _auto_detect_specs(game_root, game_slug)
     rel_files = sorted(set(_iter_domain_files(game_root, specs)))
+    workshop_state = _workshop_state(game_root)
 
     if not rel_files:
         # 域为空有两种可能:① 原版无 mod —— 这是合法且宝贵的"基线快照"
@@ -423,6 +470,13 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
                 "empty_snapshot: 快照域为空且游戏目录未通过活体检测 "
                 f"(scanned={[s['dir'] for s in specs] or '[]'})。请确认游戏目录/游戏 profile 是否正确。"
             )
+
+    reusable = _reuse_recent_identical_snapshot(
+        game_root, game_instance_id, rel_files, workshop_state,
+        trigger_mod_id, trigger_mod_name,
+    )
+    if reusable:
+        return reusable
 
     base = time.strftime("%Y%m%d_%H%M%S")
     snap_id = f"snap_{base}"
@@ -647,6 +701,20 @@ def _locate_snapshot(snapshot_id: str) -> tuple[str, dict]:
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
     return snap_dir, manifest
+
+
+def snapshot_belongs_to_root(snapshot_id: str, game_root: str) -> bool:
+    """Use the manifest path as a fallback proof of snapshot ownership."""
+    try:
+        _, manifest = _locate_snapshot(snapshot_id)
+        recorded = str(manifest.get("game_root") or "")
+        if not recorded or not game_root:
+            return False
+        return os.path.normcase(os.path.realpath(recorded)) == os.path.normcase(
+            os.path.realpath(str(game_root))
+        )
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _restore_plan(snap_dir: str, manifest: dict) -> dict:

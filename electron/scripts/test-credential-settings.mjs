@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import { saveCredentialSettings, credentialErrorMessage } from '../src/credentialSettings.mjs';
+const body = { llm_endpoint: 'https://provider.example/v1', llm_model: 'model', api_key: 'fake-nexus', language: 'en' };
+let received;
+const saved = await saveCredentialSettings(body, async values => {
+  received = values;
+  return { ok: true, llm_set: true, api_key_set: true, tavily_set: false };
+});
+assert.equal(received.nexus_api_key, 'fake-nexus');
+assert.equal(received.llm_endpoint, body.llm_endpoint);
+assert.deepEqual(saved.body, { language: 'en' });
+assert.equal(saved.status.llm_set, true);
+assert.deepEqual((await saveCredentialSettings(body, undefined)).body, body);
+await assert.rejects(saveCredentialSettings(body, async () => ({ ok: false, error: 'credential_endpoint_requires_key' })), /requires_key/);
+assert.match(credentialErrorMessage(new Error('credential_endpoint_requires_key'), 'en'), /endpoint changed/);
+assert.match(credentialErrorMessage(new Error('credential_backend_unavailable'), 'zh-CN'), /重启/);
+assert.match(credentialErrorMessage(new Error('credential_store_unreadable'), 'zh-CN'), /不要删除原文件/);
+assert.match(credentialErrorMessage(new Error('credential_store_unreadable'), 'en'), /not overwritten/);
+assert.match(credentialErrorMessage(new Error('credential_store_busy'), 'zh-CN'), /关闭其他/);
+assert.match(credentialErrorMessage(new Error('credential_store_busy'), 'en'), /Close other/);
+assert.match(credentialErrorMessage(new Error('credential_encryption_unavailable'), 'zh-CN'), /未改用明文/);
+assert.match(credentialErrorMessage(new Error('credential_encryption_unavailable'), 'en'), /Nothing was saved in plaintext/);
+console.log('Credential settings: 14 checks passed');
