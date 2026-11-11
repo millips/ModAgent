@@ -31,6 +31,10 @@ def uses_pytest_functions(path: Path) -> bool:
 
 
 def main() -> int:
+    # Child logs are UTF-8; the parent must also support them on English Windows.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     test_files = sorted(TESTS_DIR.glob("test_*.py"))
     if not test_files:
         print("No regression tests found.", file=sys.stderr)

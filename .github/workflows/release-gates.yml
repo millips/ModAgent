@@ -26,7 +26,7 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt
-      - run: pip install -e . pytest
+      - run: pip install -e ".[test]"
       - run: python scripts/run-python-regressions.py
 
   electron-build-and-release-text:
