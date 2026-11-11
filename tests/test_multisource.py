@@ -67,15 +67,14 @@ sources.available_sources("Palworld", "palworld", "X:/G")
 sources.available_sources("Palworld", "palworld", "X:/G")
 check("A4 cached per game", calls["n"] == 1)
 
-# ── B. CURRENT STATE 注入 ──
+# ── B. 提示词不再预探测；来源探测由搜索工具按需执行 ──
 config.load_prompt = lambda: ""
 db.get_installed_mods = lambda slug="": []
 sources._SRC_CACHE.clear()
 cfg = types.SimpleNamespace(game_root="X:/Games/Palworld", game_slug="palworld", game_name="Palworld")
 out = prompts.build_prompt(cfg)
-check("B1 sources line injected", "可用 mod 来源" in out and "创意工坊✓(appid 1623730)" in out)
-check("B2 unresolved sources are not called absent", "当前未确认可用" in out
-      and "空结果只能表述为“本次未搜到”" in out)
+check("B1 game context retained without source guesses", "Palworld" in out and "可用 mod 来源" not in out)
+check("B2 prompt remains bounded", len(out) < 4000)
 
 # 注入失败不阻塞对话
 _orig_avail = sources.available_sources

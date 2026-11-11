@@ -51,3 +51,9 @@ export function usePLicenseStatus() {
 export function isPAccessEnabled(status = readPLicenseStatus()) {
   return Boolean(__MODAGENT_SUBSCRIPTION__ && status?.entitled)
 }
+
+export function isPContentEnabled(status = readPLicenseStatus()) {
+  return Boolean(__MODAGENT_SUBSCRIPTION__ && (
+    status?.entitled || (Array.isArray(status?.content_packs) && status.content_packs.length)
+  ))
+}

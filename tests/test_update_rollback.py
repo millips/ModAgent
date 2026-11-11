@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import types
+import zipfile
 
 import modagent.config as config
 
@@ -39,8 +40,8 @@ originals = {
 
 async def fake_download_mod(**kwargs):
     archive = os.path.join(TMP, "new.zip")
-    with open(archive, "wb") as handle:
-        handle.write(b"test archive")
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("BepInEx/plugins/Fixture.dll", b"fixture")
     return {"local_path": archive}
 
 

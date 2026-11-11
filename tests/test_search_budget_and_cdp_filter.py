@@ -1,4 +1,4 @@
-"""Search fallback rejects browse noise without a ModAgent-wide call budget."""
+"""Search fallback rejects browse noise and keeps discovery bounded per turn."""
 import json
 from unittest.mock import patch
 
@@ -21,10 +21,19 @@ assert [
 assert len(_filter_cdp_search_results("latest popular trending mods", default_rows)) == 3
 
 agent = Agent(Config())
-with patch("modagent.agent.execute", return_value=json.dumps({"results": []})):
-    for index in range(10):
+with patch("modagent.agent.execute", return_value=json.dumps({"results": []})) as execute:
+    for index in range(4):
         result = json.loads(agent._exec("nexus_search", {"query": f"retry {index}"}))
         assert "error" not in result
-assert agent._turn_search_calls == 10
+
+    repeated = json.loads(agent._exec("nexus_search", {"query": "retry 0"}))
+    assert repeated["reused_result"] is True
+    assert repeated["searched"] is False
+
+    blocked = json.loads(agent._exec("nexus_search", {"query": "one more alias"}))
+    assert blocked["status"] == "search_source_budget_exhausted"
+    assert execute.call_count == 4
+
+assert agent._turn_search_calls == 4
 
 print("ALL PASS")

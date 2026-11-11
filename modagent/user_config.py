@@ -32,15 +32,31 @@ def _registry_path() -> Path:
     return Path(CONFIG_DIR) / "external-config-registry.json"
 
 
+class ExternalConfigRegistryUnreadable(RuntimeError):
+    code = 'EXTERNAL_CONFIG_REGISTRY_UNREADABLE'
+
+    def __init__(self):
+        super().__init__('外部配置登记无法读取，已停止操作。请检查登记文件格式、读取权限或从备份恢复；不要删除文件来绕过检查。 / External-config ownership could not be read. Check its format, permissions or restore a backup; do not delete it to bypass this check.')
+
+
 def _load_registry() -> list[dict]:
     path = _registry_path()
-    if not path.is_file():
-        return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (OSError, ValueError):
+        if not isinstance(data, list) or any(
+            not isinstance(item, dict)
+            or any(not isinstance(item.get(key), str) or not item[key]
+                   for key in ('game_slug', 'location', 'relative_path'))
+            or not isinstance(item.get('owners', {}), dict)
+            or any(not isinstance(owner, dict) for owner in item.get('owners', {}).values())
+            for item in data
+        ):
+            raise ValueError('invalid registry shape')
+        return data
+    except FileNotFoundError:
         return []
+    except (OSError, ValueError):
+        raise ExternalConfigRegistryUnreadable() from None
 
 
 def _save_registry(items: list[dict]) -> None:
@@ -207,10 +223,14 @@ def _rewrite_sections(existing: str, replacements: dict[str, list[str] | None]) 
 
 
 def _atomic_write_text(target: Path, value: str) -> None:
+    _atomic_write_bytes(target, value.encode("utf-8"))
+
+
+def _atomic_write_bytes(target: Path, value: bytes) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
@@ -224,12 +244,15 @@ def write_config(
     location: str, relative_path: str, content: str, *,
     game_slug: str = "", mod_id: str = "", mode: str = "merge_ini",
 ) -> dict:
+    items = _load_registry() if game_slug else []
+    registry_before = json.loads(json.dumps(items))
     encoded = str(content or "").encode("utf-8")
     if not encoded or len(encoded) > 256 * 1024:
         raise ValueError("配置内容为空或超过 256KB")
     root, target = resolve_target(location, relative_path)
     existed = target.is_file()
-    existing = target.read_text(encoding="utf-8-sig", errors="replace") if existed else ""
+    original_bytes = target.read_bytes() if existed else b""
+    existing = original_bytes.decode("utf-8-sig", errors="replace") if existed else ""
     if mode == "merge_ini":
         result_text = merge_ini(existing, content)
     elif mode == "create_or_replace":
@@ -255,7 +278,6 @@ def write_config(
 
     verified = target.read_text(encoding="utf-8-sig", errors="replace") == result_text
     if verified and game_slug:
-        items = _load_registry()
         key = (str(game_slug), str(location).lower(), str(relative_path).replace("\\", "/"))
         entry = next((item for item in items if _entry_key(item) == key), None)
         if entry is None:
@@ -279,7 +301,34 @@ def write_config(
             elif "previous_backup" not in owner:
                 owner["previous_backup"] = backup_path if existed else ""
                 owner["previous_existed"] = existed
-        _save_registry(items)
+        try:
+            _save_registry(items)
+        except Exception:
+            rolled_back = False
+            # Do not overwrite another writer's file, or reverse a write whose
+            # registry commit might actually have been published.
+            try:
+                if (_load_registry() == registry_before
+                        and target.read_bytes() == result_text.encode("utf-8")):
+                    if existed:
+                        _atomic_write_bytes(target, original_bytes)
+                        rolled_back = target.read_bytes() == original_bytes
+                    else:
+                        target.unlink()
+                        rolled_back = not target.exists()
+            except Exception:
+                pass
+            return {
+                "written": False, "verified": False,
+                "error_code": "EXTERNAL_CONFIG_REGISTRY_SAVE_FAILED",
+                "error": (
+                    "配置登记保存失败，原文件状态已恢复。检查磁盘空间或权限后重试。 / Registry save failed; the original file state was restored. Check disk space or permissions before retrying."
+                    if rolled_back else
+                    "配置登记保存失败，文件状态未确认。请检查配置、登记及备份，暂勿重复写入。 / Registry save failed; file state is unconfirmed. Inspect the configuration, registry and backup before writing again."
+                ),
+                "rolled_back": rolled_back, "state_unconfirmed": not rolled_back,
+                "path": str(target), "backup_path": backup_path,
+            }
     return {
         "written": verified,
         "verified": verified,

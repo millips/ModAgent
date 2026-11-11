@@ -3,6 +3,7 @@ const https = require('https');
 const path = require('path');
 const { app, dialog, ipcMain } = require('electron');
 const electronLog = require('electron-log');
+const semver = require('semver');
 
 function updateConfigurationPath(resourcesPath) {
   return path.join(resourcesPath, 'app-update.yml');
@@ -13,14 +14,8 @@ function hasUpdateConfiguration(resourcesPath, existsSync = fs.existsSync) {
 }
 
 function compareVersions(left, right) {
-  const parse = value => String(value || '').replace(/^v/i, '').split('.')
-    .map(part => Number.parseInt(part, 10) || 0)
-  const a = parse(left)
-  const b = parse(right)
-  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
-    if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) - (b[index] || 0)
-  }
-  return 0
+  if (!semver.valid(left) || !semver.valid(right)) throw new Error('UPDATE_INVALID_VERSION');
+  return semver.compare(left, right);
 }
 
 function fetchJson(url, redirects = 0) {
@@ -66,7 +61,7 @@ function setupManualUpdateChecker({ identity, diagnostics, getMainWindow }) {
       throw new Error('更新清单渠道不匹配')
     }
     const latest = String(manifest.latest_version || '')
-    if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(latest)) {
+    if (!semver.valid(latest)) {
       throw new Error('更新清单版本号无效')
     }
     const available = compareVersions(latest, app.getVersion()) > 0
@@ -101,6 +96,14 @@ function setupManualUpdateChecker({ identity, diagnostics, getMainWindow }) {
 }
 
 function setupAutoUpdater({ identity, diagnostics, getMainWindow }) {
+  if (identity.candidateId) {
+    diagnostics.logger.info('All application update checks disabled for isolated test candidate');
+    ipcMain.handle('check-for-app-update', async () => ({
+      ok: true, available: false, disabled: true,
+      message: '独立测试包不自动更新，请使用单独提供的新测试包。',
+    }));
+    return null;
+  }
   if (!app.isPackaged) return null;
   if (!hasUpdateConfiguration(process.resourcesPath)) {
     diagnostics.logger.info('Automatic updater disabled; manual update manifest enabled', {
@@ -157,7 +160,12 @@ function setupAutoUpdater({ identity, diagnostics, getMainWindow }) {
   ipcMain.handle('check-for-app-update', async () => {
     try {
       const result = await autoUpdater.checkForUpdates();
-      return { ok: true, version: result?.updateInfo?.version || app.getVersion() };
+      const version = result?.updateInfo?.version;
+      if (typeof version !== 'string' || !semver.valid(version)) {
+        return { ok: false, error: 'UPDATE_INVALID_RESPONSE' };
+      }
+      return { ok: true, available: compareVersions(version, app.getVersion()) > 0,
+        version, currentVersion: app.getVersion() };
     } catch (error) {
       return { ok: false, error: error.message };
     }

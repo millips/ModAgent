@@ -3,9 +3,18 @@ const packageInfo = require('./package.json');
 const { getAppIdentity } = require('./appIdentity');
 
 const buildEdition = process.env.MODAGENT_EDITION === 'free' ? 'free' : 'subscription';
-const buildPackageInfo = { ...packageInfo, modagentEdition: buildEdition };
+const candidate = process.env.MODAGENT_CANDIDATE_ID || '';
+const profileMode = process.env.MODAGENT_PROFILE_MODE || 'isolated';
+if (!['isolated', 'shared'].includes(profileMode)) throw new Error('Invalid build profile mode');
+const buildPackageInfo = { ...packageInfo, modagentEdition: buildEdition,
+  modagentChannel: process.env.MODAGENT_CHANNEL || packageInfo.modagentChannel,
+  ...(candidate ? { modagentCandidateId: candidate } : {}),
+  ...(candidate ? { modagentProfileMode: profileMode } : {}),
+};
 const identity = getAppIdentity(buildPackageInfo);
-const markerPath = path.join(__dirname, 'dist', 'edition.json');
+const frontendRoot = path.resolve(process.env.MODAGENT_FRONTEND_DIR || path.join(__dirname, 'dist'));
+const backendRoot = path.resolve(process.env.MODAGENT_BACKEND_DIR || path.join(__dirname, '../build/backend/ModAgentBackend'));
+const markerPath = path.join(frontendRoot, 'edition.json');
 if (!require('fs').existsSync(markerPath)) {
   throw new Error(
     `Frontend build marker is missing: ${markerPath}. Run the matching Vite build before electron-builder.`
@@ -79,6 +88,8 @@ module.exports = {
     productName: identity.productName,
     modagentEdition: identity.edition,
     modagentChannel: identity.channel,
+    ...(candidate ? { modagentCandidateId: candidate } : {}),
+    ...(candidate ? { modagentProfileMode: profileMode } : {}),
   },
   artifactName: `${identity.artifactPrefix}-Setup-${packageInfo.version}.${'${ext}'}`,
   asar: true,
@@ -87,7 +98,7 @@ module.exports = {
     output: `release/${identity.updateChannel}`,
   },
   files: [
-    'dist/**/*',
+    ...(process.env.MODAGENT_FRONTEND_DIR ? [{ from: frontendRoot, to: 'dist', filter: ['**/*'] }] : ['dist/**/*']),
     ...(buildEdition === 'subscription'
       ? [
           'assets/icons/modagent-p.ico',
@@ -100,17 +111,24 @@ module.exports = {
         ]),
     'main.js',
     'browserLauncher.js',
+    'browserController.js',
     'preload.js',
     'appIdentity.js',
+    'candidateProfile.js',
     'securityStore.js',
+    'credentialBroker.js',
+    'shareFile.js',
     'licenseStore.js',
     'runtimeDiagnostics.js',
+    'diagnosticExport.js',
+    'backgroundStore.js',
+    'backgroundDecode.js',
     'updater.js',
     'package.json',
   ],
   extraResources: [
     {
-      from: '../build/backend/ModAgentBackend',
+      from: backendRoot,
       to: 'backend',
       filter: ['**/*'],
     },
@@ -139,5 +157,5 @@ module.exports = {
     include: identity.isBeta ? 'build/installer-beta.nsh' : 'build/installer.nsh',
     runAfterFinish: true,
   },
-  publish: updateBase ? [{ provider: 'generic', url: `${updateBase}/${identity.updateChannel}` }] : null,
+  publish: !candidate && updateBase ? [{ provider: 'generic', url: `${updateBase}/${identity.updateChannel}` }] : null,
 };

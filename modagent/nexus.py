@@ -8,6 +8,8 @@ import re
 from typing import Optional
 
 USER_AGENT = "ModAgent/0.1"
+_API_BODY_DEADLINE = 20.0
+_API_MAX_BYTES = 16 * 1024 * 1024
 
 # Cache for updated mod IDs per game (max 20 entries to prevent unbounded growth)
 _MOD_CACHE: dict[str, tuple[float, list[dict]]] = {}
@@ -63,14 +65,14 @@ def _match_game_catalog(game_name: str, games) -> dict | None:
         if overlap >= required:
             exact = int(_normalise_game_name(title).casefold()
                         == _normalise_game_name(game_name).casefold())
-            candidates.append((exact, overlap, slug, title))
+            candidates.append((exact, overlap, slug, title, item.get("id")))
     if not candidates:
         return None
-    _, _, slug, title = max(candidates)
+    _, _, slug, title, game_id = max(candidates, key=lambda candidate: candidate[:4])
     return {
         "status": "available",
         "slug": slug,
-        "game_id": int(item.get("id") or 0),
+        "game_id": int(game_id or 0),
         "evidence": f"Nexus API games catalogue: {title}",
         "reason": "verified in Nexus official game catalogue",
     }
@@ -129,7 +131,7 @@ def discover_game(game_name: str, tavily_key: str = "",
             "include_domains": ["nexusmods.com"],
             "max_results": 8,
         }).encode()
-        ctx = ssl._create_unverified_context()
+        ctx = ssl.create_default_context()
         try:
             req = urllib.request.Request(
                 "https://api.tavily.com/search",
@@ -183,13 +185,50 @@ def discover_game(game_name: str, tavily_key: str = "",
     return result
 
 
+class _SameOriginApiRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        def origin(url):
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("Redirect credentials are not allowed")
+            return (parsed.scheme.lower(), (parsed.hostname or "").lower(),
+                    parsed.port if parsed.port is not None else (443 if parsed.scheme.lower() == "https" else 80))
+        try:
+            same_origin = origin(req.full_url) == origin(newurl)
+        except ValueError:
+            same_origin = False
+        if not same_origin:
+            fp.close()
+            raise urllib.error.HTTPError(req.full_url, code, "NEXUS_REDIRECT_BLOCKED", headers, None)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _api(url: str, api_key: str) -> dict:
-    ctx = ssl._create_unverified_context()
+    ctx = ssl.create_default_context()
     req = urllib.request.Request(url, headers={
         "apikey": api_key, "Accept": "application/json", "User-Agent": USER_AGENT,
     })
-    with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
-        return json.loads(resp.read())
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx), _SameOriginApiRedirect())
+    with opener.open(req, timeout=10) as resp:
+        # A socket idle timeout alone permits an endless slow-drip response.
+        # read1 returns available data without waiting to fill the whole chunk.
+        # The body budget is checked between reads; an in-flight socket read
+        # can add at most the existing 10-second idle timeout.
+        deadline = time.monotonic() + _API_BODY_DEADLINE
+        body = bytearray()
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("NEXUS_RESPONSE_TIMEOUT")
+            chunk = resp.read1(min(65536, _API_MAX_BYTES + 1 - len(body)))
+            if time.monotonic() >= deadline:
+                raise TimeoutError("NEXUS_RESPONSE_TIMEOUT")
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > _API_MAX_BYTES:
+                raise ValueError("NEXUS_RESPONSE_TOO_LARGE")
+        return json.loads(body)
 
 
 def resolve_game_id(game_slug: str, api_key: str) -> int:
@@ -220,23 +259,55 @@ def search(query: str, game_slug: str, api_key: str, cdp_port: int = 18888, game
     if tavily_key:
         result = _search_via_tavily(query, game_slug, tavily_key)
         if result:
-            return result
+            return _dedupe_search_results(result, game_slug)
 
     api_error = None
     try:
         result = _search_api(query, game_slug, api_key, game_id)
         if result:
-            return result
+            return _dedupe_search_results(result, game_slug)
     except NexusSearchUnavailable as exc:
         api_error = exc
 
     # CDP is an adaptive final route, not a prerequisite for ordinary search.
     result = _search_cdp(query, game_slug, api_key, cdp_port, game_id)
     if result and not (len(result) == 1 and result[0].get("error")):
-        return result
+        return _dedupe_search_results(result, game_slug)
     if api_error:
         raise api_error
     return []
+
+
+def _dedupe_search_results(rows: list[dict], game_slug: str = "") -> list[dict]:
+    """Collapse URL variants of one Nexus project to its stable Mod ID.
+
+    Search engines commonly return a mod's overview, files, images and
+    tracking URLs.  Those are one project, never independent recommendations.
+    Keep the most informative row while preserving the original ranking order.
+    """
+    unique: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for raw in rows or []:
+        row = dict(raw or {})
+        mod_id = str(row.get("mod_id") or "").strip()
+        slug = str(row.get("nexus_slug") or game_slug or "").strip().casefold()
+        key = (slug, mod_id) if mod_id else ("url", str(row.get("url") or ""))
+        if key not in unique:
+            unique[key] = row
+            order.append(key)
+            continue
+        current = unique[key]
+        # Detailed API rows and a useful summary are preferred over a bare
+        # search-engine snippet; neither changes the stable project identity.
+        current_quality = sum(bool(current.get(field)) for field in (
+            "version", "author", "summary", "updated_time", "downloads",
+        )) + len(str(current.get("summary") or "")) / 1000
+        row_quality = sum(bool(row.get(field)) for field in (
+            "version", "author", "summary", "updated_time", "downloads",
+        )) + len(str(row.get("summary") or "")) / 1000
+        if row_quality > current_quality:
+            unique[key] = row
+    return [unique[key] for key in order]
 
 
 def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
@@ -254,7 +325,7 @@ def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
         "max_results": 10,
     }).encode()
 
-    ctx = ssl._create_unverified_context()
+    ctx = ssl.create_default_context()
     try:
         req = urllib.request.Request(
             "https://api.tavily.com/search",
@@ -276,12 +347,12 @@ def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
             results.append({
                 "mod_id": int(m.group(1)),
                 "name": item.get("title", "").split(" at ")[0].strip()[:80],
-                "summary": item.get("content", "")[:200],
+                "summary": _source_plain_text(item.get("content", ""))[:200],
                 "endorsements": 0,
                 "version": "",
                 "updated": "",
             })
-    return results
+    return _dedupe_search_results(results, game_slug)
 
 
 _TOOL_QUERY_WORDS = (
@@ -313,7 +384,7 @@ def search_tool_entries(query: str, tavily_key: str, api_key: str = "",
         "include_domains": ["nexusmods.com"],
         "max_results": max(1, min(limit, 20)),
     }).encode()
-    ctx = ssl._create_unverified_context()
+    ctx = ssl.create_default_context()
     try:
         req = urllib.request.Request(
             "https://api.tavily.com/search", data=body,
@@ -642,8 +713,10 @@ def get_detail(mod_id: int, game_slug: str, api_key: str, cdp_port: int = 18888)
     return {
         "mod_id": mod.get("mod_id", mod_id),
         "name": mod.get("name", ""),
-        "summary": mod.get("summary", ""),
-        "description": mod.get("description", "")[:2000],
+        # Nexus descriptions often carry BBCode/HTML.  UI consumers must not
+        # expose markup as if it were a Mod description.
+        "summary": _source_plain_text(mod.get("summary", ""))[:800],
+        "description": _source_plain_text(mod.get("description", ""))[:2000],
         "version": primary.get("version", mod.get("version", "?")) if primary else mod.get("version", "?"),
         "file_id": primary.get("file_id") if primary else None,
         "file_name": primary.get("file_name", "") if primary else "",
@@ -707,6 +780,7 @@ def _source_plain_text(value: str) -> str:
     text = re.sub(r"\[/?(?:b|i|u|size|color|font|list)(?:=[^\]]+)?\]", "", text, flags=re.I)
     text = re.sub(r"\[[^\]]+\]", " ", text)
     text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n\s*\n+", "\n", text)
     return text.strip()
 

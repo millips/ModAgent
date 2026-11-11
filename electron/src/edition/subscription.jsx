@@ -1,6 +1,6 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import {
-  Bell, Check, Clock3, Copy, KeyRound, ListChecks, LockKeyhole,
+  Bell, Check, Clock3, Copy, ExternalLink, KeyRound, ListChecks, LockKeyhole,
   Palette, Pencil, RotateCcw, ShieldAlert, Sparkles, Volume2,
 } from 'lucide-react'
 import FeedbackCore from '../components/FeedbackCore'
@@ -12,25 +12,38 @@ import kawaiiSettingsIcon from '../assets/themes/kawaii/icons/nav-settings.png'
 import { emitFeedback } from '../feedback/feedbackBus'
 import {
   getFeedbackSoundVolume,
+  playFeedbackSound,
   resetFeedbackSoundVolumes,
   setFeedbackSoundVolume,
 } from '../feedback/feedbackAudio'
 import { installFeedbackInteractions } from '../feedback/feedbackInteractions'
 import {
   VISUAL_THEMES,
+  contentPackLabel,
   LIGHTING_MODES,
   applyVisualPreferences,
   clearVisualPreferences,
   readVisualPreferences,
+  readWallpaperPreference,
   saveVisualPreference,
+  saveWallpaperPreference,
+  themesForContentPacks,
+  wallpaperForId,
+  wallpapersForContentPacks,
 } from '../theme/visualTheme'
 import {
   P_LICENSE_EVENT,
   isPAccessEnabled,
+  isPContentEnabled,
   publishPLicenseStatus,
   readPLicenseStatus,
   usePLicenseStatus,
 } from '../license/pLicense'
+import {
+  CORE_SUCCESS_EVENT,
+  hasCoreSuccess,
+  installCoreSuccessTracking,
+} from './coreSuccess'
 
 export { RecommendationDecisionTable as ChatEditionMessage } from '../components/RecommendationDecisionTable'
 
@@ -61,16 +74,23 @@ const FEEDBACK_TESTS = [
   ['error', 'ERR.00', '错误'],
 ].map(([type, code, label, count]) => ({ type, code, label, count }))
 
+const AFDIAN_P_URL = 'https://afdian.com/a/mlip__'
+
 export function bootstrapEdition() {
   const applyAccess = status => {
-    const enabled = isPAccessEnabled(status)
-    document.body.dataset.maPAccess = enabled ? 'active' : 'locked'
-    if (enabled) {
-      applyVisualPreferences(readVisualPreferences())
-      if (document.body.classList.contains('default-bg')) {
-        document.body.classList.remove('has-bg', 'default-bg')
-        document.body.style.backgroundImage = ''
-      }
+    const contentEnabled = isPContentEnabled(status)
+    document.body.dataset.maPAccess = contentEnabled ? 'active' : 'locked'
+    if (contentEnabled) {
+      applyVisualPreferences(readVisualPreferences(), {
+        contentPacks: status?.content_packs || [],
+        allowAll: isPAccessEnabled(status),
+      })
+      const wallpaper = wallpaperForId(readWallpaperPreference(), status?.content_packs || [], {
+        allowAll: isPAccessEnabled(status),
+      })
+      document.body.classList.remove('default-bg')
+      document.body.classList.toggle('has-bg', Boolean(wallpaper))
+      document.body.style.backgroundImage = wallpaper ? `url("${wallpaper.src}")` : ''
     } else {
       clearVisualPreferences()
       if (!document.body.classList.contains('has-bg')) {
@@ -81,12 +101,13 @@ export function bootstrapEdition() {
   }
   applyAccess(readPLicenseStatus())
   window.addEventListener(P_LICENSE_EVENT, event => applyAccess(event.detail))
+  installCoreSuccessTracking()
   installFeedbackInteractions()
 }
 
 export function SidebarEditionAddon({ page }) {
   const status = usePLicenseStatus()
-  if (status.entitled) return <FeedbackCore page={page} />
+  if (isPContentEnabled(status)) return <FeedbackCore page={page} />
   return (
     <div className="mx-3 mb-3 rounded-lg border border-cyber-yellow/25 bg-surface-900/70 p-3 text-center">
       <LockKeyhole size={18} className="mx-auto text-cyber-yellow" />
@@ -105,7 +126,7 @@ const NAV_ART = {
 
 export function SidebarNavArtwork({ id }) {
   const status = usePLicenseStatus()
-  if (!status.entitled || !NAV_ART[id]) return null
+  if (!isPContentEnabled(status) || !NAV_ART[id]) return null
   return <img src={NAV_ART[id]} className="nav-kawaii-icon" alt="" draggable="false" />
 }
 
@@ -321,9 +342,14 @@ function LegacyChatEditionMessage({
 }
 
 export function applyEditionDefaultBackground() {
-  if (isPAccessEnabled()) {
-    document.body.classList.remove('has-bg', 'default-bg')
-    document.body.style.backgroundImage = ''
+  const license = readPLicenseStatus()
+  if (isPContentEnabled(license)) {
+    const wallpaper = wallpaperForId(readWallpaperPreference(), license.content_packs || [], {
+      allowAll: isPAccessEnabled(license),
+    })
+    document.body.classList.remove('default-bg')
+    document.body.classList.toggle('has-bg', Boolean(wallpaper))
+    document.body.style.backgroundImage = wallpaper ? `url("${wallpaper.src}")` : ''
   } else {
     document.body.classList.add('has-bg', 'default-bg')
     document.body.style.backgroundImage = `url("${defaultWallpaper}")`
@@ -332,11 +358,18 @@ export function applyEditionDefaultBackground() {
 
 export function SettingsEditionPanel({ toast }) {
   const license = usePLicenseStatus()
+  const contentEnabled = isPContentEnabled(license)
+  const availableThemes = themesForContentPacks(license.content_packs || [], { allowAll: isPAccessEnabled(license) })
+  const availableWallpapers = wallpapersForContentPacks(license.content_packs || [], { allowAll: isPAccessEnabled(license) })
   const [licenseCode, setLicenseCode] = useState('')
   const [activating, setActivating] = useState(false)
+  const [startingTrial, setStartingTrial] = useState(false)
+  const [coreSuccess, setCoreSuccess] = useState(hasCoreSuccess)
+  const [previewing, setPreviewing] = useState(false)
   const initial = readVisualPreferences()
   const [visual, setVisual] = useState(initial.visual)
   const [lighting, setLighting] = useState(initial.lighting)
+  const [wallpaper, setWallpaper] = useState(readWallpaperPreference)
   const [soundEditing, setSoundEditing] = useState(false)
   const [selectedSound, setSelectedSound] = useState('reply-complete')
   const [selectedVolume, setSelectedVolume] = useState(() => getFeedbackSoundVolume('reply-complete'))
@@ -347,9 +380,18 @@ export function SettingsEditionPanel({ toast }) {
     try { return localStorage.getItem('modagent-reply-windows-notification') === 'true' } catch (_) { return false }
   })
 
+  useEffect(() => {
+    const handleCoreSuccess = () => setCoreSuccess(true)
+    window.addEventListener(CORE_SUCCESS_EVENT, handleCoreSuccess)
+    return () => window.removeEventListener(CORE_SUCCESS_EVENT, handleCoreSuccess)
+  }, [])
+
   const save = (key, value, setter, label) => {
     setter(value)
-    saveVisualPreference(key, value)
+    saveVisualPreference(key, value, {
+      contentPacks: license.content_packs || [],
+      allowAll: isPAccessEnabled(license),
+    })
     emitFeedback('notice', { source: key, value })
     toast(label)
   }
@@ -370,7 +412,38 @@ export function SettingsEditionPanel({ toast }) {
     }
   }
 
+  const startTrial = async () => {
+    if (startingTrial) return
+    setStartingTrial(true)
+    try {
+      const result = await window.modagent?.startPTrial?.()
+      if (!result?.ok) throw new Error(result?.error || '无法开始 P 试用')
+      publishPLicenseStatus(result.status)
+      toast('P 三天体验已开始；核心 Mod 管理功能始终保持免费。')
+    } catch (error) {
+      toast(error.message || '无法开始 P 试用', 'error')
+    } finally {
+      setStartingTrial(false)
+    }
+  }
+
+  const previewFeedback = async () => {
+    if (previewing) return
+    setPreviewing(true)
+    try {
+      await playFeedbackSound('success')
+    } finally {
+      window.setTimeout(() => setPreviewing(false), 300)
+    }
+  }
+
+  const openAfdian = async () => {
+    const result = await window.modagent?.openExternal?.(AFDIAN_P_URL)
+    if (!result?.ok) toast('无法打开爱发电页面，请稍后重试。', 'error')
+  }
+
   const stateLabel = {
+    trial_available: '可开始三天 P 体验',
     trial: `三天试用中 · 剩余 ${license.days_remaining || 0} 天`,
     active: `P 会员有效 · 剩余 ${license.days_remaining || 0} 天`,
     permanent: 'P 永久授权',
@@ -394,8 +467,31 @@ export function SettingsEditionPanel({ toast }) {
           }`}>{stateLabel}</span>
         </div>
         <p className="text-xs leading-relaxed text-surface-500">
-          P 包首次启动提供三天试用；兑换码可签发为限时或永久授权。到期只关闭 P 专属主题、音效、视觉反馈与 Windows 通知，不影响 Mod 管理和用户数据。
+          P 体验由你主动开始，启动后有效三天；兑换码可签发为限时或永久授权。P 不增强 AI，也不提高搜索、安装或回滚权限。每月领取的主题、壁纸和音效包永久保留；到期只停止后续内容领取、P Share 创作入口和后续 P 下载，不影响 Mod 管理或用户数据。
         </p>
+        {license.content_packs?.length > 0 && (
+          <p className="text-[11px] leading-relaxed text-cyber-cyan">
+            已永久拥有：{license.content_packs.map(contentPackLabel).join('、')}
+          </p>
+        )}
+        {license.state === 'trial_available' && coreSuccess && (
+          <div className="rounded-lg border border-cyber-cyan/25 bg-cyber-cyan/[0.045] p-3 text-xs leading-relaxed text-surface-300">
+            <p>你已完成免费版的核心体验后，可随时主动开启一次三天 P 体验。开始后会显示剩余时间和到期时间。</p>
+            <button
+              type="button"
+              disabled={startingTrial}
+              className="btn-cyber mt-3 flex items-center gap-1.5 disabled:opacity-50"
+              onClick={startTrial}
+            >
+              <Sparkles size={13} /> {startingTrial ? '正在开始体验' : '开始三天 P 体验'}
+            </button>
+          </div>
+        )}
+        {license.state === 'trial_available' && !coreSuccess && (
+          <p className="rounded-lg border border-surface-600 bg-surface-900/45 p-3 text-xs leading-relaxed text-surface-500">
+            先完成一次免费核心操作（扫描、创建快照、生成下载完成或安装/回滚），再按自己的节奏开启三天 P 体验。免费核心始终无需付费。
+          </p>
+        )}
         {license.expires_at && (
           <div className="flex items-center gap-2 text-[11px] text-surface-400">
             <Clock3 size={12} />
@@ -434,31 +530,55 @@ export function SettingsEditionPanel({ toast }) {
         </div>
       </div>
 
-      {!license.entitled && (
-        <div className="card-cyber space-y-2 border-cyber-yellow/20 bg-cyber-yellow/[0.035]">
-          <div className="flex items-center gap-2 text-sm font-medium text-white">
-            <LockKeyhole size={14} className="text-cyber-yellow" /> P 专属外观已锁定
+      {!contentEnabled && (
+        <>
+          <div className="card-cyber space-y-2 border-cyber-yellow/20 bg-cyber-yellow/[0.035]">
+            <div className="flex items-center gap-2 text-sm font-medium text-white">
+              <LockKeyhole size={14} className="text-cyber-yellow" /> P 专属体验未启用
+            </div>
+            <p className="text-xs leading-relaxed text-surface-500">
+              P 提供主题、音效、视觉反馈、完成通知和 P Share 创作者资格；搜索、核验、安装、更新、卸载、快照和官方合集导入始终免费。
+            </p>
           </div>
-          <p className="text-xs leading-relaxed text-surface-500">
-            输入有效兑换码即可恢复 P 主题、专属音效、视觉动效与反馈核心。搜索、核验、安装、更新、卸载和快照等基础功能不会被锁定。
-          </p>
-        </div>
+          <div className="card-cyber space-y-3 border-cyber-cyan/20">
+            <div className="flex items-center gap-2 text-sm font-medium text-white">
+              <Palette size={14} className="text-cyber-cyan" /> P 体验预览
+            </div>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {VISUAL_THEMES.map(item => (
+                <div key={item.value} className="rounded-md border border-surface-600 bg-surface-900/60 p-2">
+                  <div className="text-xs text-white">{item.label}</div>
+                  <div className="mt-1 text-[10px] leading-relaxed text-surface-500">{item.note}</div>
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button type="button" className="btn-ghost text-xs" disabled={previewing} onClick={previewFeedback}>
+                <Volume2 size={13} className="mr-1 inline" /> {previewing ? '正在试听' : '试听一次完成反馈'}
+              </button>
+              <button type="button" className="btn-cyber text-xs" onClick={openAfdian}>
+                <ExternalLink size={13} className="mr-1 inline" /> 查看当月收藏 / 支持开发
+              </button>
+              <span className="text-[11px] text-surface-500">P Share 让你建立创作者档案、导出审核投稿并追踪投稿状态；官方合集导入所有用户都可使用。</span>
+            </div>
+          </div>
+        </>
       )}
 
-      {license.entitled && (
+      {contentEnabled && (
       <>
       <div className="theme-appearance-card card-cyber space-y-3">
         <div className="flex items-center gap-2 mb-1">
           <Palette size={14} className="text-cyber-cyan" />
           <span className="text-sm font-medium">界面主题</span>
         </div>
-        <p className="text-xs text-surface-500">P 专属主题与氛围打光；按钮外观会随主题自动匹配。</p>
+        <p className="text-xs text-surface-500">已拥有的主题包会永久保留；按钮外观会随主题自动匹配。</p>
         <label className="text-xs text-surface-500 block">主体配色</label>
         <select className="input-cyber" value={visual} onChange={event => {
           const value = event.target.value
           save('visual', value, setVisual, `视觉主题：${VISUAL_THEMES.find(item => item.value === value)?.label || value}`)
         }}>
-          {VISUAL_THEMES.map(item => <option key={item.value} value={item.value}>{item.label} · {item.note}</option>)}
+          {availableThemes.map(item => <option key={item.value} value={item.value}>{item.label} · {item.note}</option>)}
         </select>
         <label className="text-xs text-surface-500 block">氛围打光</label>
         <select className="input-cyber" value={lighting} onChange={event => {
@@ -467,6 +587,21 @@ export function SettingsEditionPanel({ toast }) {
         }}>
           {LIGHTING_MODES.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}
         </select>
+        {availableWallpapers.length > 0 && (
+          <>
+            <label className="text-xs text-surface-500 block">P 收藏壁纸</label>
+            <select className="input-cyber" value={wallpaper} onChange={event => {
+              const value = event.target.value
+              setWallpaper(value)
+              saveWallpaperPreference(value)
+              applyEditionDefaultBackground()
+              toast(value ? `壁纸：${availableWallpapers.find(item => item.id === value)?.label || value}` : '已使用纯色背景')
+            }}>
+              <option value="">不使用 P 壁纸</option>
+              {availableWallpapers.map(item => <option key={item.id} value={item.id}>{item.label} · {item.note}</option>)}
+            </select>
+          </>
+        )}
       </div>
 
       <div className="feedback-calibration-card card-cyber space-y-3">

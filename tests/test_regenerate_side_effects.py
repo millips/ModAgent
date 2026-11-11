@@ -54,10 +54,12 @@ try:
     assert all(name not in instance.seen_tools for name in REGENERATE_BLOCKED_TOOLS)
     guard = next(
         message["content"] for message in instance.seen_messages
-        if message["role"] == "system" and "重新生成" in message["content"]
+        if message["role"] == "system" and "这是对上一条回答的重新生成" in message["content"]
     )
     assert "严禁再次下载" in guard
-    assert "mod_install 已完成" in guard
+    assert "mod_install 已完成" not in guard
+    assert any(message["role"] == "user" and "mod_install 已完成" in message["content"]
+               for message in instance.seen_messages)
     assert any(event.get("done") is True for event in events)
 
     instance._regenerating = True

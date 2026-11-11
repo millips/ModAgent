@@ -32,7 +32,7 @@ os.makedirs(os.path.join(G, "Mods"), exist_ok=True)
 r = installer.install_mod(mkzip("m1.zip", {"CoolMod.dll": "NEW_V1"}), G, "phasmophobia")
 check("1 installed new content", open(DEST).read() == "NEW_V1")
 check("1 NO in-place bak in game dir", find_baks(G) == [])
-central = os.path.join(installer.BACKUPS_DIR, "phasmophobia", "Mods", "CoolMod.dll")
+central = installer._backup_lookup(DEST, G, "phasmophobia")
 check("1 central backup holds original", os.path.exists(central) and open(central).read() == "ORIGINAL")
 
 # 2. 再次覆盖安装 → keep-first(备份仍是最初版本)
@@ -53,12 +53,13 @@ r = installer.uninstall_mod("m2", G, [DEST2], game_slug="phasmophobia")
 check("4 legacy sibling bak restored", open(DEST2).read() == "LEGACY_ORIG")
 check("4 legacy bak gone", not os.path.exists(DEST2 + ".modagent_bak"))
 
-# 5. 文件已丢但备份在 → 清孤儿账,不复活文件
+# 5. 文件已丢但备份在：仍属于已登记的覆盖项，不得删除唯一原件。
 DEST3 = os.path.join(G, "Mods", "Ghost.dll")
 w(DEST3 + ".modagent_bak", "GHOST")
 r = installer.uninstall_mod("m3", G, [DEST3], game_slug="phasmophobia")
-check("5 orphan bak cleaned, file not resurrected",
-      not os.path.exists(DEST3) and not os.path.exists(DEST3 + ".modagent_bak"))
+check("5 missing overwritten file restored from backup",
+      os.path.exists(DEST3) and open(DEST3).read() == "GHOST"
+      and not os.path.exists(DEST3 + ".modagent_bak"))
 
 # 6. BepInEx 路径同样走集中区
 G2 = os.path.join(TMP, "Repo")
@@ -68,7 +69,7 @@ w(PRE, "BEP_ORIG")
 r = installer.install_mod(mkzip("bepmod.zip", {"plugins/P.dll": "BEP_NEW"}), G2, "repo")
 check("6 bepinex overwrote", open(PRE).read() == "BEP_NEW")
 check("6 bepinex path no in-place bak", find_baks(G2) == [])
-c2 = os.path.join(installer.BACKUPS_DIR, "repo", "BepInEx", "plugins", "bepmod", "P.dll")
+c2 = installer._backup_lookup(PRE, G2, "repo")
 check("6 bepinex central backup", os.path.exists(c2) and open(c2).read() == "BEP_ORIG")
 
 print("\nALL PASS" if allok else "\nSOME FAILED")

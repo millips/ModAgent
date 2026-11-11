@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, asdict
@@ -18,11 +19,12 @@ def _scope_game(game_slug: str = "") -> str:
         return str(game_slug or "")
 
 
-def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
+def migrate_game_scope(legacy_slug: str, instance_id: str, before_commit=None) -> None:
     """Assign unambiguous legacy rows to the currently selected install."""
     if not legacy_slug or not instance_id or legacy_slug == instance_id:
         return
     conn = get_conn()
+    undo = None
     try:
         for table in (
             "installed_mods", "snapshots", "sessions",
@@ -32,7 +34,14 @@ def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
                 f"UPDATE OR IGNORE {table} SET game_slug=? WHERE game_slug=?",
                 (instance_id, legacy_slug),
             )
+        if before_commit is not None:
+            undo = before_commit()
         conn.commit()
+    except Exception:
+        conn.rollback()
+        if callable(undo):
+            undo()
+        raise
     finally:
         conn.close()
 
@@ -143,6 +152,54 @@ def init_db():
             updated_at REAL DEFAULT 0,
             PRIMARY KEY (game_slug, mod_id)
         );
+        CREATE TABLE IF NOT EXISTS agent_tasks (
+            task_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            game_id TEXT DEFAULT '',
+            intent TEXT NOT NULL,
+            state TEXT NOT NULL,
+            spec_json TEXT NOT NULL DEFAULT '{}',
+            checkpoint_json TEXT NOT NULL DEFAULT '{}',
+            outcome_json TEXT NOT NULL DEFAULT '{}',
+            cancel_reason TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_tasks_session
+            ON agent_tasks(session_id, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS agent_task_events (
+            task_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            state TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            PRIMARY KEY (task_id, seq)
+        );
+        CREATE TABLE IF NOT EXISTS agent_effects (
+            idempotency_key TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_execution_grants (
+            grant_id TEXT PRIMARY KEY,
+            plan_task_id TEXT NOT NULL,
+            plan_revision_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            game_id TEXT NOT NULL,
+            targets_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            consumed_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_execution_grants_task
+            ON agent_execution_grants(plan_task_id, created_at DESC);
     """)
     try:
         conn.execute("ALTER TABLE installed_mods ADD COLUMN files_installed TEXT DEFAULT '[]'")
@@ -195,30 +252,34 @@ def add_mod(mod: InstalledMod):
     mod.game_slug = _scope_game(mod.game_slug)
     conn = get_conn()
     mod.installed_at = time.time()
-    conn.execute(
-        "INSERT OR REPLACE INTO installed_mods VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (mod.id, mod.name, mod.version, mod.snapshot_id, mod.load_order,
-         mod.file_id, mod.installed_at, mod.files_installed, mod.dependencies, mod.installed_by, mod.game_slug),
-    )
-    _log(conn, "install", json.dumps(asdict(mod)))
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO installed_mods VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (mod.id, mod.name, mod.version, mod.snapshot_id, mod.load_order,
+                 mod.file_id, mod.installed_at, mod.files_installed, mod.dependencies, mod.installed_by, mod.game_slug),
+            )
+            _log(conn, "install", json.dumps(asdict(mod)))
+    finally:
+        conn.close()
 
 
 def remove_mod(mod_id: str, game_slug: str = ""):
     game_slug = _scope_game(game_slug)
     conn = get_conn()
-    if game_slug:
-        conn.execute("DELETE FROM installed_mods WHERE id=? AND game_slug=?", (mod_id, game_slug))
-        conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
-        conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
-    else:
-        conn.execute("DELETE FROM installed_mods WHERE id=?", (mod_id,))
-        conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=?", (mod_id,))
-        conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=?", (mod_id,))
-    _log(conn, "uninstall", json.dumps({"mod_id": mod_id, "game_slug": game_slug}))
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            if game_slug:
+                conn.execute("DELETE FROM installed_mods WHERE id=? AND game_slug=?", (mod_id, game_slug))
+                conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
+                conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
+            else:
+                conn.execute("DELETE FROM installed_mods WHERE id=?", (mod_id,))
+                conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=?", (mod_id,))
+                conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=?", (mod_id,))
+            _log(conn, "uninstall", json.dumps({"mod_id": mod_id, "game_slug": game_slug}))
+    finally:
+        conn.close()
 
 
 def get_mod(mod_id: str, game_slug: str = "") -> Optional[InstalledMod]:
@@ -261,14 +322,86 @@ def get_installed_mods(game_slug: str = "") -> list:
 
 
 def _installed_file_signature(value) -> tuple[str, ...]:
-    try:
-        files = json.loads(value) if isinstance(value, str) else (value or [])
-    except (TypeError, ValueError, json.JSONDecodeError):
-        files = []
+    files = _installed_files(value)
     return tuple(sorted({
         os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
         for path in files if str(path or "").strip()
     }))
+
+
+def _installed_files(value) -> list:
+    try:
+        files = json.loads(value) if isinstance(value, str) else (value or [])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        files = []
+    return files if isinstance(files, list) else []
+
+
+def _inventory_name_key(value: str) -> str:
+    """Stable comparison key for a recorded package name, not a search key.
+
+    ``mod_install_custom`` uses a readable archive-based id/name while a
+    scanner may later obtain the loader manifest name.  Strip only generated
+    prefixes and punctuation; this helper is intentionally conservative and
+    is used together with a shared physical file requirement below.
+    """
+    text = str(value or "").casefold()
+    text = re.sub(r"^custom_(?:\d+_){1,5}", "", text)
+    text = re.sub(r"^local_[a-f0-9]{8}_?", "", text)
+    text = re.sub(r"\b(?:v?\d+(?:[._-]\d+)+|unknown)\b", "", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _unreal_variant_family(files) -> tuple[tuple[str, ...], str] | tuple[(), str]:
+    """Return a conservative local family key for loose Unreal variants.
+
+    Historical manual installs lose the original archive boundary after the
+    files are copied into ``~mods``.  We may only recover it from filenames
+    when every row is an imported, unbound local row and at least three
+    variants share the same specific prefix.  This helper merely extracts that
+    prefix; the caller applies the safety conditions.
+    """
+    stems = set()
+    for path in files or []:
+        filename = os.path.basename(str(path or ""))
+        if filename.casefold().endswith(".disabled"):
+            filename = filename[:-len(".disabled")]
+        stem, ext = os.path.splitext(filename)
+        if ext.casefold() not in {".pak", ".ucas", ".utoc"}:
+            continue
+        stem = re.sub(r"(?i)(?:[_\-.]p)$", "", stem).strip()
+        if stem:
+            stems.add(stem)
+    # One flat scanner row should represent one .pak/.ucas/.utoc triplet.  A
+    # row with several stems may already be a real package and must not be
+    # folded into a guessed family.
+    if len(stems) != 1:
+        return (), ""
+    tokens = re.findall(r"[A-Za-z0-9]+", next(iter(stems)))
+    if len(tokens) < 4:
+        return (), ""
+    key = tuple(token.casefold() for token in tokens[:3])
+    return key, " ".join(tokens[:3])
+
+
+def _same_package_identity(canonical, alias, signatures, game_slug: str) -> bool:
+    """Match a scanned alias only when both name and physical evidence agree."""
+    canonical_files = signatures.get(
+        (game_slug, str(canonical["id"])), frozenset()
+    )
+    alias_files = signatures.get((game_slug, str(alias["id"])), frozenset())
+    if not (canonical_files & alias_files):
+        return False
+    first = _inventory_name_key(canonical["name"])
+    second = _inventory_name_key(alias["name"])
+    # Prefix matching handles an archive title such as
+    # ``Generic_Mod_Config_Menu_(GMCM)`` vs the manifest's
+    # ``GenericModConfigMenu``.  A 12-character floor keeps generic labels
+    # such as "config" or "patch" from collapsing unrelated packages.
+    return (
+        min(len(first), len(second)) >= 12
+        and (first.startswith(second) or second.startswith(first))
+    )
 
 
 def merge_duplicate_inventory_rows(game_slug: str = "") -> list[dict]:
@@ -416,6 +549,80 @@ def merge_duplicate_inventory_rows(game_slug: str = "") -> list[dict]:
         if len(owners) == 1:
             merge_alias(conn, owners[0], alias, "package_file_subset")
 
+    # A generic loader/manifest scan can include generated config files that
+    # were never part of the installation ledger.  The strict subset rule
+    # above intentionally does not cover that case.  When an imported row
+    # shares an actual installed file *and* both normalized package names are
+    # clearly the same, it is still only a metadata alias, not a second Mod.
+    for alias in rows:
+        alias_id = str(alias["id"])
+        if (
+            alias_id in removed_ids
+            or str(alias["installed_by"] or "") != "imported"
+        ):
+            continue
+        owners = [
+            row for row in authoritative
+            if _same_package_identity(row, alias, signatures, game_slug)
+        ]
+        if len(owners) == 1:
+            merge_alias(conn, owners[0], alias, "shared_file_matching_name")
+
+    # Recover a lost archive boundary for obvious loose Unreal variant packs.
+    # This is intentionally limited to *imported and unbound* rows: a source
+    # binding or a ModAgent installation ledger is stronger evidence than a
+    # filename prefix and must never be overwritten by this repair.
+    unreal_families: dict[tuple[str, ...], dict[str, object]] = {}
+    for row in rows:
+        row_id = str(row["id"])
+        if (
+            row_id in removed_ids
+            or row_id in bound_ids
+            or str(row["installed_by"] or "") != "imported"
+        ):
+            continue
+        # Keep the original filesystem spelling for the display label.  The
+        # normalized signature is intentionally lower-cased on Windows and
+        # would turn a friendly package title into "addon nier 03".
+        key, label = _unreal_variant_family(_installed_files(row["files_installed"]))
+        if not key:
+            continue
+        bucket = unreal_families.setdefault(key, {"label": label, "rows": []})
+        bucket["rows"].append(row)
+
+    for family in unreal_families.values():
+        members = [
+            row for row in family["rows"]
+            if str(row["id"]) not in removed_ids
+        ]
+        # Do not guess a package from only a pair of similar files.  Three
+        # independent components sharing the exact prefix is the threshold
+        # used by the disk scanner as well.
+        if len(members) < 3:
+            continue
+        canonical = min(members, key=lambda row: float(row["installed_at"] or 0))
+        canonical_id = str(canonical["id"])
+        union_files = sorted({
+        path
+        for row in members
+        for path in _installed_files(row["files_installed"])
+            if str(path or "").strip()
+        })
+        conn.execute(
+            "UPDATE installed_mods SET name=?, files_installed=? WHERE game_slug=? AND id=?",
+            (str(family["label"]), json.dumps(union_files), game_slug, canonical_id),
+        )
+        signatures[(game_slug, canonical_id)] = frozenset(
+            _installed_file_signature(union_files)
+        )
+        # ``merge_alias`` also transfers any cached presentation metadata; it
+        # never touches the actual game files.
+        canonical_record = dict(canonical)
+        canonical_record["name"] = str(family["label"])
+        for alias in members:
+            if str(alias["id"]) != canonical_id:
+                merge_alias(conn, canonical_record, alias, "unreal_variant_family")
+
     if merged:
         _log(conn, "inventory_alias_merge", json.dumps({
             "game_slug": game_slug,
@@ -424,6 +631,116 @@ def merge_duplicate_inventory_rows(game_slug: str = "") -> list[dict]:
     conn.commit()
     conn.close()
     return merged
+
+
+def merge_mod_rows_as_package(
+    game_slug: str, mod_ids: list[str], package_name: str,
+) -> dict:
+    """Persist a user-confirmed local package boundary.
+
+    This is deliberately metadata-only: selected inventory rows become one
+    management row with the union of their files.  No game file is moved,
+    renamed, enabled, disabled or deleted.  Future flat scans are absorbed by
+    the existing package-subset repair rule, so the user does not need to
+    repeat the merge after moving a Steam library.
+    """
+    game_slug = _scope_game(game_slug)
+    selected = list(dict.fromkeys(str(item or "").strip() for item in mod_ids))
+    selected = [item for item in selected if item]
+    label = re.sub(r"\s+", " ", str(package_name or "").strip())[:160]
+    if not game_slug:
+        raise ValueError("missing_game_scope")
+    if len(selected) < 2:
+        raise ValueError("package_merge_requires_two_mods")
+    if not label:
+        raise ValueError("package_merge_requires_name")
+
+    conn = get_conn()
+    try:
+        placeholders = ",".join("?" for _ in selected)
+        rows = conn.execute(
+            f"SELECT * FROM installed_mods WHERE game_slug=? AND id IN ({placeholders})",
+            (game_slug, *selected),
+        ).fetchall()
+        if len(rows) != len(selected):
+            raise ValueError("package_merge_mod_not_found")
+        if any(
+            str(row["installed_by"] or "") == "steam_workshop"
+            or str(row["id"] or "").startswith("ws_")
+            for row in rows
+        ):
+            raise ValueError("package_merge_workshop_not_supported")
+
+        files = sorted({
+            str(path)
+            for row in rows
+            for path in _installed_files(row["files_installed"])
+            if str(path or "").strip()
+        })
+        if not files:
+            raise ValueError("package_merge_no_files")
+        canonical = min(rows, key=lambda row: float(row["installed_at"] or 0))
+        canonical_id = str(canonical["id"])
+        alias_ids = [str(row["id"]) for row in rows if str(row["id"]) != canonical_id]
+
+        # A group may only retain a public source binding when every selected
+        # row points at the same upstream project.  Otherwise calling it a
+        # verified source would be misleading; users can align the new package
+        # later after they choose the intended canonical source.
+        bindings = conn.execute(
+            f"SELECT * FROM mod_source_bindings WHERE game_slug=? AND mod_id IN ({placeholders})",
+            (game_slug, *selected),
+        ).fetchall()
+        identities = {
+            (str(row["source"]), str(row["source_key"]), str(row["source_url"]))
+            for row in bindings
+        }
+        conn.execute(
+            f"DELETE FROM mod_source_bindings WHERE game_slug=? AND mod_id IN ({placeholders})",
+            (game_slug, *selected),
+        )
+        conn.execute(
+            f"DELETE FROM mod_catalog_notes WHERE game_slug=? AND mod_id IN ({placeholders})",
+            (game_slug, *selected),
+        )
+        conn.execute(
+            "UPDATE installed_mods SET name=?, files_installed=?, installed_by=? "
+            "WHERE game_slug=? AND id=?",
+            (label, json.dumps(files, ensure_ascii=False), "package_group", game_slug, canonical_id),
+        )
+        if alias_ids:
+            aliases = ",".join("?" for _ in alias_ids)
+            conn.execute(
+                f"DELETE FROM installed_mods WHERE game_slug=? AND id IN ({aliases})",
+                (game_slug, *alias_ids),
+            )
+        if len(identities) == 1 and bindings:
+            binding = bindings[0]
+            conn.execute(
+                """
+                INSERT INTO mod_source_bindings
+                (game_slug,mod_id,source,source_key,source_url,confidence,
+                 match_method,latest_version,metadata,bound_at,last_checked_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (game_slug, canonical_id, binding["source"], binding["source_key"],
+                 binding["source_url"], binding["confidence"], binding["match_method"],
+                 binding["latest_version"], binding["metadata"], binding["bound_at"],
+                 binding["last_checked_at"]),
+            )
+        _log(conn, "package_merge", json.dumps({
+            "game_slug": game_slug, "kept_id": canonical_id,
+            "merged_ids": selected, "name": label, "file_count": len(files),
+            "source_retained": len(identities) == 1 and bool(bindings),
+        }, ensure_ascii=False))
+        conn.commit()
+        return {
+            "id": canonical_id, "name": label, "merged_count": len(rows),
+            "file_count": len(files),
+            "source_retained": len(identities) == 1 and bool(bindings),
+        }
+    finally:
+        conn.close()
 
 
 def upsert_mod_source_binding(
@@ -440,31 +757,71 @@ def upsert_mod_source_binding(
     game_slug = _scope_game(game_slug)
     now = time.time()
     conn = get_conn()
-    conn.execute(
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO mod_source_bindings
+                (game_slug,mod_id,source,source_key,source_url,confidence,match_method,
+                 latest_version,metadata,bound_at,last_checked_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(game_slug,mod_id) DO UPDATE SET
+                  source=excluded.source,
+                  source_key=excluded.source_key,
+                  source_url=excluded.source_url,
+                  confidence=excluded.confidence,
+                  match_method=excluded.match_method,
+                  latest_version=excluded.latest_version,
+                  metadata=excluded.metadata,
+                  last_checked_at=excluded.last_checked_at
+                """,
+                (
+                    str(game_slug or ""), str(mod_id), str(source), str(source_key),
+                    str(source_url or ""), float(confidence or 0),
+                    str(match_method or ""), str(latest_version or ""),
+                    json.dumps(metadata or {}, ensure_ascii=False), now, now,
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def backfill_custom_nexus_bindings(game_slug: str = "") -> list[dict]:
+    """Recover source bindings for legacy ModAgent custom Nexus installs.
+
+    Older custom-install IDs preserve the stable ``custom_<mod>_<file>_``
+    prefix but were not bound because Nexus provenance was mistakenly ignored.
+    This is a metadata-only repair; no file is scanned, moved, or changed.
+    """
+    game_slug = _scope_game(game_slug)
+    if not game_slug or str(game_slug).startswith("local_"):
+        return []
+    conn = get_conn()
+    rows = conn.execute(
         """
-        INSERT INTO mod_source_bindings
-        (game_slug,mod_id,source,source_key,source_url,confidence,match_method,
-         latest_version,metadata,bound_at,last_checked_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(game_slug,mod_id) DO UPDATE SET
-          source=excluded.source,
-          source_key=excluded.source_key,
-          source_url=excluded.source_url,
-          confidence=excluded.confidence,
-          match_method=excluded.match_method,
-          latest_version=excluded.latest_version,
-          metadata=excluded.metadata,
-          last_checked_at=excluded.last_checked_at
+        SELECT m.id, m.version
+        FROM installed_mods AS m
+        LEFT JOIN mod_source_bindings AS b
+          ON b.game_slug=m.game_slug AND b.mod_id=m.id
+        WHERE m.game_slug=? AND b.mod_id IS NULL
         """,
-        (
-            str(game_slug or ""), str(mod_id), str(source), str(source_key),
-            str(source_url or ""), float(confidence or 0),
-            str(match_method or ""), str(latest_version or ""),
-            json.dumps(metadata or {}, ensure_ascii=False), now, now,
-        ),
-    )
-    conn.commit()
+        (game_slug,),
+    ).fetchall()
     conn.close()
+    repaired = []
+    for row in rows:
+        match = re.match(r"^custom_(\d+)_(\d+)(?:_|$)", str(row["id"] or ""))
+        if not match:
+            continue
+        mod_key, file_id = match.groups()
+        upsert_mod_source_binding(
+            game_slug, str(row["id"]), "nexus", mod_key,
+            f"https://www.nexusmods.com/{game_slug}/mods/{mod_key}",
+            0.98, "legacy_custom_download_provenance",
+            str(row["version"] or ""), {"file_id": file_id},
+        )
+        repaired.append({"mod_id": str(row["id"]), "source_key": mod_key})
+    return repaired
 
 
 def delete_mod_source_binding(
@@ -633,14 +990,27 @@ def get_mod_by_source(game_slug: str, source: str, source_key: str) -> Optional[
     return InstalledMod(**dict(row)) if row else None
 
 
-def get_shared_files(mod_id: str, files: list, game_slug: str = "") -> set:
+def get_shared_files(mod_id: str, files: list, game_slug: str = "", *, game_root: str = "") -> set:
     """返回 files 中【也被除 mod_id 外的其他已装 mod 拥有】的文件集合。
     用于卸载保护:这些是共享文件,卸载本 mod 时不应从磁盘删除。
     返回值为 normcase 后的绝对路径集合,便于调用方比对。
     """
     import os as _os
     import json as _json
-    target = {_os.path.normcase(_os.path.abspath(f)) for f in (files or [])}
+    def path_key(path):
+        if not game_root:
+            return _os.path.normcase(_os.path.abspath(path))
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("Invalid file ownership record")
+        root = _os.path.normcase(_os.path.realpath(game_root))
+        candidate = path if _os.path.isabs(path) else _os.path.join(game_root, path)
+        key = _os.path.normcase(_os.path.realpath(candidate))
+        if _os.path.commonpath([root, key]) != root or key == root:
+            raise ValueError("File ownership record is outside the game")
+        return key
+    # A captured root opts into strict update checks: resolve relative/alias
+    # paths and never treat unreadable ownership metadata as an empty inventory.
+    target = {path_key(f) for f in (files or [])}
     if not target:
         return set()
     shared = set()
@@ -651,9 +1021,13 @@ def get_shared_files(mod_id: str, files: list, game_slug: str = "") -> set:
             other = m.files_installed
             other = _json.loads(other) if isinstance(other, str) else (other or [])
         except Exception:
+            if game_root:
+                raise ValueError("Unreadable file ownership record") from None
             other = []
+        if game_root and not isinstance(other, list):
+            raise ValueError("Invalid file ownership list")
         for f in other:
-            key = _os.path.normcase(_os.path.abspath(f))
+            key = path_key(f)
             if key in target:
                 shared.add(key)
     return shared
@@ -849,11 +1223,35 @@ def _log(conn: sqlite3.Connection, action: str, details: str):
 
 def log_operation(action: str, details) -> None:
     """记录不隶属于单一 CRUD 的用户可见操作（如快照回滚）。"""
-    conn = get_conn()
     payload = details if isinstance(details, str) else json.dumps(details, ensure_ascii=False)
-    _log(conn, action, payload)
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        with conn:
+            _log(conn, action, payload)
+    finally:
+        conn.close()
+
+
+def pending_snapshot_inventory_cleanup(snapshot_id: str, game_scope: str) -> list[str]:
+    """Read the latest matching receipt, never another game's cleanup request."""
+    conn = get_conn()
+    try:
+        for row in conn.execute(
+            "SELECT details FROM operation_log WHERE action=? ORDER BY id DESC",
+            ("snapshot_restore",),
+        ):
+            try:
+                data = json.loads(row[0])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict) or data.get("snapshot_id") != snapshot_id or data.get("game_instance_id") != game_scope:
+                continue
+            cleanup = data.get("inventory_cleanup") or {}
+            ids = cleanup.get("failed_mod_ids", []) if isinstance(cleanup, dict) else []
+            return [mid for mid in ids if isinstance(mid, str)] if isinstance(ids, list) else []
+        return []
+    finally:
+        conn.close()
 
 
 # ── Sessions ──

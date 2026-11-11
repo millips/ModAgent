@@ -4,7 +4,10 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import time
+import urllib.error
+from functools import wraps
 from typing import Optional
 
 from .config import Config, Tier, game_storage_id
@@ -13,7 +16,7 @@ from . import nexus
 from . import downloader
 from . import installer
 from . import snapshot
-from . import diagnostics
+from . import diagnostics as game_diagnostics
 from . import progress
 from . import patcher
 from . import user_config
@@ -41,6 +44,35 @@ _DOWNLOAD_PHASE_LABELS = {
     "verifying": "正在校验压缩包",
     "download_complete": "下载并校验完成",
 }
+_SOURCE_RETRY_DELAYS = (1.0, 3.0)
+
+
+def _is_transient_source_error(exc: Exception) -> bool:
+    if isinstance(exc, nexus.NexusSearchUnavailable):
+        return str(getattr(exc, "status", "")) == "source_unavailable"
+    if isinstance(exc, (TimeoutError, ConnectionResetError, ssl.SSLError, urllib.error.URLError)):
+        return True
+    message = str(exc or "").casefold()
+    transient_markers = (
+        "timed out", "timeout", "connection reset", "connection aborted",
+        "handshake operation", "temporarily unavailable", "tls handshake",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+def _source_call_with_retry(callable_, *args, enabled: bool = False, **kwargs):
+    """Retry one transient source independently; never retry auth/config gates."""
+    delays = _SOURCE_RETRY_DELAYS if enabled else ()
+    for attempt in range(len(delays) + 1):
+        try:
+            return callable_(*args, **kwargs)
+        except Exception as exc:
+            if attempt >= len(delays) or not _is_transient_source_error(exc):
+                raise
+            deadline = time.monotonic() + delays[attempt]
+            while time.monotonic() < deadline:
+                task_control.raise_if_cancelled()
+                time.sleep(min(.1, max(0.0, deadline - time.monotonic())))
 
 
 def _publish_download_phase(mod_id: str, phase: str, detail: str = "") -> None:
@@ -231,6 +263,7 @@ def refresh_local_inventory(cfg: Config) -> dict:
     if not root or not slug or not os.path.isdir(root):
         return {"detected": 0, "imported": 0}
     storage_id = str(getattr(cfg, "game_instance_id", "") or slug)
+    bindings_backfilled = db.backfill_custom_nexus_bindings(storage_id)
     aliases_merged = db.merge_duplicate_inventory_rows(storage_id)
     manual_roots = getattr(cfg, "manual_mod_dirs", {}) or {}
     extra = manual_roots.get(storage_id, manual_roots.get(slug, []))
@@ -238,8 +271,14 @@ def refresh_local_inventory(cfg: Config) -> dict:
         root, slug, "", extra, game_instance_id=storage_id,
     )
     result["imported"] = scanner.import_mods(result.get("identified", []))
+    # A scanner candidate can legitimately contain generated config/log files
+    # in addition to the files recorded at installation time.  Merge again
+    # after import so that such a row never survives one UI refresh as a
+    # duplicate of the ModAgent-installed package.
+    aliases_merged.extend(db.merge_duplicate_inventory_rows(storage_id))
     result["aliases_merged"] = aliases_merged
     result["aliases_merged_count"] = len(aliases_merged)
+    result["source_bindings_backfilled"] = bindings_backfilled
     return result
 
 
@@ -277,7 +316,13 @@ def _url_source_identity(url: str) -> tuple[str, str, str]:
 
 
 def _download_source_provenance(path: str, game_slug: str) -> dict:
-    """Return validated non-Nexus source identity carried by a download."""
+    """Return validated source identity carried by a ModAgent download.
+
+    Nexus archives deliberately carry only their numeric Mod ID in the local
+    download sidecar.  That is still a stable identity, so treating Nexus as
+    "unbound" after a successful ModAgent install loses provenance and makes
+    the next inventory scan look like a separate local Mod.
+    """
     metadata = downloader.read_download_provenance(path)
     if not metadata:
         return {}
@@ -287,13 +332,22 @@ def _download_source_provenance(path: str, game_slug: str) -> dict:
     source = str(metadata.get("source") or "").casefold()
     source_key = str(metadata.get("source_key") or "")
     source_url = str(metadata.get("source_url") or "")
+    if not source or not source_key:
+        return {}
     parsed_source, parsed_key, parsed_name = _url_source_identity(source_url)
-    if (
-        not source
-        or source == "nexus"
-        or source != parsed_source
-        or source_key != parsed_key
-    ):
+    if source == "nexus":
+        if not source_key.isdigit():
+            return {}
+        # The downloader records the exact numeric ID before an optional
+        # website/detail lookup.  Rebuild the canonical page URL locally when
+        # the sidecar predates source_url support.
+        if not source_url:
+            nexus_slug = recorded_game or str(game_slug or "")
+            if nexus_slug and not nexus_slug.startswith("local_"):
+                source_url = (
+                    f"https://www.nexusmods.com/{nexus_slug}/mods/{source_key}"
+                )
+    elif source != parsed_source or source_key != parsed_key:
         return {}
     return {
         "source": source,
@@ -317,12 +371,12 @@ def _download_source_provenance(path: str, game_slug: str) -> dict:
     }
 
 
-def _bind_download_source(path: str, game_slug: str, mod_id: str) -> dict:
+def _bind_download_source(path: str, game_slug: str, mod_id: str, *, storage_slug: str = "") -> dict:
     provenance = _download_source_provenance(path, game_slug)
     if not provenance:
         return {}
     db.upsert_mod_source_binding(
-        game_slug,
+        storage_slug or game_slug,
         str(mod_id),
         provenance["source"],
         provenance["source_key"],
@@ -409,6 +463,7 @@ def build_tools_definitions(tier: str) -> list[dict]:
            ["query"]),
         _t("workshop_install", "订阅安装 Steam 创意工坊 mod（Steam 客户端会自动下载到本地）。⚠️ 安装前必须先征得用户确认。需要 Steam 客户端在运行且浏览器已登录 Steam。",
            {"workshop_id": {"type": "string", "description": "工坊物品 ID（纯数字）"},
+            "name": {"type": "string", "description": "可选：保留 workshop_search 或用户选中条目返回的标题，用于本地清单显示"},
             "dependencies": {"type": "array", "items": {"type": "string"},
                              "description": "可选：该 Mod 实际依赖的已安装本地 Mod ID"}},
            ["workshop_id"]),
@@ -607,11 +662,12 @@ def build_tools_definitions(tier: str) -> list[dict]:
             "include_config_metadata": {"type": "boolean", "description": "Reserve configuration metadata; config contents are never exported automatically."}}, []),
         _t("share_import", "Parse a pasted ModAgent share JSON, offline share link, GitHub Raw link, or Gist Raw link and return a reviewable installation preview. This tool NEVER installs, writes files, changes enabled state, or trusts dependencies without normal verification. Use it before preparing the normal installation plan.",
            {"share": {"type": "string", "description": "Pasted JSON, data: offline link, raw.githubusercontent.com link, or gist.githubusercontent.com link."}}, ["share"]),
-        _t("official_share_catalog", "Browse/search the reviewed official ModAgent collection library. Official collections have stable ma-xxxxxx IDs and are loaded from the project's GitHub Raw index. The list is read-only and does not install anything.",
+        _t("official_share_catalog", "Browse/search the reviewed official ModAgent collection library. Official collections have stable ma-xxxxxx IDs and are loaded from the project's GitHub Raw index with a GitHub API and verified local-cache fallback. The list is read-only and does not install anything.",
            {"query": {"type": "string", "description": "Optional title, tag, or collection ID search."},
             "all_games": {"type": "boolean", "description": "When true, do not filter by the currently selected game."}}, []),
         _t("official_share_import", "Open a reviewed official ma-xxxxxx collection and return its verification/install-plan preview. This NEVER installs automatically; normal source, dependency, conflict, loader, duplicate, and game compatibility checks remain mandatory.",
            {"share_id": {"type": "string", "description": "Official collection code, for example ma-repo-000001."}}, ["share_id"]),
+        _t("official_share_network_diagnostics", "Read-only diagnostics for the official collection library. Test GitHub Raw, the equivalent GitHub Contents API, and whether a verified local catalogue cache is available. Never changes installation, configuration, or credentials.", {}, []),
         _t("game_file_check", "只读诊断:检查游戏目录内某文件/文件夹是否存在,返回大小与修改时间;"
            "对文本文件可读取末尾若干行(如查看 SB/Binaries/Win64/ue4ss/UE4SS.log 判断 UE4SS 是否被游戏加载)。"
            "path 为相对游戏根目录的路径,禁止越界。",
@@ -708,6 +764,11 @@ def _execute_toggle_plan(
     mods, enabling: bool, game_slug: str = "", game_root: str = "",
 ) -> dict:
     """Preflight and execute a toggle chain; roll back newly renamed files on failure."""
+    if game_slug:
+        try:
+            user_config.preview_toggle_mod_configs(game_slug, [str(mod.id) for mod in mods])
+        except user_config.ExternalConfigRegistryUnreadable as exc:
+            return {"error_code": exc.code, "error": str(exc), "files_changed": False}
     issues = []
     for mod in mods:
         for tracked in _mod_files(mod):
@@ -756,16 +817,35 @@ def _execute_toggle_plan(
                 "details": details,
                 "rollback": rollback,
             }
-    config_result = user_config.toggle_mod_configs(
-        game_slug, [str(mod.id) for mod in mods], enabling=enabling,
-    ) if game_slug else {"complete": True, "changed": [], "failed": []}
+    try:
+        config_result = user_config.toggle_mod_configs(
+            game_slug, [str(mod.id) for mod in mods], enabling=enabling,
+        ) if game_slug else {"complete": True, "changed": [], "failed": []}
+    except Exception:
+        # The registry may become unreadable after preflight, or fail to save
+        # after an external file changed. An inverse toggle cannot establish
+        # the original state in either case; only undo known game-file moves.
+        rollback_files = (installer.disable_mod if enabling else installer.enable_mod)(
+            list(reversed(changed)), game_root,
+        )
+        return {
+            "error_code": "EXTERNAL_CONFIG_TOGGLE_UNCONFIRMED",
+            "error": "外部配置操作未确认；已尝试撤销本轮游戏文件改名。请检查外部配置与登记文件后再重试。 / External-config state is unconfirmed. Game-file rollback was attempted; inspect the external configuration and registry before retrying.",
+            "details": details,
+            "external_configs": {"complete": False, "state_unconfirmed": True},
+            "rollback": {"files": rollback_files, "external_configs": {"complete": False, "not_attempted": True}},
+        }
     if not config_result.get("complete"):
         rollback_files = (installer.disable_mod if enabling else installer.enable_mod)(
             list(reversed(changed)), game_root,
         )
-        rollback_config = user_config.toggle_mod_configs(
-            game_slug, [str(mod.id) for mod in mods], enabling=not enabling,
-        )
+        try:
+            rollback_config = user_config.toggle_mod_configs(
+                game_slug, [str(mod.id) for mod in mods], enabling=not enabling,
+            )
+        except Exception:
+            rollback_config = {"complete": False, "state_unconfirmed": True,
+                               "error_code": "EXTERNAL_CONFIG_ROLLBACK_UNCONFIRMED"}
         return {
             "error": "外部配置启停失败；已尝试撤销本轮文件改名，未将状态报告为完成。",
             "details": details, "external_configs": config_result,
@@ -774,6 +854,81 @@ def _execute_toggle_plan(
     return {"details": details, "external_configs": config_result}
 
 
+def _serialize_game_writes(function):
+    @wraps(function)
+    def wrapped(name, args, cfg):
+        if name in {"mod_install", "mod_install_custom", "mod_install_batch", "mod_uninstall",
+                    "mod_disable", "mod_enable", "mod_update", "snapshot_restore"}:
+            with task_control.game_write_scope(getattr(cfg, "game_root", "")):
+                return function(name, args, cfg)
+        task_control.raise_if_cancelled()
+        return function(name, args, cfg)
+    return wrapped
+
+
+def _install_conflict_receipt(exc, snapshot_id: str) -> dict:
+    """Preserve transaction recovery evidence without a destructive full restore."""
+    details = {}
+    if isinstance(exc, installer.InstallRollbackIncomplete):
+        details = {
+            "recovery_dir": exc.recovery_dir,
+            "recovery_files": exc.recovery_files,
+            "recovery_manifest_saved": exc.manifest_saved,
+        }
+    return {
+        "status": "installation_conflict", "install_blocked": True,
+        "error": str(exc), "error_code": exc.code,
+        "snapshot_id": snapshot_id, "snapshot_restore_skipped": True,
+        "recovery_required": True, "retryable": False, "files_installed": [],
+        **details,
+    }
+
+
+def _cleanup_installed_archive_safely(path: str) -> dict:
+    """Post-install cache maintenance must not invalidate a committed install."""
+    try:
+        receipt = downloader.cleanup_installed_archive(path)
+    except Exception:
+        receipt = None
+    if isinstance(receipt, dict) and (receipt.get("removed") is True or (
+        receipt.get("removed") is False and receipt.get("reason") in ("not_found", "user_managed_file")
+    )):
+        return receipt
+    return {
+        "status": "unconfirmed", "reason": "cleanup_failed",
+        "warning_code": "ARCHIVE_CLEANUP_UNCONFIRMED",
+        "warning": "下载缓存清理未确认。请稍后检查缓存，不要仅因此重复下载或安装。 / Download-cache cleanup is unconfirmed. Review the cache later; do not repeat downloads or installations solely for this warning.",
+    }
+
+
+def _restore_install_snapshot(snapshot_id: str) -> dict:
+    """Keep a failed recovery reportable; never infer success from an exception."""
+    try:
+        return snapshot.snapshot_restore(snapshot_id)
+    except Exception:
+        return {
+            "status": "incomplete", "complete": False,
+            "error_code": "INSTALL_ROLLBACK_FAILED",
+            "snapshot_id": snapshot_id,
+            "message": (
+                "安装后的自动恢复未完成，当前文件状态未确认。请保留快照，检查后再重试。 / "
+                "Automatic recovery failed; the current file state is unconfirmed. "
+                "Keep the snapshot and review before retrying."
+            ),
+        }
+
+
+def _install_failure_message(reason: str, rollback: dict) -> str:
+    recovery = (
+        "已恢复安装前快照。 / The pre-install snapshot was restored."
+        if rollback.get("complete") else
+        "自动恢复未完成，文件状态待核对；请保留快照并检查后再重试。 / "
+        "Automatic recovery is incomplete; keep the snapshot and review the files before retrying."
+    )
+    return reason + " " + recovery
+
+
+@_serialize_game_writes
 def execute(name: str, args: dict, cfg: Config) -> str:
     api_key = cfg.nexus_api_key
     slug = cfg.game_slug
@@ -840,13 +995,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         configured = canonical_loader(getattr(cfg, "mod_loader", ""))
         if configured:
             detected.append(configured)
-        checks = (
-            ("BepInEx", os.path.join(root, "BepInEx")),
-            ("MelonLoader", os.path.join(root, "MelonLoader")),
-            ("SMAPI", os.path.join(root, "StardewModdingAPI.exe")),
-        )
-        for loader, path in checks:
-            if os.path.exists(path) and loader not in detected:
+        from .runtime_detection import active_loaders as detect_active_loaders
+        for loader in detect_active_loaders(root):
+            if loader not in detected:
                 detected.append(loader)
         return detected
 
@@ -883,7 +1034,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         incompatible_loader = bool(
             required_loader and required_loader not in loaders
         )
-        installed = db.get_installed_mods(slug)
+        installed = db.get_installed_mods(storage_slug)
         installed_aliases = []
         for item in installed:
             installed_aliases.extend((
@@ -909,8 +1060,8 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 continue
             if label.isdigit():
                 found = (
-                    db.get_mod_by_source(slug, "nexus", label)
-                    or db.get_mod(label, slug)
+                    db.get_mod_by_source(storage_slug, "nexus", label)
+                    or db.get_mod(label, storage_slug)
                 )
             else:
                 wanted = dependency_key(label)
@@ -979,11 +1130,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
 
         bindings = {
             str(item.get("source_key") or "").casefold(): item
-            for item in db.get_mod_source_bindings(slug)
+            for item in db.get_mod_source_bindings(storage_slug)
             if item.get("source") == "thunderstore"
         }
         installed_by_id = {
-            str(item.id): item for item in db.get_installed_mods(slug)
+            str(item.id): item for item in db.get_installed_mods(storage_slug)
         }
 
         def dependency_spec(label: str) -> tuple[str, str]:
@@ -1207,13 +1358,19 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         extra_roots = manual_roots.get(
             storage_slug, manual_roots.get(slug, [])
         )
-        result = scanner.scan_existing_mods(
-            root, slug, api_key, extra_roots,
-            game_instance_id=storage_slug,
-        )
+        try:
+            result = scanner.scan_existing_mods(
+                root, slug, api_key, extra_roots,
+                game_instance_id=storage_slug,
+            )
+        except scanner.ScanDirectoryUnreadable as exc:
+            return json.dumps({
+                "status": "failed", "error_code": exc.code,
+                "error": str(exc),
+            }, ensure_ascii=False)
         identified = result.get("identified", [])
-        if identified:
-            scanner.import_mods(identified)
+        imported = scanner.import_mods(identified) if identified else 0
+        aliases_merged = db.merge_duplicate_inventory_rows(storage_slug)
         # Never inject thousands of absolute file paths into the model context.
         # The full inventory is already persisted; the tool response is a bounded report.
         public_items = [{
@@ -1225,9 +1382,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         } for item in identified[:500]]
         return json.dumps({
             "detected": result.get("detected", 0),
-            "imported": len(identified),
+            "imported": imported,
             "identified": public_items,
             "identified_total": len(identified),
+            "aliases_merged": aliases_merged,
+            "aliases_merged_count": len(aliases_merged),
             "truncated": len(identified) > len(public_items),
             "unidentified_count": len(result.get("unidentified") or []),
             "scanned_roots": result.get("scanned_roots", []),
@@ -1276,11 +1435,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             except Exception as e:
                 return json.dumps({"error": f"按 ID/链接获取详情失败: {e}"}, ensure_ascii=False)
         try:
-            results = nexus.search(
+            results = _source_call_with_retry(
+                nexus.search,
                 q, effective_slug, api_key,
                 cdp_port=cfg.chrome_cdp_port,
                 game_id=effective_gid,
                 tavily_key=cfg.tavily_api_key,
+                enabled=str(getattr(cfg, "agent_core_v2", "off")) == "on",
             )
         except nexus.NexusSearchUnavailable as e:
             return json.dumps({
@@ -1325,6 +1486,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "status": "ok",
             "searched": True,
             "source": "nexus",
+            "query": q,
             "game_slug": effective_slug,
             "tool_query_global_checked": nexus.is_tool_query(q),
             "results": [{
@@ -1404,6 +1566,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             "status": "ok",
             "searched": True,
             "source": "thunderstore",
+            "query": q,
             "community": comm,
             "attempts": attempts,
             "query_attempts": [q] if q else [],
@@ -1417,12 +1580,21 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not appid:
             return json.dumps({"error": "无法解析当前游戏的 Steam AppID（可能不是 Steam 安装，或未选游戏）"}, ensure_ascii=False)
         try:
-            results = asyncio.run(sw.search(args.get("query", ""), appid, cfg.chrome_cdp_port))
+            results = _source_call_with_retry(
+                lambda: asyncio.run(sw.search(args.get("query", ""), appid, cfg.chrome_cdp_port)),
+                enabled=str(getattr(cfg, "agent_core_v2", "off")) == "on",
+            )
+        except sw.SteamLoginRequired as e:
+            return json.dumps({"error": str(e), "status": "login_required", "source": "workshop"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": f"工坊搜索失败: {e}"}, ensure_ascii=False)
         if not results:
             return json.dumps({"appid": appid, "results": [], "note": "没搜到（或该游戏没有创意工坊内容）"}, ensure_ascii=False)
-        return json.dumps({"appid": appid, "results": results}, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "appid": appid,
+            "query": str(args.get("query") or "").strip(),
+            "results": results,
+        }, ensure_ascii=False, indent=2)
 
     elif name == "github_search":
         from .sources import github as gh
@@ -1430,15 +1602,18 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not q:
             return json.dumps({"error": "请提供搜索关键词"}, ensure_ascii=False)
         try:
-            results = gh.search(q, getattr(cfg, "game_name", "") or slug)
+            results = _source_call_with_retry(
+                gh.search, q, getattr(cfg, "game_name", "") or slug,
+                enabled=str(getattr(cfg, "agent_core_v2", "off")) == "on",
+            )
         except RuntimeError as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
         if not results:
             return json.dumps({"status": "search_empty",
-                               "note": f"GitHub 已先按当前游戏限定搜索，并自动用原关键词做全局回退；本次仍未搜到「{q}」相关仓库。这不等于仓库不存在。",
+                               "note": f"GitHub 本次未找到同时具有当前游戏与 Mod 证据的「{q}」仓库；普通功能搜索不会扩展到其他游戏。这不等于仓库不存在。",
                                "results": []}, ensure_ascii=False)
-        return json.dumps({"results": results,
-                           "note": "游戏限定为空时已自动回退全局搜索。结果可能混入非 mod 仓库(工具/教程),凭 summary/星数判断后再推荐;"
+        return json.dumps({"query": q, "results": results,
+                           "note": "仅明确指定的官方通用加载器可跨游戏查询；其他候选需具有当前游戏与功能证据。星数不能证明功能或兼容性。"
                                    "archived=true 表示作者已弃更。下载:download_from_url 直接吃仓库链接。"},
                           ensure_ascii=False, indent=1)
 
@@ -1446,18 +1621,25 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         from .sources import gamebanana as gb
         q = (args.get("query") or "").strip()
         game_name = getattr(cfg, "game_name", "") or ""
-        gid = gb.find_game(game_name)
+        try:
+            gid = gb.find_game(game_name)
+        except gb.GameDiscoveryFailed as exc:
+            return json.dumps({"error_code": "GAMEBANANA_DISCOVERY_FAILED",
+                               "error": str(exc)}, ensure_ascii=False)
         if not gid:
-            return json.dumps({"note": f"GameBanana 没匹配到游戏「{game_name}」(未收录或站点不可达),"
+            return json.dumps({"note": f"GameBanana 本次没有匹配到游戏「{game_name}」，"
                                        "换其他来源搜吧。", "results": []}, ensure_ascii=False)
         try:
-            results = gb.search(gid, q)
+            results = _source_call_with_retry(
+                gb.search, gid, q,
+                enabled=str(getattr(cfg, "agent_core_v2", "off")) == "on",
+            )
         except Exception as e:
             return json.dumps({"error": f"GameBanana 搜索失败: {e}"}, ensure_ascii=False)
         if not results:
             return json.dumps({"note": f"GameBanana 的「{game_name}」板块没搜到「{q}」。",
                                "results": [], "game_id": gid}, ensure_ascii=False)
-        return json.dumps({"game_id": gid, "results": results,
+        return json.dumps({"game_id": gid, "query": q, "results": results,
                            "note": "has_files=false 的条目没有可下载文件;下载:download_from_url 吃 url。"},
                           ensure_ascii=False, indent=1)
 
@@ -1480,6 +1662,16 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "subscription_skipped": True, "workshop_id": wid,
                 "installed_id": str(existing_workshop.id),
                 "name": existing_workshop.name,
+                "results": [{
+                    "mod_id": "ws_" + wid,
+                    "name": existing_workshop.name,
+                    "ok": True,
+                    "status": "already_installed",
+                    "version": existing_workshop.version or "",
+                    "files_installed": [],
+                    "dependencies": [],
+                    "warnings": [],
+                }],
                 "message": "该创意工坊项目已在当前游戏中，未重复订阅。",
             }, ensure_ascii=False)
         explicit_deps = None
@@ -1491,31 +1683,89 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                                    "missing_dependencies": missing_deps}, ensure_ascii=False)
         try:
             sub = asyncio.run(sw.subscribe(wid, appid, cfg.chrome_cdp_port))
+        except sw.SteamLoginRequired as e:
+            return json.dumps({"error": str(e), "status": "login_required", "source": "workshop"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": f"订阅失败: {e}"}, ensure_ascii=False)
         if not sub.get("ok"):
+            if sub.get("error") == "no_session" or sub.get("status") == 401:
+                return json.dumps({"error": "需要检查 Steam 网页登录后重试订阅", "status": "login_required", "source": "workshop"}, ensure_ascii=False)
             return json.dumps({"error": f"订阅失败（status={sub.get('status')} {sub.get('error', '')}）。请确认 Chrome 已登录 Steam 且账号拥有该游戏。"}, ensure_ascii=False)
         key = "ws_" + wid
+        requested_name = str(args.get("name") or args.get("title") or "").strip()
+        # Preserve the title from the selected result. If it was not supplied,
+        # resolve Steam's public metadata as a best-effort fallback only.
+        if not requested_name:
+            try:
+                requested_name = str(sw.get_titles([wid]).get(wid) or "").strip()
+            except Exception:
+                requested_name = ""
+        display_name = requested_name or f"Workshop {wid}"
         progress.start([{
             "mod_id": key,
-            "name": f"工坊项目 {wid}",
+            "name": display_name,
             "source": "workshop",
         }])
         progress.set_status(key, "downloading")
-        dl = asyncio.run(sw.wait_for_download(root, appid, wid, timeout=180,
+        # Steam accepts a subscription immediately, but its client can take
+        # much longer to transfer large Workshop content.  Keep the common
+        # fast path responsive; afterwards report a pending subscription.
+        dl = asyncio.run(sw.wait_for_download(root, appid, wid, timeout=45,
                                               progress_callback=lambda f: progress.set_pct(key, int(f * 100))))
         progress.set_status(key, "done" if dl.get("downloaded") else "failed",
                             "" if dl.get("downloaded") else "Steam 未在限时内下完，请确认 Steam 客户端在运行")
         progress.finish()
+        if not dl.get("downloaded"):
+            # Steam accepted the subscription, but it has not installed the
+            # content yet. Never create a fake installed record in this state.
+            return json.dumps({
+                "status": "steam_download_pending",
+                "workshop_id": wid,
+                "name": display_name,
+                "subscribed": True,
+                "downloaded": False,
+                "path": dl.get("path", ""),
+                "files": 0,
+                "results": [{
+                    "mod_id": key,
+                    "name": display_name,
+                    "ok": False,
+                    "status": "steam_download_pending",
+                    "version": "",
+                    "files_installed": [],
+                    "dependencies": explicit_deps or [],
+                    "warnings": ["Steam subscription accepted; content directory is not ready"],
+                    "error": "Steam did not finish within 45 seconds; keep Steam running and rescan later.",
+                }],
+                "message": "Steam subscription accepted but download is still pending; no installed record was written.",
+                "user_action": "Keep Steam running. When its download finishes, click Scan Existing Mods.",
+            }, ensure_ascii=False)
+        try:
+            from .scanner import _workshop_local_meta
+            local_name, local_version = _workshop_local_meta(str(dl.get("path") or ""))
+            display_name = local_name or display_name
+        except Exception:
+            local_version = ""
         mod = db.InstalledMod(
-            id=key, name=f"Workshop {wid}", version="", snapshot_id="",
+            id=key, name=display_name, version=local_version, snapshot_id="",
             load_order=db.get_max_load_order(slug) + 1, file_id=int(wid) if wid.isdigit() else 0,
             files_installed=json.dumps(dl.get("files", [])),
             dependencies=json.dumps(explicit_deps or []),
             installed_by="steam_workshop", game_slug=slug)
         db.add_mod(mod)
-        return json.dumps({"workshop_id": wid, "subscribed": True, "downloaded": dl.get("downloaded", False),
+        return json.dumps({"status": "completed", "workshop_id": wid, "name": display_name,
+                           "subscribed": True, "downloaded": True,
                            "files": len(dl.get("files", [])), "path": dl.get("path", ""),
+                           "results": [{
+                               "mod_id": key,
+                               "name": display_name,
+                               "ok": True,
+                               "status": "installed",
+                               "version": local_version,
+                               "files_installed": dl.get("files", []),
+                               "dependencies": explicit_deps or [],
+                               "warnings": [],
+                           }],
                            "note": "工坊 mod 由 Steam 管理,存放在 steamapps\\workshop\\content\\ 下,不在游戏目录;"
                                    "撤销方式是退订(workshop_uninstall)。快照会记录订阅清单,回滚时自动同步订阅状态。"},
                           ensure_ascii=False)
@@ -1550,8 +1800,14 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             }, ensure_ascii=False)
         preflight = _refresh_local_inventory(cfg)
         source_name, source_key, name_hint = _url_source_identity(url)
+        expected_version = str(args.get("expected_version") or "").strip()
         existing = _installed_duplicate(slug, source_name, source_key, name_hint) if source_key else None
         if existing:
+            if expected_version and str(existing.version or "") != expected_version:
+                return json.dumps({"status": "plan_revalidation_required",
+                    "error": "installed_version_differs", "expected_version": expected_version,
+                    "installed_version": existing.version, "download_skipped": True,
+                    "message": "已装版本与所选版本不同，不能标记为已完成；请核验更新计划。"}, ensure_ascii=False)
             if not db.get_mod_by_source(slug, source_name, source_key):
                 db.upsert_mod_source_binding(
                     slug, str(existing.id), source_name, source_key, url,
@@ -1573,6 +1829,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 return json.dumps({"error": f"GitHub 链接解析失败: {gh_meta['error']}。"
                                    f"你也可以直接粘贴 releases 页面里 .zip 资产的下载地址。"}, ensure_ascii=False)
             url = gh_meta["url"]
+            if expected_version and str(gh_meta.get("version") or "") != expected_version:
+                return json.dumps({"status": "plan_revalidation_required",
+                    "error": "selected_version_changed", "expected_version": expected_version,
+                    "available_version": gh_meta.get("version"), "download_skipped": True,
+                    "message": "来源版本与所选版本不同，已停止下载，请重新核验计划。"}, ensure_ascii=False)
         key = "url"
         progress.start([{
             "mod_id": key,
@@ -1581,7 +1842,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         }])
         progress.set_status(key, "downloading")
         try:
-            r = sources.download_from_url(url, slug, progress_callback=lambda f: progress.set_pct(key, int(f * 100)))
+            version_args = ({"expected_version": expected_version}
+                            if source_name == "thunderstore" and expected_version else {})
+            r = sources.download_from_url(url, slug, progress_callback=lambda f: progress.set_pct(key, int(f * 100)), **version_args)
         except Exception as e:
             progress.set_status(key, "failed", str(e))
             progress.finish()
@@ -1660,7 +1923,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if already:
             cached_path = find_download(_mid, args.get("file_id"))
             cache_cleanup = (
-                downloader.cleanup_installed_archive(cached_path)
+                _cleanup_installed_archive_safely(cached_path)
                 if cached_path else {"removed": False, "reason": "not_found"}
             )
             return json.dumps({
@@ -1691,8 +1954,20 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not nexus_gid:
             return json.dumps({
                 "error": "nexus_game_id_missing",
+                "status": "nexus_game_id_missing",
                 "nexus_slug": nexus_slug,
                 "note": "无法解析该 Nexus 来源的数字 game_id，已在打开下载页之前停止，避免重复开页。请稍后重试或检查 Nexus API Key。",
+                "stop_further_downloads": True,
+                "continue_other_items": False,
+            }, ensure_ascii=False)
+        if not api_key:
+            return json.dumps({
+                "error": "nexus_api_key_missing",
+                "status": "nexus_api_key_missing",
+                "nexus_slug": nexus_slug,
+                "message": "Nexus 下载需要用户在设置中填写自己的 Nexus API Key。本轮未打开下载页、未写入任何游戏文件。",
+                "stop_further_downloads": True,
+                "continue_other_items": False,
             }, ensure_ascii=False)
         # A local import initially has no Nexus ID. Resolve only the requested
         # item and use a strict name match to prevent installing a second copy.
@@ -1716,7 +1991,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             )
             cached_path = find_download(_mid, args.get("file_id"))
             cache_cleanup = (
-                downloader.cleanup_installed_archive(cached_path)
+                _cleanup_installed_archive_safely(cached_path)
                 if cached_path else {"removed": False, "reason": "not_found"}
             )
             return json.dumps({
@@ -1903,7 +2178,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     "mod_id": mid, "installed_id": str(installed.id),
                     "name": installed.name, "version": installed.version,
                     "cache_cleanup": (
-                        downloader.cleanup_installed_archive(cached_path)
+                        _cleanup_installed_archive_safely(cached_path)
                         if cached_path else {"removed": False, "reason": "not_found"}
                     ),
                 })
@@ -1925,6 +2200,31 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "error": "game_mapping_missing",
                 "status": discovery.get("status", "not_detected"),
                 "reason": discovery.get("reason", "Nexus game page was not resolved"),
+            }, ensure_ascii=False)
+        if not nexus_gid:
+            return json.dumps({
+                "error": "nexus_game_id_missing",
+                "status": "nexus_game_id_missing",
+                "nexus_slug": nexus_slug,
+                "failed": [{
+                    "mod_id": item.get("mod_id"),
+                    "status": "nexus_game_id_missing",
+                } for item in mods],
+                "message": "无法解析当前游戏的 Nexus 数字 game_id。本批次未打开下载页、未开始下载。",
+                "stop_further_downloads": True,
+                "continue_other_items": False,
+            }, ensure_ascii=False)
+        if not api_key:
+            return json.dumps({
+                "error": "nexus_api_key_missing",
+                "status": "nexus_api_key_missing",
+                "failed": [{
+                    "mod_id": item.get("mod_id"),
+                    "status": "nexus_api_key_missing",
+                } for item in mods],
+                "message": "Nexus 下载需要用户在设置中填写自己的 Nexus API Key。本批次未打开下载页、未开始下载。",
+                "stop_further_downloads": True,
+                "continue_other_items": False,
             }, ensure_ascii=False)
         success, failed = [], []
         progress.start([{
@@ -2187,12 +2487,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             }, ensure_ascii=False, indent=2)
         # 整批共享一张安装前快照(治 22 连发时每装一个拍一张的浪费)
         try:
-            batch_snap = snapshot.snapshot_create(root, slug,
+            batch_snap = snapshot.snapshot_create(root, storage_slug,
                                                   trigger_mod_name=f"批量安装 {len(resolved_items)} 个前")
         except (ValueError, FileNotFoundError, RuntimeError) as e:
             return json.dumps({"error": f"批量安装前快照失败,安装未开始: {e}"}, ensure_ascii=False)
         results = []
-        for item in resolved_items:
+        batch_stopped = False
+        for item_index, item in enumerate(resolved_items):
             task_control.raise_if_cancelled()
             mid = item["mod_id"]
             local_path = item["local_path"]
@@ -2200,9 +2501,27 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "mod_id": mid,
                 "snapshot_id": batch_snap,
                 "local_path": local_path,
+                "require_verified_preflight": bool(
+                    args.get("require_verified_preflight")
+                ),
+                "_batch_preflight_approved": bool(
+                    args.get("_batch_preflight_approved")
+                ),
             }
             r = json.loads(execute("mod_install", call_args, cfg))
-            if "error" in r or r.get("status") == "installation_guidance_required":
+            if (
+                "error" in r
+                or r.get("install_blocked")
+                or r.get("status") in {
+                    "installation_guidance_required",
+                    "preinstall_confirmation_required",
+                    "compatibility_confirmation_required",
+                    "missing_dependencies",
+                    "dependency_blocked",
+                    "conflict_blocked",
+                    "download_incomplete",
+                }
+            ):
                 results.append({
                     "mod_id": mid,
                     "file_id": item.get("file_id"),
@@ -2216,6 +2535,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                         r if r.get("status") == "installation_guidance_required"
                         else {}
                     ),
+                    **({"rollback": r["rollback"],
+                        "rollback_complete": bool(r.get("rollback_complete"))}
+                       if isinstance(r.get("rollback"), dict) else {}),
+                    **{key: r[key] for key in (
+                        "error_code", "recovery_required", "snapshot_restore_skipped",
+                        "recovery_dir", "recovery_files", "recovery_manifest_saved",
+                    ) if key in r},
                 })
             else:
                 verification = r.get("verification_report") or {}
@@ -2243,6 +2569,57 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     "cache_cleanup": r.get("cache_cleanup") or {},
                     "status": r.get("status", "installed"),
                 })
+            if isinstance(r.get("rollback"), dict) or r.get("recovery_required"):
+                # Stop after either shared-snapshot recovery or a preserved
+                # transaction conflict. Only the former invalidates prior writes.
+                batch_stopped = True
+                rollback = r.get("rollback") or {}
+                baseline = rollback.get("inventory_mod_ids")
+                verified = {os.path.normcase(os.path.abspath(path)) for path in (
+                    rollback.get("reverted_files", [])
+                    + rollback.get("verified_snapshot_files", [])
+                )}
+                for prior in (results[:-1] if rollback else []):
+                    paths = prior.get("files_installed") or []
+                    if not prior.get("ok") or not paths:
+                        continue  # Already-installed/skipped items were not written.
+                    reconciled = False
+                    if (rollback.get("complete") and isinstance(baseline, list)
+                            and str(prior["mod_id"]) not in baseline
+                            and all(os.path.normcase(os.path.abspath(p)) in verified for p in paths)):
+                        try:
+                            row = db.get_mod(str(prior["mod_id"]), storage_slug)
+                            if row is None:
+                                reconciled = True
+                            elif row.snapshot_id == batch_snap:
+                                db.remove_mod(str(prior["mod_id"]), storage_slug)
+                                reconciled = True
+                        except Exception:
+                            reconciled = False
+                    prior.update({
+                        "ok": False,
+                        "status": "rolled_back" if reconciled else "rollback_unconfirmed",
+                        "error": (
+                            "后续项目失败，本项已随整批快照撤回。 / A later item failed; this item was rolled back."
+                            if reconciled else
+                            "整批恢复或记录核对未完成，请检查后再重试。 / Batch recovery or inventory reconciliation is incomplete; review before retrying."
+                        ),
+                        "attempted_files": paths,
+                        "files_installed": [],
+                        "files": 0,
+                        "inventory_reconciled": reconciled,
+                    })
+                for pending in resolved_items[item_index + 1:]:
+                    results.append({
+                        "mod_id": pending["mod_id"],
+                        "file_id": pending.get("file_id"),
+                        "variant_id": pending.get("variant_id"),
+                        "variant_name": pending.get("variant_name"),
+                        "target_slot": pending.get("target_slot"),
+                        "ok": False, "status": "not_attempted",
+                        "error": "批量安装已停止，尚未尝试。 / Not attempted because batch installation stopped.",
+                    })
+                break
         ok_n = sum(1 for r in results if r["ok"])
         failed_n = len(results) - ok_n
         return json.dumps({
@@ -2252,6 +2629,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                                "failed"
                            ),
                            "snapshot_id": batch_snap,
+                           "batch_stopped": batch_stopped,
                            "total": len(results), "succeeded": ok_n,
                            "failed": failed_n,
                            "all_selected_installed": failed_n == 0,
@@ -2263,11 +2641,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             return json.dumps({"error": "当前层级不支持安装"}, ensure_ascii=False)
         mid = args.get("mod_id")
         if mid not in (None, ""):
-            installed = db.get_mod(str(mid), slug) or db.get_mod_by_source(slug, "nexus", str(mid))
+            installed = db.get_mod(str(mid), storage_slug) or db.get_mod_by_source(storage_slug, "nexus", str(mid))
             if installed:
                 supplied_path = args.get("local_path") or find_download(mid)
                 cache_cleanup = (
-                    downloader.cleanup_installed_archive(supplied_path)
+                    _cleanup_installed_archive_safely(supplied_path)
                     if supplied_path else {"removed": False, "reason": "not_found"}
                 )
                 return json.dumps({
@@ -2297,7 +2675,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             mid = "src_" + os.path.splitext(os.path.basename(local_path))[0][:48]
         explicit_deps = None
         if "dependencies" in args:
-            explicit_deps, missing_deps = _validate_local_dependencies(args.get("dependencies"), slug, str(mid))
+            explicit_deps, missing_deps = _validate_local_dependencies(args.get("dependencies"), storage_slug, str(mid))
             if missing_deps:
                 return json.dumps({"error": "依赖映射包含未安装的本地 Mod ID",
                                    "missing_dependencies": missing_deps}, ensure_ascii=False)
@@ -2314,38 +2692,19 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                         "更正为真实安装位置(可用游戏体检/重新检测),确认能找到游戏本体 exe 后再安装。",
             }, ensure_ascii=False)
 
-        source_preflight = download_install_preflight(local_path)
-        if source_preflight.get("install_blocked"):
-            return json.dumps({
-                **source_preflight,
-                "message": (
-                    "安装前来源详情、加载器或必要前置核验未通过；"
-                    "尚未创建快照，也未写入游戏目录。"
-                ),
-            }, ensure_ascii=False, indent=2)
-        if (
-            source_preflight.get("compatibility_confirmation_required")
-            and not args.get("compatibility_confirmed")
-        ):
-            return json.dumps({
-                **source_preflight,
-                "requires_confirmation": True,
-                "message": (
-                    "该 Mod 较长时间未更新，来源没有声明适配当前游戏构建；"
-                    "请先向用户展示依赖核验与兼容性风险，得到明确同意后再安装。"
-                ),
-            }, ensure_ascii=False, indent=2)
-
+        # 先识别同一物理 Mod，再进行只对“新增写盘”有意义的加载器与依赖核验。
+        # 否则旧版/手工导入的本地别名虽然已经指向同一文件，仍可能因为没有
+        # 单独登记 BepInEx 等基础环境而被误报为 dependency_blocked。
         if str(mid).isdigit() and args.get("require_verified_preflight"):
-            nexus_preflight = nexus_install_preflight(mid)
-            if nexus_preflight.get("install_blocked"):
-                return json.dumps(nexus_preflight, ensure_ascii=False, indent=2)
+            duplicate_hint = (
+                download_provenance.get("name")
+                or os.path.splitext(os.path.basename(local_path))[0]
+            )
             installed = find_installed_duplicate(
-                slug, "nexus", str(mid),
-                target_name=str(nexus_preflight.get("name") or ""),
+                storage_slug, "nexus", str(mid), target_name=str(duplicate_hint or ""),
             )
             if installed:
-                cache_cleanup = downloader.cleanup_installed_archive(local_path)
+                cache_cleanup = _cleanup_installed_archive_safely(local_path)
                 return json.dumps({
                     "status": "already_installed",
                     "already_installed": True,
@@ -2360,6 +2719,34 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                         "未创建快照，也未写入第二份文件。"
                     ),
                 }, ensure_ascii=False)
+
+        source_preflight = download_install_preflight(local_path)
+        if source_preflight.get("install_blocked"):
+            return json.dumps({
+                **source_preflight,
+                "message": (
+                    "安装前来源详情、加载器或必要前置核验未通过；"
+                    "尚未创建快照，也未写入游戏目录。"
+                ),
+            }, ensure_ascii=False, indent=2)
+        if (
+            source_preflight.get("compatibility_confirmation_required")
+            and not args.get("compatibility_confirmed")
+            and not args.get("_batch_preflight_approved")
+        ):
+            return json.dumps({
+                **source_preflight,
+                "requires_confirmation": True,
+                "message": (
+                    "该 Mod 较长时间未更新，来源没有声明适配当前游戏构建；"
+                    "请先向用户展示依赖核验与兼容性风险，得到明确同意后再安装。"
+                ),
+            }, ensure_ascii=False, indent=2)
+
+        if str(mid).isdigit() and args.get("require_verified_preflight"):
+            nexus_preflight = nexus_install_preflight(mid)
+            if nexus_preflight.get("install_blocked"):
+                return json.dumps(nexus_preflight, ensure_ascii=False, indent=2)
 
         try:
             dependency_preflight = stardew.archive_dependency_preflight(
@@ -2379,12 +2766,16 @@ def execute(name: str, args: dict, cfg: Config) -> str:
 
         snap_id = args.get("snapshot_id", "")
         if not snap_id:
-            snap_id = snapshot.snapshot_create(root, slug, trigger_mod_name=f"安装前快照")
-        lo = db.get_max_load_order(slug) + 1
+            snap_id = snapshot.snapshot_create(root, storage_slug, trigger_mod_name=f"安装前快照")
+        lo = db.get_max_load_order(storage_slug) + 1
         try:
             result = installer.install_mod(local_path, root, slug, lo)
+        except (installer.InstallTargetChanged, installer.InstallRollbackIncomplete) as exc:
+            # Transaction recovery deliberately preserved external changes. A full
+            # snapshot restore here would silently overwrite those changes again.
+            return json.dumps(_install_conflict_receipt(exc, snap_id), ensure_ascii=False, indent=1)
         except installer.UnsupportedInstallLayout as exc:
-            rollback = snapshot.snapshot_restore(snap_id)
+            rollback = _restore_install_snapshot(snap_id)
             package_notes = (exc.install_notes or "").strip()
             source_url = download_provenance.get("source_url") or ""
             source_kind = download_provenance.get("source") or (
@@ -2411,10 +2802,10 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "install_blocked": True,
                 "write_performed": False,
                 "error": str(exc),
-                "message": (
-                    "确定性安装规则无法安全识别该包，已停止重复尝试并恢复安装前状态。"
-                    "请仅依据包内 README/INSTALL、来源页教程和文件树生成显式安装映射；"
-                    "证据不足时不得猜测目录。"
+                "message": _install_failure_message(
+                    "安装规则无法安全识别该包，安装已停止。请依据包内说明和来源页核对安装映射，不得猜测目录。 / "
+                    "Installation stopped because the package layout is unsupported; verify its installation instructions.",
+                    rollback,
                 ),
                 "archive_path": os.path.abspath(local_path),
                 "archive_contents": exc.archive_members[:300],
@@ -2457,9 +2848,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "rollback": rollback,
             }, ensure_ascii=False, indent=2)
         except Exception as exc:
-            rollback = snapshot.snapshot_restore(snap_id)
+            rollback = _restore_install_snapshot(snap_id)
             return json.dumps({
-                "error": f"安装事务失败，已恢复安装前快照: {exc}",
+                "error": _install_failure_message("安装事务失败。 / Installation transaction failed.", rollback),
                 "snapshot_id": snap_id,
                 "rollback_complete": bool(rollback.get("complete")),
                 "rollback": rollback,
@@ -2467,7 +2858,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         files_installed = [f["dest"] for f in result.get("installed", [])]
         # 自动落位规则没接住任何文件(开放模式/非常规结构包)→ 引导 agent 走通用安装,不写空账
         if not files_installed:
-            rollback = snapshot.snapshot_restore(snap_id)
+            rollback = _restore_install_snapshot(snap_id)
             try:
                 archive_contents = installer.detect_mod_structure(local_path)
             except Exception:
@@ -2523,25 +2914,25 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             id=str(mid), name=mod_name, version=mod_ver, snapshot_id=snap_id,
             load_order=lo, file_id=0, files_installed=json.dumps(files_installed),
             dependencies=json.dumps(mod_deps),
-            game_slug=slug,
+            game_slug=storage_slug,
         )
         source_binding = {}
         try:
             db.add_mod(mod)
-            source_binding = _bind_download_source(local_path, slug, str(mid))
+            source_binding = _bind_download_source(local_path, slug, str(mid), storage_slug=storage_slug)
         except Exception as exc:
             try:
-                db.remove_mod(str(mid), slug)
+                db.remove_mod(str(mid), storage_slug)
             except Exception:
                 pass
-            rollback = snapshot.snapshot_restore(snap_id)
+            rollback = _restore_install_snapshot(snap_id)
             return json.dumps({
-                "error": f"安装文件已复核，但数据库登记失败，已恢复安装前快照: {exc}",
+                "error": _install_failure_message("安装文件已复核，但数据库登记失败。 / Installed files were verified, but inventory registration failed.", rollback),
                 "snapshot_id": snap_id,
                 "rollback_complete": bool(rollback.get("complete")),
                 "rollback": rollback,
             }, ensure_ascii=False, indent=1)
-        cache_cleanup = downloader.cleanup_installed_archive(local_path)
+        cache_cleanup = _cleanup_installed_archive_safely(local_path)
         return json.dumps({"snapshot_id": snap_id, "files_installed": files_installed,
                            "load_order": lo, "name": mod_name,
                            "version": mod_ver,
@@ -2604,14 +2995,14 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         mid = "custom_" + os.path.splitext(os.path.basename(local_path))[0][:40]
         explicit_deps = None
         if "dependencies" in args:
-            explicit_deps, missing_deps = _validate_local_dependencies(args.get("dependencies"), slug, mid)
+            explicit_deps, missing_deps = _validate_local_dependencies(args.get("dependencies"), storage_slug, mid)
             if missing_deps:
                 return json.dumps({"error": "依赖映射包含未安装的本地 Mod ID",
                                    "missing_dependencies": missing_deps}, ensure_ascii=False)
 
         try:
             mapped_preflight = installer.preview_custom_install(
-                local_path, root, slug, mapping,
+                local_path, root, storage_slug, mapping,
             )
         except Exception as exc:
             return json.dumps({
@@ -2621,7 +3012,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             }, ensure_ascii=False)
 
         duplicate = find_installed_duplicate(
-            slug,
+            storage_slug,
             download_provenance.get("source") or "local",
             download_provenance.get("source_key") or mid,
             target_name=download_provenance.get("name") or mid,
@@ -2736,10 +3127,28 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         require_preflight = bool(
             source_preflight or args.get("require_verified_preflight")
         )
+        archive_digest = hashlib.sha256()
+        try:
+            with open(local_path, "rb") as archive_stream:
+                while True:
+                    task_control.raise_if_cancelled()
+                    block = archive_stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    archive_digest.update(block)
+        except OSError:
+            return json.dumps({
+                "error": "安装包内容无法读取，已停止安装。检查文件权限或重新下载后，再生成预检报告。 / The archive could not be read. Check permissions or download it again, then generate a new preview.",
+                "error_code": "INSTALL_ARCHIVE_UNREADABLE", "install_blocked": True,
+            }, ensure_ascii=False)
         preflight_target = hashlib.sha256(
             json.dumps(
                 {
                     "path": os.path.abspath(local_path),
+                    "game_root": os.path.normcase(os.path.realpath(root)),
+                    "game_scope": storage_slug,
+                    "archive_sha256": archive_digest.hexdigest(),
+                    "target_states": mapped_preflight.get("checked_mappings", []),
                     "mapping": mapping,
                     "size": os.path.getsize(local_path),
                     "mtime_ns": os.stat(local_path).st_mtime_ns,
@@ -2748,7 +3157,15 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 ensure_ascii=False,
             ).encode("utf-8")
         ).hexdigest()
-        if require_preflight and not args.get("preflight_confirmed"):
+        # This private flag is supplied only by mod_install_batch after the
+        # Agent received a clear confirmation for the whole visible plan.
+        # It is deliberately absent from the public tool schema.
+        batch_preflight_approved = bool(args.get("_batch_preflight_approved"))
+        if (
+            require_preflight
+            and not args.get("preflight_confirmed")
+            and not batch_preflight_approved
+        ):
             return json.dumps({
                 "status": "preinstall_confirmation_required",
                 "requires_confirmation": True,
@@ -2768,16 +3185,20 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     "只有用户随后明确确认，才可继续写盘。"
                 ),
             }, ensure_ascii=False, indent=2)
-        if require_preflight and not confirmation.consume(
+        if (
+            require_preflight
+            and not batch_preflight_approved
+            and not confirmation.consume(
             args.get("preflight_confirmation_token", ""),
             "mod_install_preflight",
             preflight_target,
+            )
         ):
             return json.dumps({
                 "error": "preinstall_confirmation_invalid",
                 "status": "preinstall_confirmation_invalid",
                 "message": (
-                    "安装前核验确认令牌缺失、过期或与当前文件/映射不一致；"
+                    "安装前核验确认令牌缺失、过期或与当前安装包、目标文件、目录或映射不一致；"
                     "请重新生成预检报告。"
                 ),
             }, ensure_ascii=False)
@@ -2801,16 +3222,19 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         # → ③ 落位。plan 只做路径校验(不解压),与 install_mod_custom 内部共用同一校验。
         plan = installer.plan_custom_targets(root, mapping)
         if plan["valid"]:
-            db.add_custom_domain_files(slug, plan["valid"])
+            db.add_custom_domain_files(storage_slug, plan["valid"])
         snap_id = args.get("snapshot_id") or snapshot.snapshot_create(
-            root, slug, trigger_mod_name=f"{mid} 自定义安装前")
+            root, storage_slug, trigger_mod_name=f"{mid} 自定义安装前")
 
-        result = installer.install_mod_custom(local_path, root, slug, mapping)
+        result = installer.install_mod_custom(local_path, root, storage_slug, mapping,
+                                             expected_targets=mapped_preflight.get("checked_mappings", []))
         files_installed = [i["dest"] for i in result.get("installed", [])]
 
         if not files_installed:
             return json.dumps({
                 "error": "没有文件成功安装(全部被校验拦下或包内缺失)。",
+                "error_code": next((item["error_code"] for item in result.get("errors", []) if item.get("error_code")), "INSTALL_FAILED"),
+                "errors": result.get("errors", []),
                 "snapshot_id": snap_id,
                 "skipped": result.get("skipped", []),
                 "rejected": plan.get("rejected", []),
@@ -2827,25 +3251,25 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         try:
             db.add_mod(db.InstalledMod(
                 id=mid, name=mod_name, version=mod_version, snapshot_id=snap_id,
-                load_order=db.get_max_load_order(slug) + 1,
+                load_order=db.get_max_load_order(storage_slug) + 1,
                 files_installed=json.dumps(files_installed),
                 dependencies=json.dumps(recorded_dependencies),
-                installed_by="custom", game_slug=slug,
+                installed_by="custom", game_slug=storage_slug,
             ))
-            source_binding = _bind_download_source(local_path, slug, mid)
+            source_binding = _bind_download_source(local_path, slug, mid, storage_slug=storage_slug)
         except Exception as exc:
             try:
-                db.remove_mod(mid, slug)
+                db.remove_mod(mid, storage_slug)
             except Exception:
                 pass
-            rollback = snapshot.snapshot_restore(snap_id)
+            rollback = _restore_install_snapshot(snap_id)
             return json.dumps({
-                "error": f"安装文件已复核，但数据库登记失败，已恢复安装前快照: {exc}",
+                "error": _install_failure_message("安装文件已复核，但数据库登记失败。 / Installed files were verified, but inventory registration failed.", rollback),
                 "snapshot_id": snap_id,
                 "rollback_complete": bool(rollback.get("complete")),
                 "rollback": rollback,
             }, ensure_ascii=False, indent=1)
-        cache_cleanup = downloader.cleanup_installed_archive(local_path)
+        cache_cleanup = _cleanup_installed_archive_safely(local_path)
         return json.dumps({
             "snapshot_id": snap_id, "installed": len(files_installed),
             "files_installed": files_installed,
@@ -2863,12 +3287,12 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if not Tier.can(cfg.tier, "install"):
             return json.dumps({"error": "当前层级不支持卸载"}, ensure_ascii=False)
         mid = args["mod_id"]
-        mod = db.get_mod(mid, slug)
+        mod = db.get_mod(mid, storage_slug)
         if not mod:
             return json.dumps({"error": f"未找到 Mod: {mid}"}, ensure_ascii=False)
 
         is_ws = str(mid).startswith("ws_")
-        deps = db.get_dependents(mid, slug)
+        deps = db.get_dependents(mid, storage_slug)
         # ── 卸载确认门(破坏性操作,确定性守门放代码,同 snapshot_restore 回滚预览门)──
         # 不带 confirmed 先返回预览;安装有确认门,卸载更该有(对称保护)。
         if not args.get("confirmed"):
@@ -2893,7 +3317,8 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "blocked_unsafe_count": len(_unsafe),
                 "blocked_unsafe_sample": _unsafe[:20],
                 "dependents": [d["name"] for d in deps],
-                "note": ("卸载前会自动建快照,可回滚。"
+                "note": (("工坊卸载是 Steam 退订；本地快照不能恢复订阅，需要在 Steam 中重新订阅。"
+                          if is_ws else "卸载前会创建本地安全快照；恢复范围以实际快照内容为准，不保证恢复存档或外部服务状态。")
                          + (f"⚠️ 有 {len(deps)} 个 mod 依赖它("
                             + "、".join(d["name"] for d in deps) + "),卸载可能导致它们失效。"
                             if deps else "")
@@ -2913,16 +3338,44 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     res = asyncio.run(sw.unsubscribe(wid, appid, cfg.chrome_cdp_port))
                 except Exception as e:
                     return json.dumps({"error": f"取消订阅失败: {e}"}, ensure_ascii=False)
-            db.remove_mod(mid, slug)
-            return json.dumps({"workshop_id": wid, "unsubscribed": res.get("ok", False),
-                               "note": "已从 Steam 取消订阅" if res.get("ok") else "已移除记录（取消订阅可能未生效，请确认已登录 Steam）"}, ensure_ascii=False)
+            if res.get("ok"):
+                db.remove_mod(mid, storage_slug)
+            return json.dumps({"status": "completed" if res.get("ok") else "blocked",
+                               "workshop_id": wid, "unsubscribed": bool(res.get("ok")),
+                               "record_retained": not bool(res.get("ok")),
+                               "note": "已从 Steam 取消订阅" if res.get("ok") else "未能确认 Steam 退订成功，管理记录已保留；请检查登录状态后重新预览。"}, ensure_ascii=False)
         files = json.loads(mod.files_installed) if isinstance(mod.files_installed, str) else (mod.files_installed or [])
-        snap_id = snapshot.snapshot_create(root, slug, trigger_mod_name=f"{mod.name} 卸载前")
-        shared = db.get_shared_files(mid, files, slug)
-        result = installer.uninstall_mod(mid, root, files, game_slug=slug, shared_files=shared)
-        external_cleanup = user_config.uninstall_mod_configs(slug, str(mid))
-        db.remove_mod(mid, slug)
-        return json.dumps({"removed": len(result["removed"]),
+        # A batch operation creates one explicit snapshot up front and passes
+        # its ID here.  Validate it belongs to this exact game root; otherwise
+        # fall back to the normal per-Mod snapshot rather than risking an
+        # unprotected delete.
+        snap_id = str(args.get("snapshot_id") or "")
+        if snap_id and not snapshot.snapshot_belongs_to_root(snap_id, root):
+            return json.dumps({"error": "批量卸载快照不属于当前游戏目录，已拒绝删除"}, ensure_ascii=False)
+        if not snap_id:
+            snap_id = snapshot.snapshot_create(root, storage_slug, trigger_mod_name=f"{mod.name} 卸载前")
+        shared = db.get_shared_files(mid, files, storage_slug)
+        result = installer.uninstall_mod(mid, root, files, game_slug=slug, shared_files=shared,
+                                         retain_backups=True)
+        incomplete = bool(result.get("errors") or result.get("blocked_unsafe")
+                          or result.get("pending") or result.get("status") == "cancelled")
+        cancelled = task_control.is_cancelled() or result.get("status") == "cancelled"
+        external_cleanup = {"complete": False, "skipped": True}
+        if not incomplete and not cancelled:
+            try:
+                external_cleanup = user_config.uninstall_mod_configs(slug, str(mid))
+            except Exception as exc:
+                external_cleanup = {"complete": False, "failed": [{"error": str(exc)}]}
+        complete = not incomplete and not cancelled and external_cleanup.get("complete") is True
+        if complete:
+            db.remove_mod(mid, storage_slug)
+            installer.cleanup_uninstall_backups(result)
+        return json.dumps({"status": "completed" if complete else "cancelled" if cancelled else "partial",
+                           "record_retained": not complete,
+                           "message": ("卸载完成，已核验文件移除和原文件恢复。" if complete else
+                                       "卸载未全部完成；管理记录和恢复备份已保留，请检查未完成项后重新预览。"),
+                           "retryable": False,
+                           "removed": len(result["removed"]),
                            "kept_shared": len(result.get("kept_shared", [])),
                            "snapshot_id": snap_id,
                            "dependents_warned": [d["name"] for d in deps],
@@ -2993,6 +3446,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if (
             _snap is not None and _snap.game_slug
             and game_storage_id(cfg, _snap.game_slug) != storage_slug
+            and not snapshot.snapshot_belongs_to_root(args["snapshot_id"], root)
         ):
             return json.dumps({
                 "error": f"快照 {args['snapshot_id']} 不属于当前安装目录。"
@@ -3017,15 +3471,56 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "error": "rollback_confirmation_invalid",
                 "message": "回滚确认已失效或未经过预览，请重新生成预览并请求用户确认。",
             }, ensure_ascii=False)
+        pending_cleanup = db.pending_snapshot_inventory_cleanup(args["snapshot_id"], storage_slug)
         res = snapshot.snapshot_restore(args["snapshot_id"])
         ws = res.get("workshop") or {}
+        cleanup_failed = []
+        workshop_cleanup = set(ws.get("unsubscribed", []))
+        target_ids = res.get("workshop_target_ids")
+        for mid in pending_cleanup:
+            if not mid.startswith("ws_"):
+                continue  # Local records are rechecked against verified files below.
+            pid = mid[3:]
+            if isinstance(target_ids, list) and pid in target_ids:
+                continue  # A snapshot that now wants the item must retain its record.
+            if isinstance(target_ids, list) and (ws.get("in_sync") is True or pid in workshop_cleanup):
+                workshop_cleanup.add(pid)
+            else:
+                cleanup_failed.append(mid)
         # 被自动退订的工坊 mod,同步清掉 DB 记录(账本跟事实走)
-        for pid in ws.get("unsubscribed", []):
-            db.remove_mod("ws_" + pid, storage_slug)
+        for pid in sorted(workshop_cleanup):
+            try:
+                db.remove_mod("ws_" + pid, storage_slug)
+            except Exception:
+                cleanup_failed.append("ws_" + pid)
         # 回滚联动清账:快照后安装的 mod 文件刚被回滚删掉,DB 记录不能留成幽灵账。
-        # 判定 = 记录里有文件、且所有文件在磁盘上都不存在(连 .disabled 禁用副本也没有)。
+        # 新快照还能证明覆盖安装已撤回：安装关联本快照、基线无该记录，且全部路径
+        # 已恢复/删除或逐字节核实与快照一致。缺基线的旧快照仍只按全部文件消失清账。
         # 工坊 mod 不在此列(文件由 Steam 托管,上面按订阅差集单独处理)。
         mods_cleaned = []
+        inventory_before = res.get("inventory_mod_ids")
+        inventory_before = (set(inventory_before) if isinstance(inventory_before, list)
+                            and all(isinstance(item, str) for item in inventory_before) else None)
+        reverted_files = {os.path.normcase(os.path.abspath(path))
+                          for path in (res.get("reverted_files", [])
+                                       + res.get("verified_snapshot_files", []))}
+        def verified_reverted_or_absent(path):
+            if not isinstance(path, str) or not path:
+                return False
+            full = os.path.normcase(os.path.abspath(path))
+            if full in reverted_files:
+                return True
+            # A previous partial restore may already have deleted this file.
+            # Accept absence only inside this game, including disabled variants.
+            try:
+                boundary = os.path.normcase(os.path.realpath(root))
+                resolved = os.path.normcase(os.path.realpath(full))
+                return (resolved != boundary
+                        and os.path.commonpath([boundary, resolved]) == boundary
+                        and not os.path.lexists(full)
+                        and not os.path.lexists(full + ".disabled"))
+            except (OSError, ValueError):
+                return False
         # 文件复核未通过时保留账本，避免“磁盘没恢复、记录又被清了”的二次损坏。
         if res.get("complete"):
             for m in db.get_installed_mods(storage_slug):
@@ -3035,13 +3530,25 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     mfiles = json.loads(m.files_installed or "[]")
                 except Exception:
                     mfiles = []
-                if mfiles and all(not os.path.exists(f) and not os.path.exists(f + ".disabled")
-                                  for f in mfiles):
-                    db.remove_mod(m.id, storage_slug)
-                    mods_cleaned.append({"id": m.id, "name": m.name})
+                reverted_install = (
+                    inventory_before is not None and str(m.id) not in inventory_before
+                    and m.snapshot_id == args["snapshot_id"]
+                    and mfiles and all(verified_reverted_or_absent(f) for f in mfiles)
+                )
+                if mfiles and (reverted_install or all(
+                    not os.path.exists(f) and not os.path.exists(f + ".disabled") for f in mfiles
+                )):
+                    try:
+                        db.remove_mod(m.id, storage_slug)
+                        mods_cleaned.append({"id": m.id, "name": m.name})
+                    except Exception:
+                        cleanup_failed.append(str(m.id))
         out = {"snapshot_id": args["snapshot_id"],
-               "status": res.get("status", "incomplete"),
-               "complete": bool(res.get("complete")),
+               "game_instance_id": storage_slug,
+               "status": "incomplete" if cleanup_failed else res.get("status", "incomplete"),
+               "complete": bool(res.get("complete")) and not cleanup_failed,
+               "inventory_cleanup": {"complete": not cleanup_failed,
+                                     "failed_mod_ids": cleanup_failed},
                "deleted": res.get("deleted", 0),
                "restored": res.get("restored", 0),
                "unchanged_verified": res.get("unchanged_verified", 0),
@@ -3068,9 +3575,24 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             lead = _all_failed[0]   # 同一次回滚的失败通常同因(游戏在跑),取首项归因作主导建议
             out["warning"] = (f"{len(_all_failed)} 个文件操作失败({lead.get('reason','未知原因')}),"
                               f"回滚不完整。{lead.get('action','')}")
+        elif cleanup_failed:
+            out["warning"] = "回滚库存同步未完成；请检查 Mod 清单和数据库可用性，再重新预览并确认回滚。"
         elif not out["complete"]:
             out["warning"] = "回滚后文件级复核仍有差异，不能视为完成；请关闭游戏后重试或查看待处理清单。"
-        db.log_operation("snapshot_restore", out)
+        out["audit_log_saved"] = True
+        try:
+            db.log_operation("snapshot_restore", out)
+        except Exception:
+            # The restore has already run. Preserve its receipt instead of
+            # turning a history-write failure into an ambiguous HTTP error.
+            out["restore_verified"] = out["complete"]
+            out["audit_log_saved"] = False
+            out["complete"] = False
+            out["status"] = "receipt_not_saved"
+            out["warning"] = (
+                "回滚操作已执行，但操作记录保存失败。请保留本次回执并检查文件和 Mod 清单；"
+                "先恢复数据库可用性，不要盲目重复回滚。"
+            )
         return json.dumps(out, ensure_ascii=False)
 
     elif name == "snapshot_delete":
@@ -3080,6 +3602,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         if (
             _snap.game_slug
             and game_storage_id(cfg, _snap.game_slug) != storage_slug
+            and not snapshot.snapshot_belongs_to_root(args["snapshot_id"], root)
         ):
             return json.dumps({
                 "error": f"快照 {args['snapshot_id']} 不属于当前安装目录。"
@@ -3167,10 +3690,19 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 mod_id=str(args.get("mod_id") or ""),
                 mode=args.get("mode") or "merge_ini",
             )
-            db.log_operation("game_config_write", result)
-            return json.dumps(result, indent=2, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        try:
+            db.log_operation("game_config_write", result)
+        except Exception:
+            # The file operation already has a verified outcome. Losing its
+            # audit receipt must not erase that outcome or invite a blind retry.
+            result = {**result, "receipt_saved": False, "complete": False,
+                      "warning_code": "CONFIG_WRITE_RECEIPT_NOT_SAVED",
+                      "warning": "操作记录未能保存；配置写入或恢复结果见本次回执。请检查数据目录权限和磁盘空间，不要仅因记录失败重复写入。 / The operation record could not be saved. Use this receipt's write or rollback result. Check data-directory permissions and disk space; do not repeat the write solely because recording failed."}
+        else:
+            result = {**result, "receipt_saved": True}
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     # T15
     elif name == "read_readme":
@@ -3186,15 +3718,15 @@ def execute(name: str, args: dict, cfg: Config) -> str:
 
     # T15b:框架日志诊断(export=true 额外打脱敏诊断包)
     elif name == "game_diagnose":
-        installed = db.get_installed_mods(slug)
+        installed = db.get_installed_mods(storage_slug)
         if args.get("export"):
-            r = diagnostics.export_diag_bundle(
+            r = game_diagnostics.export_diag_bundle(
                 root, slug, cfg, installed,
                 db.get_operation_log(limit=500), app_version=__import__("modagent").__version__)
         else:
-            r = diagnostics.game_diagnose(root, slug, installed)
+            r = game_diagnostics.game_diagnose(root, slug, installed)
             from .diagnostic_impact import build_diagnostic_strategy
-            bindings = {str(item["mod_id"]): item for item in db.get_mod_source_bindings(slug)}
+            bindings = {str(item["mod_id"]): item for item in db.get_mod_source_bindings(storage_slug)}
             r["diagnostic_strategy"] = build_diagnostic_strategy(r, installed, bindings)
         return json.dumps(r, ensure_ascii=False, indent=1)
 
@@ -3246,7 +3778,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
 
     elif name == "mod_source_bind":
         local_mod_id = str(args.get("local_mod_id") or "").strip()
-        mod = db.get_mod(local_mod_id, slug)
+        mod = db.get_mod(local_mod_id, storage_slug)
         if not mod:
             return json.dumps({
                 "error": f"未找到本地已安装 Mod: {local_mod_id}"
@@ -3274,14 +3806,14 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     "url": source_url,
                 },
             }
-            if not args.get("confirmed"):
+            if args.get("confirmed") is not True:
                 return json.dumps({
                     "requires_confirmation": True,
                     "message": "请确认本地项与该 Thunderstore 包是同一 Mod",
                     "preview": preview,
                 }, ensure_ascii=False, indent=2)
             db.upsert_mod_source_binding(
-                slug, str(mod.id), "thunderstore", source_key, source_url,
+                storage_slug, str(mod.id), "thunderstore", source_key, source_url,
                 1.0, "user_confirmed", latest_version,
                 {"matched_name": candidate_name, "confirmed_in_mod_manager": True},
             )
@@ -3324,7 +3856,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "updated_at": detail.get("updated_at") or "",
             },
         }
-        if not args.get("confirmed"):
+        if args.get("confirmed") is not True:
             return json.dumps({
                 "requires_confirmation": True,
                 "message": (
@@ -3335,7 +3867,7 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             }, ensure_ascii=False, indent=2)
         url = f"https://www.nexusmods.com/{slug}/mods/{nexus_mod_id}"
         db.upsert_mod_source_binding(
-            slug, str(mod.id), "nexus", str(nexus_mod_id), url,
+            storage_slug, str(mod.id), "nexus", str(nexus_mod_id), url,
             1.0, "user_confirmed", str(detail.get("version") or ""),
             {
                 "nexus_slug": slug,
@@ -3705,16 +4237,16 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "task_busy": True,
                 "active_task_kind": active.get("task_kind") or "",
             }, ensure_ascii=False)
-        mod = db.get_mod(args["mod_id"], slug)
+        mod = db.get_mod(args["mod_id"], storage_slug)
         if not mod:
             return json.dumps({"error": f"Mod {args['mod_id']} 未安装"}, ensure_ascii=False)
-        binding = db.get_mod_source_binding(str(mod.id), slug)
+        binding = db.get_mod_source_binding(str(mod.id), storage_slug)
         if binding:
             from .source_alignment import binding_reaudit_reason
             unsafe_reason = binding_reaudit_reason(mod, binding)
             if unsafe_reason:
                 db.delete_mod_source_binding(
-                    slug, str(mod.id), reason="unsafe_binding_blocked_update",
+                    storage_slug, str(mod.id), reason="unsafe_binding_blocked_update",
                 )
                 return json.dumps({
                     "error": "已阻止更新：原维护来源属于不安全的相似名称匹配",
@@ -3726,9 +4258,119 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     "requires_source_alignment": True,
                     "hint": "重新执行来源对齐；歧义候选必须核对详情并由用户确认。",
                 }, indent=2, ensure_ascii=False)
+        try:
+            files = json.loads(mod.files_installed) if isinstance(mod.files_installed, str) else mod.files_installed
+            valid_files = isinstance(files, list) and bool(files) and all(
+                isinstance(path, str) and bool(path.strip())
+                and installer.resolve_managed_game_path(path, root)[0]
+                for path in files
+            )
+        except (TypeError, ValueError, OSError):
+            valid_files = False
+        if not valid_files:
+            return json.dumps({
+                "status": "update_blocked", "error_code": "UPDATE_UNSAFE_RECORD",
+                "error": (
+                    "旧版本文件记录无效或包含当前游戏目录之外的路径，更新未开始。请先重新扫描并核对文件归属。 / "
+                    "The old file record is invalid or contains paths outside this game directory. "
+                    "Update not started; rescan and verify file ownership first."
+                ),
+                "mod_id": str(mod.id), "write_performed": False, "retryable": False,
+            }, ensure_ascii=False)
+        ownership_failure = {
+            "status": "update_blocked", "error_code": "UPDATE_OWNERSHIP_UNCONFIRMED",
+            "error": (
+                "无法核验已安装 Mod 的文件归属，旧版本未移除。请重新扫描并核对管理记录后再更新。 / "
+                "Installed Mod file ownership could not be verified; the old version was not removed. "
+                "Rescan and review inventory records before updating."
+            ),
+            "mod_id": str(mod.id), "write_performed": False, "retryable": False,
+        }
+        try:
+            shared = db.get_shared_files(str(mod.id), files, storage_slug, game_root=root)
+        except Exception:
+            return json.dumps(ownership_failure, ensure_ascii=False)
+        if shared:
+            return json.dumps({
+                "status": "update_blocked", "error_code": "UPDATE_SHARED_FILES",
+                "error": (
+                    "旧版本包含其他已安装 Mod 仍在使用的共享文件，自动更新未开始。"
+                    "请先核对共享依赖及兼容版本，不要直接删除共享文件。 / "
+                    "Other installed Mods still own files used by this version. Automatic update was not started. "
+                    "Review shared dependencies and compatible versions; do not delete shared files."
+                ),
+                "mod_id": str(mod.id), "shared_file_count": len(shared),
+                "write_performed": False, "retryable": False,
+            }, ensure_ascii=False)
+        old_files_failure = {
+            "status": "update_blocked", "error_code": "UPDATE_OLD_FILES_UNCONFIRMED",
+            "error": (
+                "旧版本文件已变化或无法核验，更新已停止，未移除旧版文件。请保留外部改动并重新检查后再更新。 / "
+                "Old-version files changed or could not be verified. Update stopped without removing old files. "
+                "Preserve external changes and review before updating again."
+            ),
+            "mod_id": str(mod.id), "write_performed": False, "retryable": False,
+        }
+        def old_file_states():
+            return {
+                candidate: installer._preflight_file_state(candidate, root)
+                for old_file in files for candidate in (old_file, old_file + ".disabled")
+            }
+        try:
+            old_states = old_file_states()
+        except Exception:
+            return json.dumps(old_files_failure, ensure_ascii=False)
+        def old_files_unchanged():
+            try:
+                return old_file_states() == old_states
+            except Exception:
+                return False
         source = (binding or {}).get("source") or (
             "nexus" if str(mod.id).isdigit() else ""
         )
+        def source_failure(stage, exc=None):
+            import ssl
+            import urllib.error
+            kind = "unknown"
+            current, seen = exc, set()
+            while isinstance(current, BaseException) and id(current) not in seen and len(seen) < 8:
+                seen.add(id(current))
+                if isinstance(current, ssl.SSLCertVerificationError):
+                    kind = "tls_error"
+                elif isinstance(current, TimeoutError):
+                    kind = "timeout"
+                elif isinstance(current, urllib.error.HTTPError):
+                    if current.code in (401, 403):
+                        kind = "access_denied"
+                    elif current.code == 429:
+                        kind = "rate_limited"
+                    elif 300 <= current.code < 400:
+                        kind = "redirect_blocked"
+                if kind != "unknown":
+                    break
+                reason = getattr(current, "reason", None)
+                current = reason if isinstance(reason, BaseException) else current.__cause__ or current.__context__
+            message = (
+                "无法读取最新版本信息。请检查来源站连接、授权与维护页；旧版本未改动。 / "
+                "Latest version information could not be read. Check source connectivity, authorization and the Mod page; the old version is unchanged."
+                if stage == "source" else
+                "新版下载未完成或未返回有效安装包。请检查来源站连接、授权与下载记录；旧版本未改动。 / "
+                "The update download did not produce a valid archive. Check source connectivity, authorization and download diagnostics; the old version is unchanged."
+            )
+            advice = {
+                "tls_error": "证书验证失败，请检查系统时间及代理证书信任，不要关闭证书校验。 / Certificate verification failed; check system time and proxy trust without disabling verification.",
+                "timeout": "请求超时，请检查网络或代理后再试。 / Request timed out; check connectivity or proxy settings before retrying.",
+                "access_denied": "来源站拒绝访问，请检查授权及站点访问限制。 / The source denied access; check authorization and site restrictions.",
+                "rate_limited": "来源站限流，请稍后再试。 / The source rate-limited this request; try again later.",
+                "redirect_blocked": "来源跳转未获允许，请检查维护页或稍后再试，不要转发密钥。 / The source redirect was blocked; review the Mod page or try later without forwarding keys.",
+            }
+            message += " " + advice.get(kind, "")
+            return json.dumps({
+                "status": "update_blocked",
+                "error_code": "UPDATE_SOURCE_FAILED" if stage == "source" else "UPDATE_DOWNLOAD_FAILED",
+                "error": message, "source": source, "mod_id": str(mod.id), "failure_kind": kind,
+                "write_performed": False, "retryable": False,
+            }, ensure_ascii=False)
         if source == "thunderstore":
             from .sources import thunderstore
             url = (binding or {}).get("source_url") or ""
@@ -3739,9 +4381,9 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             try:
                 path_result = thunderstore.download(url, slug)
             except Exception as exc:
-                return json.dumps({
-                    "error": f"Thunderstore 最新版下载失败: {exc}"
-                }, ensure_ascii=False)
+                return source_failure("download", exc)
+            if not isinstance(path_result, dict):
+                return source_failure("download")
             path = path_result.get("local_path")
             latest_version = path_result.get("version") or (
                 binding or {}
@@ -3750,12 +4392,20 @@ def execute(name: str, args: dict, cfg: Config) -> str:
             upstream_id = str((binding or {}).get("source_key") or mod.id)
             if not upstream_id.isdigit():
                 return json.dumps({"error": "Nexus 绑定缺少有效 Mod ID，请重新执行一键绑定"}, ensure_ascii=False)
-            main = nexus.get_main_file(int(upstream_id), slug, api_key)
-            if not main or not main.get("file_id"):
-                return json.dumps({"error": "无法获取最新版本信息或文件 ID"}, ensure_ascii=False)
-            path_result = asyncio.run(downloader.download_mod(
-                mod_id=int(upstream_id), game_slug=slug, game_id=gid,
-                api_key=api_key, cdp_port=cfg.chrome_cdp_port))
+            try:
+                main = nexus.get_main_file(int(upstream_id), slug, api_key)
+            except Exception as exc:
+                return source_failure("source", exc)
+            if not isinstance(main, dict) or not main.get("file_id"):
+                return source_failure("source")
+            try:
+                path_result = asyncio.run(downloader.download_mod(
+                    mod_id=int(upstream_id), game_slug=slug, game_id=gid,
+                    api_key=api_key, cdp_port=cfg.chrome_cdp_port))
+            except Exception as exc:
+                return source_failure("download", exc)
+            if not isinstance(path_result, dict):
+                return source_failure("download")
             path = path_result.get("local_path")
             latest_version = main.get("version", mod.version)
         else:
@@ -3764,15 +4414,84 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "mod_id": str(mod.id),
                 "hint": "先运行 mod_source_align；歧义项需要用户确认正确维护页。",
             }, ensure_ascii=False)
-        if not path or not os.path.exists(path):
-            return json.dumps({"error": "最新版下载未产生可安装文件"}, ensure_ascii=False)
-        snap_id = snapshot.snapshot_create(root, slug, trigger_mod_name=f"{mod.name} 更新前")
-        files = json.loads(mod.files_installed) if isinstance(mod.files_installed, str) else (mod.files_installed or [])
+        if not isinstance(path, str) or not path.strip() or not os.path.isfile(path):
+            return source_failure("download")
         try:
-            uninstall_result = installer.uninstall_mod(mod.id, root, files, game_slug=slug)
+            preview = installer.preview_install(path, root, slug)
+            targets = preview.get("planned_files")
+            if not isinstance(targets, list) or not targets or preview.get("errors"):
+                raise ValueError("No verified install targets")
+        except Exception:
+            return json.dumps({
+                "status": "update_blocked", "error_code": "UPDATE_PREVIEW_FAILED",
+                "error": (
+                    "无法确认新版安装路径，旧版本未移除。请检查安装包和游戏适配，不要重复更新。 / "
+                    "New install destinations could not be verified; the old version was not removed. "
+                    "Review the archive and game support before retrying."
+                ),
+                "mod_id": str(mod.id), "write_performed": False, "retryable": False,
+            }, ensure_ascii=False)
+        try:
+            owned_targets = db.get_shared_files(str(mod.id), targets, storage_slug, game_root=root)
+        except Exception:
+            return json.dumps(ownership_failure, ensure_ascii=False)
+        if owned_targets:
+            return json.dumps({
+                "status": "update_blocked", "error_code": "UPDATE_TARGET_OWNED",
+                "error": (
+                    "新版安装位置包含其他 Mod 已登记的文件，旧版本未移除。请核对冲突及兼容版本。 / "
+                    "New destinations include files owned by other Mods; the old version was not removed. "
+                    "Review conflicts and compatible versions."
+                ),
+                "mod_id": str(mod.id), "conflict_count": len(owned_targets),
+                "write_performed": False, "retryable": False,
+            }, ensure_ascii=False)
+        if not old_files_unchanged():
+            return json.dumps(old_files_failure, ensure_ascii=False)
+        try:
+            snap_id = snapshot.snapshot_create(root, storage_slug, trigger_mod_name=f"{mod.name} 更新前")
+            if not isinstance(snap_id, str) or not snap_id.strip():
+                raise ValueError("Snapshot identity was not confirmed")
+        except Exception:
+            return json.dumps({
+                "status": "update_blocked", "error_code": "UPDATE_SNAPSHOT_FAILED",
+                "error": (
+                    "更新前快照未确认完成，旧版本未移除。请检查磁盘空间、目录权限和快照列表，"
+                    "保留现有备份及安装包，排除问题后再更新。 / "
+                    "The pre-update snapshot was not confirmed; the old version was not removed. "
+                    "Check disk space, folder permissions and the snapshot list. Keep existing backups "
+                    "and the archive, and resolve the issue before updating."
+                ),
+                "mod_id": str(mod.id), "write_performed": False,
+                "snapshot_unconfirmed": True, "retryable": False,
+            }, ensure_ascii=False)
+        if not old_files_unchanged():
+            return json.dumps({**old_files_failure, "snapshot_id": snap_id}, ensure_ascii=False)
+        try:
+            # Updating is not a final uninstall: retain originals for rollback
+            # and for the user's later uninstall of either version.
+            uninstall_result = installer.uninstall_mod(mod.id, root, files, game_slug=slug,
+                                                       retain_backups=True)
+            if (uninstall_result.get("pending") or uninstall_result.get("blocked_unsafe")
+                    or uninstall_result.get("status", "completed") not in ("completed", "partial")
+                    or (uninstall_result.get("status") == "partial" and not uninstall_result.get("errors"))):
+                # Removal may already have changed some files. Do not proceed
+                # or restore a broad snapshot over an unsafe/concurrent target.
+                return json.dumps({
+                    "status": "update_unconfirmed", "error_code": "UPDATE_REMOVAL_INCOMPLETE",
+                    "error": (
+                        "旧版本文件移除未完成，新版本尚未安装。部分文件可能已改变；请保留快照并核对文件，不要重复更新。 / "
+                        "Old-version removal did not complete; the new version was not installed. "
+                        "Some files may have changed. Keep the snapshot and review files before retrying."
+                    ),
+                    "mod_id": str(mod.id), "snapshot_id": snap_id,
+                    "game_instance_id": storage_slug,
+                    "recovery_required": True, "retryable": False,
+                    "snapshot_restore_skipped": True,
+                }, ensure_ascii=False)
             if uninstall_result.get("errors"):
                 raise RuntimeError("旧版本文件未能完整移除")
-            lo = db.get_max_load_order(slug) + 1
+            lo = db.get_max_load_order(storage_slug) + 1
             result = installer.install_mod(path, root, slug, lo)
             new_files = [f["dest"] for f in result.get("installed", [])]
             if not new_files or result.get("errors"):
@@ -3797,20 +4516,26 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                     raise RuntimeError(
                         "SMAPI 更新验收失败：新版本未完整安装到 Stardew Valley/Mods"
                     )
-        except Exception as exc:
-            try:
-                rollback = snapshot.snapshot_restore(snap_id)
-                failed = rollback.get("failed") or {}
-                rollback_ok = bool(rollback.get("complete"))
-            except Exception as rollback_exc:
-                rollback = {"error": str(rollback_exc)}
-                rollback_ok = False
+        except (installer.InstallTargetChanged, installer.InstallRollbackIncomplete) as exc:
+            receipt = _install_conflict_receipt(exc, snap_id)
+            receipt.update(status="update_conflict", mod_id=str(mod.id), game_instance_id=storage_slug)
+            return json.dumps(receipt, ensure_ascii=False, indent=2)
+        except Exception:
+            rollback = _restore_install_snapshot(snap_id)
+            rollback_ok = bool(rollback.get("complete"))
             return json.dumps({
-                "error": f"更新失败: {exc}",
+                "error": _install_failure_message("更新失败。 / Mod update failed.", rollback),
+                "error_code": "UPDATE_FAILED" if rollback_ok else "UPDATE_ROLLBACK_UNCONFIRMED",
                 "snapshot_id": snap_id,
                 "restored_previous": rollback_ok,
+                "rollback_complete": rollback_ok,
+                "recovery_required": not rollback_ok,
+                "retryable": False,
                 "rollback": rollback,
-                "note": "已自动恢复更新前版本" if rollback_ok else "自动恢复未完整成功，请关闭游戏后从快照页手动回滚",
+                "note": ("已自动恢复更新前文件。 / Pre-update files were restored."
+                         if rollback_ok else
+                         "自动恢复未确认完成，请保留快照并核对当前文件；不要直接重复更新。 / "
+                         "Recovery is unconfirmed. Keep the snapshot and review current files; do not repeat the update immediately."),
             }, indent=2, ensure_ascii=False)
         mod.version = latest_version
         if source == "nexus":
@@ -3822,16 +4547,39 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 pass
         mod.files_installed = json.dumps(new_files, ensure_ascii=False)
         mod.snapshot_id = snap_id
-        db.update_mod(mod)
-        cache_cleanup = downloader.cleanup_installed_archive(path)
-        if binding:
-            db.upsert_mod_source_binding(
-                slug, str(mod.id), source, binding["source_key"],
-                binding.get("source_url") or "", binding.get("confidence") or 1,
-                binding.get("match_method") or "stable_id", mod.version,
-                json.loads(binding.get("metadata") or "{}"),
-            )
+        try:
+            db.update_mod(mod)
+            if binding:
+                db.upsert_mod_source_binding(
+                    storage_slug, str(mod.id), source, binding["source_key"],
+                    binding.get("source_url") or "", binding.get("confidence") or 1,
+                    binding.get("match_method") or "stable_id", mod.version,
+                    json.loads(binding.get("metadata") or "{}"),
+                )
+        except Exception:
+            # A write may have committed before raising. Do not claim either
+            # version is registered, delete the archive, or blindly replay it.
+            return json.dumps({
+                "status": "update_unconfirmed", "error_code": "UPDATE_INVENTORY_UNCONFIRMED",
+                "error": (
+                    "新版文件已写入，但管理记录或来源绑定保存未确认。请保留快照与安装包，核对文件和记录后再操作。 / "
+                    "New files were written, but inventory or source-binding registration is unconfirmed. "
+                    "Keep the snapshot and archive; review files and records before proceeding."
+                ),
+                "write_performed": True, "recovery_required": True, "retryable": False,
+                "snapshot_id": snap_id, "mod_id": str(mod.id),
+                "game_instance_id": storage_slug, "files_installed": new_files,
+                "archive_path": os.path.abspath(path),
+            }, ensure_ascii=False, indent=2)
+        cache_cleanup = _cleanup_installed_archive_safely(path)
+        cleanup_confirmed = cache_cleanup.get("status") != "unconfirmed"
         return json.dumps({"updated": mod.name, "version": mod.version,
+                           "warning_code": "" if cleanup_confirmed else "UPDATE_CACHE_CLEANUP_UNCONFIRMED",
+                           "warning": "" if cleanup_confirmed else (
+                               "更新已完成，但下载缓存清理未确认。可稍后检查缓存；不要因此重复更新。 / "
+                               "Update completed, but download-cache cleanup is unconfirmed. "
+                               "Review the cache later; do not repeat the update for this warning."
+                           ),
                            "source": source,
                            "install_handler": result.get("handler", ""),
                            "verified_mods": result.get("verified_mods", []),
@@ -3932,6 +4680,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "next_step": "Check the ma-xxxxxx code, selected game, and network connection; no local changes were made.",
             }, indent=2, ensure_ascii=False)
 
+    elif name == "official_share_network_diagnostics":
+        return json.dumps(
+            official_shares.connectivity_diagnostics(cfg),
+            indent=2,
+            ensure_ascii=False,
+        )
+
     elif name == "mod_dependency_set":
         mod = db.get_mod(args["mod_id"], slug)
         if not mod:
@@ -3960,10 +4715,29 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                            "dependencies": proposed}, indent=2, ensure_ascii=False)
 
     elif name == "mod_disable":
-        mod = db.get_mod(args["mod_id"], slug)
+        mod = db.get_mod(args["mod_id"], storage_slug)
         if not mod:
             return json.dumps({"error": f"未找到 Mod: {args['mod_id']}"}, ensure_ascii=False)
-        dependents = db.get_dependent_chain(mod.id, slug)
+        if str(mod.installed_by or "") == "steam_workshop" or str(mod.id).startswith("ws_"):
+            from .sources import steam_workshop as sw
+            appid = sw.resolve_appid(root)
+            return json.dumps({
+                "blocked": True,
+                "requires_external_manager": True,
+                "action": "steam_workshop_local_toggle",
+                "target": _toggle_mod_info(mod),
+                "workshop_id": str(mod.id).removeprefix("ws_"),
+                "steam_appid": appid,
+                "subscription_changed": False,
+                "files_changed": False,
+                "note": (
+                    "该项目由 Steam 创意工坊托管。Steam 客户端确实提供本地启用复选框，"
+                    "但当前公开接口没有为独立管理器提供可靠的通用写入方式；ModAgent 已停止普通文件禁用，"
+                    "不会把‘退订/删除’冒充‘临时禁用’，也不会改写 Steam 内部配置。"
+                ),
+                "user_action": "请在 Steam → 该游戏属性 → 创意工坊中取消该项目的启用勾选。",
+            }, indent=2, ensure_ascii=False)
+        dependents = db.get_dependent_chain(mod.id, storage_slug)
         full_plan = dependents + [mod]
         plan = [item for item in full_plan if not installer.is_mod_disabled(_mod_files(item))]
         already_disabled = [item for item in full_plan if installer.is_mod_disabled(_mod_files(item))]
@@ -3973,7 +4747,11 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         ]
         if not args.get("confirmed"):
             from .diagnostic_impact import build_disable_impact
-            bindings = {str(item["mod_id"]): item for item in db.get_mod_source_bindings(slug)}
+            bindings = {str(item["mod_id"]): item for item in db.get_mod_source_bindings(storage_slug)}
+            try:
+                external_preview = user_config.preview_toggle_mod_configs(slug, [str(item.id) for item in plan])
+            except user_config.ExternalConfigRegistryUnreadable as exc:
+                return json.dumps({"error_code": exc.code, "error": str(exc), "files_changed": False}, ensure_ascii=False)
             return json.dumps({
                 "requires_confirmation": True,
                 "action": "disable",
@@ -3982,13 +4760,13 @@ def execute(name: str, args: dict, cfg: Config) -> str:
                 "will_disable": [_toggle_mod_info(item) for item in plan],
                 "already_disabled": [_toggle_mod_info(item) for item in already_disabled],
                 "file_count": sum(len(_mod_files(item)) for item in plan),
-                "external_configs": user_config.preview_toggle_mod_configs(slug, [str(item.id) for item in plan]),
+                "external_configs": external_preview,
                 "decision_support": build_disable_impact(
-                    mod, plan, already_disabled, db.get_installed_mods(slug), bindings),
-                "confirmation_token": confirmation.issue("mod_disable", str(mod.id)),
+                    mod, plan, already_disabled, db.get_installed_mods(storage_slug), bindings),
+                "confirmation_token": confirmation.issue("mod_disable", json.dumps([storage_slug, os.path.realpath(root or ""), str(mod.id)])),
                 "note": "请先说明会失去和保留的功能、诊断理由、恢复方法及下一步，再等待用户下一轮明确确认；文件数只作技术附注。",
             }, indent=2, ensure_ascii=False)
-        if not confirmation.consume(args.get("confirmation_token", ""), "mod_disable", str(mod.id)):
+        if not confirmation.consume(args.get("confirmation_token", ""), "mod_disable", json.dumps([storage_slug, os.path.realpath(root or ""), str(mod.id)])):
             return json.dumps({
                 "error": "mod_disable_confirmation_invalid",
                 "message": "禁用确认令牌缺失、过期或已使用；请重新生成禁用预览并让用户确认。",
@@ -4016,10 +4794,25 @@ def execute(name: str, args: dict, cfg: Config) -> str:
         }, indent=2, ensure_ascii=False)
 
     elif name == "mod_enable":
-        mod = db.get_mod(args["mod_id"], slug)
+        mod = db.get_mod(args["mod_id"], storage_slug)
         if not mod:
             return json.dumps({"error": f"未找到 Mod: {args['mod_id']}"}, ensure_ascii=False)
-        dependencies, missing = db.get_dependency_chain(mod.id, slug)
+        if str(mod.installed_by or "") == "steam_workshop" or str(mod.id).startswith("ws_"):
+            from .sources import steam_workshop as sw
+            appid = sw.resolve_appid(root)
+            return json.dumps({
+                "blocked": True,
+                "requires_external_manager": True,
+                "action": "steam_workshop_local_toggle",
+                "target": _toggle_mod_info(mod),
+                "workshop_id": str(mod.id).removeprefix("ws_"),
+                "steam_appid": appid,
+                "subscription_changed": False,
+                "files_changed": False,
+                "note": "该项目由 Steam 创意工坊托管；ModAgent 不会通过移动工坊文件来伪造启用状态。",
+                "user_action": "请在 Steam → 该游戏属性 → 创意工坊中勾选启用该项目。",
+            }, indent=2, ensure_ascii=False)
+        dependencies, missing = db.get_dependency_chain(mod.id, storage_slug)
         loaders = set(active_loaders())
         missing = [
             dependency for dependency in missing
@@ -4146,6 +4939,8 @@ def _recommend_nexus(
 ) -> dict:
     """Search Nexus, then verify usable results through the detail endpoint."""
     import concurrent.futures as cf
+    from . import task_control
+    cache = task_control.read_cache()
 
     import inspect
     search_parameters = inspect.signature(nexus.search).parameters
@@ -4190,7 +4985,10 @@ def _recommend_nexus(
 
     def verify(row):
         mod_id = int(row["mod_id"])
+        key = ('nexus_detail', slug, mod_id)
         try:
+            if cache is not None and key in cache:
+                return mod_id, cache[key], ''
             detail_parameters = inspect.signature(nexus.get_detail).parameters
             if "cdp_port" in detail_parameters or any(
                 parameter.kind == inspect.Parameter.VAR_KEYWORD
@@ -4201,6 +4999,8 @@ def _recommend_nexus(
                 )
             else:
                 detail = nexus.get_detail(mod_id, slug, api_key)
+            if cache is not None and detail:
+                cache[key] = detail
             return mod_id, detail, ""
         except Exception as exc:
             return mod_id, {}, (str(exc) or type(exc).__name__)[:160]
@@ -4210,13 +5010,18 @@ def _recommend_nexus(
             max_workers=min(8, len(recs)),
             thread_name_prefix="recommend-detail",
         )
-        futures = [pool.submit(verify, row) for row in recs]
-        for future in cf.as_completed(futures):
+        futures = [pool.submit(task_control.scoped_worker(verify, row)) for row in recs]
+        for index, future in enumerate(cf.as_completed(futures), 1):
+            task_control.raise_if_cancelled()
             mod_id, detail, error = future.result()
             if detail:
                 verified_by_id[mod_id] = detail
             elif error:
                 errors[mod_id] = error
+            task_control.report_progress(stage='source_detail', tool='mod_recommend',
+                label=f'Nexus 详情核验已返回 {index}/{len(recs)} 项',
+                label_en=f'Nexus detail responses: {index}/{len(recs)}',
+                completed=index, total=len(recs))
         pool.shutdown(wait=True)
 
     enriched = []
@@ -4282,36 +5087,54 @@ def _recommend(query: str, cfg: Config) -> dict:
     effective_slug = src.get("nexus") or ""
 
     import concurrent.futures as cf
+    import time
+    from . import task_control
+    started = time.monotonic()
+    retry_enabled = str(getattr(cfg, "agent_core_v2", "off")) == "on"
     tasks = {}
     ex = cf.ThreadPoolExecutor(max_workers=5)
+    def submit(function, *args, **kwargs):
+        return ex.submit(task_control.scoped_worker(function, *args, **kwargs))
     if effective_slug:
-        tasks["nexus"] = ex.submit(
+        tasks["nexus"] = submit(
+            _source_call_with_retry,
             _recommend_nexus, query, effective_slug, api_key, per_source_limit,
-            cfg.chrome_cdp_port,
+            cfg.chrome_cdp_port, enabled=retry_enabled,
         )
     if src.get("workshop"):
         from .sources import steam_workshop as sw
-        tasks["workshop"] = ex.submit(
+        tasks["workshop"] = submit(
+            _source_call_with_retry,
             lambda: asyncio.run(
                 sw.search(query, src["workshop"], cfg.chrome_cdp_port)
-            )[:per_source_limit]
+            )[:per_source_limit],
+            enabled=retry_enabled,
         )
     if src.get("thunderstore"):
-        tasks["thunderstore"] = ex.submit(
-            _recommend_thunderstore, src["thunderstore"], query, per_source_limit
+        tasks["thunderstore"] = submit(
+            _source_call_with_retry,
+            _recommend_thunderstore, src["thunderstore"], query, per_source_limit,
+            enabled=retry_enabled,
         )
     if src.get("gamebanana"):
         from .sources import gamebanana as gb
-        tasks["gamebanana"] = ex.submit(
-            gb.search, src["gamebanana"], query, per_source_limit
+        tasks["gamebanana"] = submit(
+            _source_call_with_retry,
+            gb.search, src["gamebanana"], query, per_source_limit,
+            enabled=retry_enabled,
         )
     from .sources import github as gh
-    tasks["github"] = ex.submit(
-        gh.search, query, cfg.game_name or slug or "", per_source_limit
+    tasks["github"] = submit(
+        _source_call_with_retry,
+        gh.search, query, cfg.game_name or slug or "", per_source_limit,
+        enabled=retry_enabled,
     )
 
     source_status = src.get("source_status", {})
     out = {"recommendations": [], "install_plan": [],
+           # Keep the exact query used by every source.  The structured
+           # recommendation layer uses it to remove unrelated popular items.
+           "query": str(query or "").strip(),
            "sources_attempted": list(tasks),
            "sources_consulted": [], "sources_empty": [],
            "sources_failed": {}, "sources_skipped": {},
@@ -4327,8 +5150,21 @@ def _recommend(query: str, cfg: Config) -> dict:
     # requests retain their own finite network timeouts, while completed
     # sources are preserved independently.
     future_names = {future: name for name, future in tasks.items()}
+    waiting = set(tasks)
+    out['source_elapsed_seconds'] = {}
+    def notify_sources():
+        pending = ', '.join(sorted(waiting)) or '—'
+        task_control.report_progress(stage='source_search', tool='mod_recommend',
+            label=f'来源已返回 {len(tasks)-len(waiting)}/{len(tasks)}；等待：{pending}',
+            label_en=f'Sources returned {len(tasks)-len(waiting)}/{len(tasks)}; waiting: {pending}',
+            completed=len(tasks)-len(waiting), total=len(tasks))
+    notify_sources()
     for fut in cf.as_completed(future_names):
+        task_control.raise_if_cancelled()
         name = future_names[fut]
+        waiting.discard(name)
+        out['source_elapsed_seconds'][name] = round(time.monotonic()-started, 2)
+        notify_sources()
         try:
             r = fut.result()
         except Exception as e:
@@ -4346,6 +5182,7 @@ def _recommend(query: str, cfg: Config) -> dict:
             if not r:
                 out["sources_empty"].append(name)
     ex.shutdown(wait=True)
+    out['elapsed_seconds'] = round(time.monotonic()-started, 2)
 
     source_order = (
         "nexus", "workshop", "thunderstore", "gamebanana", "github",

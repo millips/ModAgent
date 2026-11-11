@@ -177,8 +177,8 @@ def _parse_json_object(text: str) -> dict:
     return {}
 
 
-def generate_catalog_notes(client, model: str, rows: list[dict]) -> list[dict]:
-    """Generate faithful summaries in one bounded LLM call."""
+def generate_catalog_notes(client, model: str, rows: list[dict], language: str = "zh-CN") -> list[dict]:
+    """Generate faithful summaries in the locally selected UI language."""
     if not rows:
         return []
     prompt_rows = [{
@@ -188,23 +188,37 @@ def generate_catalog_notes(client, model: str, rows: list[dict]) -> list[dict]:
         "evidence_kind": row["evidence_kind"],
         "evidence": row["evidence"],
     } for row in rows[:80]]
-    prompt = (
-        "为已安装 Mod 管理列表生成简体中文信息。每项返回："
-        "localized_name（简短忠实中文名，保留专有名词）和 summary"
-        "（一句话说明玩家会获得或改变什么，建议 20-70 个中文字）。"
-        "只能使用给出的名称和 evidence。evidence 为空时允许根据名称做保守推测，"
-        "但 summary 必须以“可能”开头，不能虚构具体按键、依赖或兼容性。"
-        "不要把版本号当成功能。只返回 JSON："
-        '{"items":[{"mod_id":"原值","localized_name":"中文名",'
-        '"summary":"功能简介"}]}。\n'
-        + json.dumps(prompt_rows, ensure_ascii=False)
-    )
+    english = str(language).lower() in {"en", "en-us", "en-gb"}
+    if english:
+        prompt = (
+            "Create clear English entries for the installed Mod manager. Each item returns "
+            "localized_name (normally keep the canonical original name) and summary "
+            "(one factual sentence about what it changes, 12-40 words). Use only the supplied "
+            "name and evidence. If evidence is empty, make a conservative inference and begin "
+            "the summary with 'Possibly:'. Do not invent shortcuts, dependencies or compatibility. "
+            "Return JSON only: {\"items\":[{\"mod_id\":\"original\",\"localized_name\":\"name\",\"summary\":\"summary\"}]}.\n"
+            + json.dumps(prompt_rows, ensure_ascii=False)
+        )
+        system = "You are a careful game Mod catalogue editor. State uncertainty explicitly."
+    else:
+        prompt = (
+            "为已安装 Mod 管理列表生成简体中文信息。每项返回："
+            "localized_name（简短忠实中文名，保留专有名词）和 summary"
+            "（一句话说明玩家会获得或改变什么，建议 20-70 个中文字）。"
+            "只能使用给出的名称和 evidence。evidence 为空时允许根据名称做保守推测，"
+            "但 summary 必须以“可能”开头，不能虚构具体按键、依赖或兼容性。"
+            "不要把版本号当成功能。只返回 JSON："
+            '{"items":[{"mod_id":"原值","localized_name":"中文名",'
+            '"summary":"功能简介"}]}。\n'
+            + json.dumps(prompt_rows, ensure_ascii=False)
+        )
+        system = "你是严谨的游戏 Mod 中文资料整理助手；证据不足时必须明确不确定。"
     response = client.chat.completions.create(
         model=model,
         messages=[
             {
                 "role": "system",
-                "content": "你是严谨的游戏 Mod 中文资料整理助手；证据不足时必须明确不确定。",
+                "content": system,
             },
             {"role": "user", "content": prompt},
         ],
@@ -224,8 +238,10 @@ def generate_catalog_notes(client, model: str, rows: list[dict]) -> list[dict]:
         summary = re.sub(r"\s+", " ", str(item.get("summary") or "")).strip()[:360]
         if not summary:
             continue
-        if row["evidence_kind"] == "name_inference" and not summary.startswith("可能"):
-            summary = "可能" + summary
+        if row["evidence_kind"] == "name_inference":
+            uncertain_prefix = "Possibly:" if english else "可能"
+            if not summary.lower().startswith(uncertain_prefix.lower()):
+                summary = uncertain_prefix + summary
         notes.append({
             "mod_id": row["mod_id"],
             "localized_name": localized_name,

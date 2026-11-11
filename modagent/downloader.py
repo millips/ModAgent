@@ -10,6 +10,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+from contextlib import closing
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -105,6 +106,8 @@ def _classify_download_error(exc: Exception) -> tuple[str, bool, Optional[int]]:
         if status in {404, 410}:
             return "http_not_found", False, status
         return "http_client_error" if 400 <= status < 500 else "http_error", False, status
+    if isinstance(exc, ssl.SSLCertVerificationError) or isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+        return "certificate_verification_failed", False, None
     if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
         return "network_transient", True, None
     return "unknown", False, None
@@ -115,6 +118,8 @@ def _download_failure_message(
     attempts: int,
     status: Optional[int] = None,
 ) -> str:
+    if kind == "certificate_verification_failed":
+        return "下载来源的 TLS 证书验证失败，未关闭验证或自动重试。请检查系统时间、代理和证书配置。"
     if kind == "http_not_found":
         return (
             f"下载地址不存在或已失效（HTTP {status}），未继续重试。"
@@ -1518,7 +1523,7 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
         )
 
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    ctx = ssl._create_unverified_context()
+    ctx = ssl.create_default_context()
     tmp_path = local_path + ".part"
 
     downloaded = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
@@ -1560,9 +1565,35 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
             continue
 
         status = getattr(resp, "status", 200)
+        response_end = None
+        if status == 206:
+            # A 206 alone does not prove that these bytes belong at our offset.
+            # Validate before opening the partial file in append mode.
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", str(resp.headers.get("Content-Range", "")).strip(), re.IGNORECASE)
+            valid_range = False
+            if match:
+                start, end, response_total = map(int, match.groups())
+                length_header = resp.headers.get("Content-Length")
+                try:
+                    valid_range = (
+                        start == downloaded and start <= end < response_total
+                        and (total is None or total == response_total)
+                        and (length_header is None or int(length_header) == end - start + 1)
+                    )
+                except (TypeError, ValueError):
+                    valid_range = False
+            if not valid_range:
+                resp.close()
+                raise DownloadFailure(
+                    "下载来源返回的续传范围与本地断点不一致，已停止拼接；保留已有文件。请重新核验下载链接后重试。",
+                    failure_kind="invalid_resume_response", retryable=False, attempts=attempt + 1,
+                )
+            total = response_total
+            response_end = end + 1
         # 服务器忽略 Range（返回 200 而非 206）→ 从头开始
         if downloaded and status == 200:
             downloaded = 0
+            total = None
         # 确定总大小
         if total is None:
             cr = resp.headers.get("Content-Range", "")
@@ -1577,28 +1608,35 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
 
         mode = "ab" if downloaded else "wb"
         got = 0
-        with open(tmp_path, mode) as f:
+        read_failed = False
+        with closing(resp), open(tmp_path, mode) as f:
             while True:
                 _raise_if_download_cancelled()
                 try:
                     chunk = resp.read(65536)
                 except Exception:
                     _raise_if_download_cancelled()
+                    read_failed = True
                     break
                 if not chunk:
                     break
+                if response_end is not None and downloaded + len(chunk) > response_end:
+                    raise DownloadFailure(
+                        "下载来源传回的数据超出声明的续传范围，已停止写入；未替换已有完整文件。请重新核验来源后重试。",
+                        failure_kind="invalid_resume_response", retryable=False, attempts=attempt + 1,
+                    )
                 f.write(chunk)
                 downloaded += len(chunk)
                 got += len(chunk)
                 if progress_callback and total:
                     progress_callback(min(downloaded / total, 1.0))
-        try:
-            resp.close()
-        except Exception:
-            pass
-
         if total and downloaded >= total:
             break
+        if not total and read_failed:
+            raise DownloadFailure(
+                "下载读取中断且来源未提供总大小，保留临时文件，未报告下载完成。",
+                failure_kind="read_interrupted", retryable=True, attempts=attempt + 1,
+            )
         if not total:
             break  # 无法判断总量，按一次性完成处理
         # 没下完 → 续传

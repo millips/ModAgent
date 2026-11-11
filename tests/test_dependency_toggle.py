@@ -50,6 +50,9 @@ F = add_mod(
     "F", ["BepInEx-BepInExPack-5.4.2100"], disabled=True,
 )
 os.makedirs(os.path.join(GAME, "BepInEx"), exist_ok=True)
+os.makedirs(os.path.join(GAME, "BepInEx", "core"), exist_ok=True)
+with open(os.path.join(GAME, "BepInEx", "core", "BepInEx.Core.dll"), "wb") as stream:
+    stream.write(b"runtime")
 
 cfg = types.SimpleNamespace(
     nexus_api_key="", game_slug="repo", game_id=0, game_root=GAME,

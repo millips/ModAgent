@@ -22,7 +22,7 @@ gh._http_json = lambda url, headers=None: {"items": [
 ]}
 r = gh.search("minimap", "Palworld", limit=5)
 check("A1 github: irrelevant/archived result filtered", len(r) == 1)
-check("A2 github: summary truncated to 140", len(r[0]["summary"]) <= 140)
+check("A2 github: preserves source evidence beyond display excerpt", r[0]["summary"] == "A Palworld mod " + "x" * 200)
 check("A3 github: stars/updated/archived", r[0]["stars"] == 42
       and r[0]["updated_at"] == "2026-05-21" and r[0]["archived"] is False)
 check("A4 github: relevant result retained", r[0]["name"] == "PalMod")
@@ -69,12 +69,17 @@ check("C1 gamebanana shaped", r[0]["name"] == "Growlmon" and r[0]["has_files"] i
       and r[0]["updated_at"].startswith("2025"))
 check("C2 no-files flagged", r[1]["has_files"] is False and r[1]["updated_at"] == "")
 
-# find_game 站点不可达 → None 且不缓存失败
+# 站点不可达必须与成功查询无匹配区分，且不缓存失败。
 def _boom(url, headers=None):
     raise OSError("net down")
 gb._http_json = _boom
 gb._GAME_CACHE.clear()
-check("D1 unreachable → None", gb.find_game("SomeGame") is None)
+try:
+    gb.find_game("SomeGame")
+except gb.GameDiscoveryFailed:
+    check("D1 unreachable is discovery failure", True)
+else:
+    check("D1 unreachable is discovery failure", False)
 gb._http_json = _gb_game
 check("D2 failure not cached, retry works", gb.find_game("SomeGame") == 19741
       or gb.find_game("Palworld") == 19741)

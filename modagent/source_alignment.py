@@ -187,6 +187,36 @@ def _public_candidate(row: dict, score: float) -> dict:
     } | {"score": score}
 
 
+def _dedupe_nexus_rows(rows: list[dict]) -> list[dict]:
+    """Return one candidate per stable Nexus Mod ID.
+
+    A search engine can expose the overview, files and image URLs for the same
+    Nexus project.  Presenting those as three choices creates fake ambiguity
+    and makes manual alignment needlessly painful.
+    """
+    seen: dict[str, dict] = {}
+    order: list[str] = []
+    for raw in rows or []:
+        row = dict(raw or {})
+        mod_id = str(row.get("mod_id") or "").strip()
+        if not mod_id:
+            continue
+        if mod_id not in seen:
+            seen[mod_id] = row
+            order.append(mod_id)
+            continue
+        current = seen[mod_id]
+        current_quality = sum(bool(current.get(field)) for field in (
+            "version", "author", "summary", "updated_time", "downloads",
+        ))
+        row_quality = sum(bool(row.get(field)) for field in (
+            "version", "author", "summary", "updated_time", "downloads",
+        ))
+        if row_quality > current_quality:
+            seen[mod_id] = row
+    return [seen[mod_id] for mod_id in order]
+
+
 def _complete_binding(binding: dict | None) -> bool:
     """A usable binding needs both a stable identity and a public maintenance page.
 
@@ -411,10 +441,13 @@ def align_installed_mods(
                     break
                 resolved.append(nexus_candidates(mod))
 
+        # A forced re-alignment may reconsider an existing binding for the
+        # same local Mod.  Its own stable ID is not a collision; another
+        # local Mod claiming that ID still is.
         claimed = {
-            str(item.get("source_key"))
+            str(item.get("source_key")): str(item.get("mod_id"))
             for item in db.get_mod_source_bindings(slug)
-            if item.get("source") == "nexus"
+            if item.get("source") == "nexus" and item.get("source_key")
         }
         still_pending = []
         nexus_errors = []
@@ -423,7 +456,7 @@ def align_installed_mods(
                 break
             aliases = _local_aliases(mod)
             ranked = []
-            for row in rows[:10]:
+            for row in _dedupe_nexus_rows(rows)[:10]:
                 candidate = {
                     "_normalized": normalize_name(row.get("name", "")),
                     "_full_normalized": normalize_name(row.get("name", "")),
@@ -449,7 +482,7 @@ def align_installed_mods(
                 and len(credible) == 1
                 and runner_up < .80
             )
-            if source_key and source_key not in claimed and (exact or strong):
+            if source_key and claimed.get(source_key) in {None, str(mod.id)} and (exact or strong):
                 url = f"https://www.nexusmods.com/{nexus_slug}/mods/{source_key}"
                 latest = str(best.get("version") or "")
                 method = "exact_name" if exact else "strong_name"
@@ -458,7 +491,7 @@ def align_installed_mods(
                     best_score, method, latest,
                     {"nexus_slug": nexus_slug, "matched_name": best.get("name", "")},
                 )
-                claimed.add(source_key)
+                claimed[source_key] = str(mod.id)
                 report["bound"].append({
                     "mod_id": str(mod.id), "name": mod.name, "source": "nexus",
                     "source_key": source_key, "confidence": best_score,
@@ -466,7 +499,10 @@ def align_installed_mods(
                     "latest_version": latest, "url": url,
                 })
                 notify(mod, "done")
-            elif best_score >= .58 and ranked:
+            # Below this threshold a search result is only a weak textual
+            # resemblance.  Do not bury the user in low-confidence cards;
+            # leave it unmatched and expose the explicit URL-check path.
+            elif best_score >= .72 and ranked:
                 candidates = []
                 for score, row in ranked[:3]:
                     if score < .45:
@@ -480,7 +516,9 @@ def align_installed_mods(
                         ),
                         "name": str(row.get("name") or ""),
                         "version": str(row.get("version") or ""),
-                        "summary": str(row.get("summary") or "")[:500],
+                        "summary": nexus._source_plain_text(
+                            str(row.get("summary") or "")
+                        )[:500],
                         "score": score,
                         "detail_verified": False,
                     }
@@ -492,8 +530,12 @@ def align_installed_mods(
                             "name": str(detail.get("name") or candidate["name"]),
                             "version": str(detail.get("version") or candidate["version"]),
                             "author": str(detail.get("author") or ""),
-                            "summary": str(detail.get("summary") or "")[:800],
-                            "description": str(detail.get("description") or "")[:2000],
+                            "summary": nexus._source_plain_text(
+                                str(detail.get("summary") or "")
+                            )[:800],
+                            "description": nexus._source_plain_text(
+                                str(detail.get("description") or "")
+                            )[:1200],
                             "dependencies": detail.get("dependencies") or [],
                             "updated_at": str(detail.get("updated_at") or ""),
                             "detail_verified": True,
@@ -605,7 +647,7 @@ def align_installed_mods(
                 "match_method": method,
             })
             notify(mod, "done")
-        elif best_score >= .58:
+        elif best_score >= .72:
             report["ambiguous"].append(base | {
                 "reason": "候选相似，但不足以安全自动绑定",
                 "candidates": [

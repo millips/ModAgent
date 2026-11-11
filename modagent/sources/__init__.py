@@ -9,6 +9,7 @@ import time
 import urllib.request
 
 from .. import downloader
+from .. import task_control
 
 
 class RequestCancelled(RuntimeError):
@@ -19,7 +20,8 @@ def _http_json(
     url: str, headers: dict = None, *, timeout: int = 12,
     total_timeout: int = 60, cancel_check=None,
 ) -> dict:
-    ctx = ssl._create_unverified_context()
+    task_control.raise_if_cancelled()
+    ctx = ssl.create_default_context()
     h = {
         "User-Agent": "ModAgent/1.3",
         "Accept": "application/json",
@@ -34,6 +36,7 @@ def _http_json(
     chunks = []
     with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
         while True:
+            task_control.raise_if_cancelled()
             if cancel_check and cancel_check():
                 raise RequestCancelled("用户已取消当前网络任务")
             if total_timeout and time.monotonic() - started > total_timeout:
@@ -46,6 +49,17 @@ def _http_json(
         if str(r.headers.get("Content-Encoding") or "").casefold() == "gzip":
             raw = gzip.decompress(raw)
         return json.loads(raw)
+
+
+def _require_record_list(data, field: str) -> list[dict]:
+    """Do not convert missing/malformed service responses into empty results."""
+    if (not isinstance(data, dict) or not isinstance(data.get(field), list)
+            or any(not isinstance(item, dict) for item in data[field])):
+        raise RuntimeError(
+            "来源返回的数据格式异常，无法确认搜索结果。请稍后重试或使用其他来源。 / "
+            "The source response is invalid; search results are unconfirmed. Retry later or use another source."
+        )
+    return data[field]
 
 
 def _safe(name: str) -> str:
@@ -67,10 +81,13 @@ def available_sources(game_name: str, game_slug: str, game_root: str,
     """当前游戏在哪些平台有 mod 可搜。CURRENT STATE 注入 + mod_recommend 选源共用。
     本地判断(nexus=slug 非 local_、工坊=acf 解析)零成本;联网探测(thunderstore 社区、
     gamebanana 收录)并发跑、单项限时 4 秒,失败按不可用处理——绝不阻塞对话首条消息。
-    结果按游戏缓存 1 小时。github 是通用代码托管,恒可用。"""
+    完整探测结果按游戏及安装目录缓存 1 小时，失败结果不缓存。
+    github 支持通用仓库搜索；此处不证明其当前网络可达。"""
     import time
     key = (
         (game_slug or game_name or "").lower(),
+        (game_name or "").strip().casefold(),
+        os.path.normcase(os.path.realpath(game_root)) if game_root else "",
         bool(tavily_key),
         bool(nexus_api_key),
     )
@@ -153,7 +170,11 @@ def available_sources(game_name: str, game_slug: str, game_root: str,
             }
     ex.shutdown(wait=False)      # 超时的探测线程后台自生自灭,不拖住对话
 
-    _SRC_CACHE[key] = (time.time(), out)
+    if not any(
+        item.get("status") == "search_failed"
+        for item in out["source_status"].values()
+    ):
+        _SRC_CACHE[key] = (time.time(), out)
     return out
 
 
@@ -170,7 +191,7 @@ def detect_source(url: str) -> str:
     return ""
 
 
-def download_from_url(url: str, game_slug: str, progress_callback=None) -> dict:
+def download_from_url(url: str, game_slug: str, progress_callback=None, *, expected_version: str = "") -> dict:
     """根据链接自动识别来源并下载，返回 {local_path, name, source, version}。"""
     src = detect_source(url)
     if src == "github":
@@ -178,6 +199,8 @@ def download_from_url(url: str, game_slug: str, progress_callback=None) -> dict:
         return github.download(url, game_slug, progress_callback)
     if src == "thunderstore":
         from . import thunderstore
+        if expected_version:
+            return thunderstore.download(url, game_slug, progress_callback, expected_version=expected_version)
         return thunderstore.download(url, game_slug, progress_callback)
     if src == "gamebanana":
         from . import gamebanana

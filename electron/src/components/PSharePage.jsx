@@ -14,16 +14,25 @@ const STATUS = {
   published: { label: '已发布', tone: 'text-cyber-green bg-cyber-green/10', icon: CheckCircle2 },
 }
 
-function stamp(value) {
-  if (!value) return '—'
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', { hour12: false })
+const STATUS_LABELS_EN = {
+  draft: 'Draft', submission_opened: 'Ready to submit', reviewing: 'Under review',
+  needs_changes: 'Changes requested', rejected: 'Not approved', published: 'Published',
 }
 
-function StatusBadge({ status }) {
+function statusLabel(status, language) {
+  return language === 'en' ? (STATUS_LABELS_EN[status] || STATUS_LABELS_EN.draft) : (STATUS[status]?.label || STATUS.draft.label)
+}
+
+function stamp(value, language = 'zh-CN') {
+  if (!value) return '—'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString(language === 'en' ? 'en-US' : 'zh-CN', { hour12: false })
+}
+
+function StatusBadge({ status, language = 'zh-CN' }) {
   const item = STATUS[status] || STATUS.draft
   const Icon = item.icon
-  return <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] ${item.tone}`}><Icon size={12} />{item.label}</span>
+  return <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] ${item.tone}`}><Icon size={12} />{statusLabel(status, language)}</span>
 }
 
 function openExternal(url) {
@@ -49,7 +58,7 @@ function resolveStatus(labels = []) {
   return 'reviewing'
 }
 
-export default function PSharePage({ toast }) {
+export default function PSharePage({ toast, language = 'zh-CN' }) {
   const profile = usePShareProfile()
   const submissions = usePShareSubmissions()
   const [gameFilter, setGameFilter] = useState('all')
@@ -154,7 +163,7 @@ export default function PSharePage({ toast }) {
   }
 
   if (!profile) {
-    return <div className="h-full flex items-center justify-center text-surface-400">请先在设置中开通 P Share 创作者计划。</div>
+    return <div className="h-full flex items-center justify-center text-surface-400">{language === 'en' ? 'Enable the P Share creator program in Settings first.' : '请先在设置中开通 P Share 创作者计划。'}</div>
   }
 
   return (
@@ -163,12 +172,12 @@ export default function PSharePage({ toast }) {
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <div className="text-cyber-cyan text-xs tracking-[.22em] mb-2">P SHARE / CREATOR SPACE</div>
-            <h2 className="text-2xl font-semibold text-white flex items-center gap-2"><Sparkles className="text-cyber-cyan" size={22} /> 分享者主页</h2>
-            <p className="text-sm text-surface-400 mt-2">{profile.display_name || 'P Share 创作者'} · 管理本机导出的投稿，关联 GitHub Issue 后可查看审核状态。</p>
+            <h2 className="text-2xl font-semibold text-white flex items-center gap-2"><Sparkles className="text-cyber-cyan" size={22} /> {language === 'en' ? 'Creator space' : '分享者主页'}</h2>
+            <p className="text-sm text-surface-400 mt-2">{profile.display_name || (language === 'en' ? 'P Share creator' : 'P Share 创作者')} · {language === 'en' ? 'Manage local submissions and link a GitHub Issue to follow review status.' : '管理本机导出的投稿，关联 GitHub Issue 后可查看审核状态。'}</p>
           </div>
           <div className="rounded-xl bg-surface-900/70 px-4 py-3 text-right">
             <div className="text-xl font-semibold text-white">{submissions.length}</div>
-            <div className="text-xs text-surface-500">我的投稿</div>
+            <div className="text-xs text-surface-500">{language === 'en' ? 'My submissions' : '我的投稿'}</div>
           </div>
         </div>
       </section>
@@ -177,35 +186,35 @@ export default function PSharePage({ toast }) {
         <div className="flex flex-wrap items-center gap-3">
           <Filter size={16} className="text-surface-500" />
           <select value={gameFilter} onChange={event => setGameFilter(event.target.value)} className="input-cyber min-w-40 text-sm">
-            <option value="all">全部游戏</option>
+            <option value="all">{language === 'en' ? 'All games' : '全部游戏'}</option>
             {games.map(game => <option key={game} value={game}>{game}</option>)}
           </select>
           <select value={statusFilter} onChange={event => setStatusFilter(event.target.value)} className="input-cyber min-w-32 text-sm">
-            <option value="all">全部状态</option>
-            {Object.entries(STATUS).map(([key, item]) => <option key={key} value={key}>{item.label}</option>)}
+            <option value="all">{language === 'en' ? 'All statuses' : '全部状态'}</option>
+            {Object.keys(STATUS).map(key => <option key={key} value={key}>{statusLabel(key, language)}</option>)}
           </select>
-          <span className="text-xs text-surface-500 ml-auto">显示 {visible.length} / {submissions.length}</span>
+          <span className="text-xs text-surface-500 ml-auto">{language === 'en' ? 'Showing' : '显示'} {visible.length} / {submissions.length}</span>
         </div>
 
         {visible.length === 0 ? (
           <div className="py-14 text-center text-surface-500">
             <FileText size={28} className="mx-auto mb-3 opacity-60" />
-            还没有符合条件的投稿。请在 Mod 管理中选择已对齐的 Mod 后导出分享配置。
+            {language === 'en' ? 'No matching submissions yet. Select source-aligned Mods in Mod Manager, then export a share configuration.' : '还没有符合条件的投稿。请在 Mod 管理中选择已对齐的 Mod 后导出分享配置。'}
           </div>
         ) : (
           <div className="mt-4 overflow-x-auto">
             <table className="w-full min-w-[680px] text-sm">
               <thead className="text-left text-xs text-surface-500 border-b border-surface-600">
-                <tr><th className="pb-3 font-medium">标题</th><th className="pb-3 font-medium">游戏</th><th className="pb-3 font-medium">Mod</th><th className="pb-3 font-medium">导出时间</th><th className="pb-3 font-medium">状态</th><th className="pb-3" /></tr>
+                <tr><th className="pb-3 font-medium">{language === 'en' ? 'Title' : '标题'}</th><th className="pb-3 font-medium">{language === 'en' ? 'Game' : '游戏'}</th><th className="pb-3 font-medium">Mod</th><th className="pb-3 font-medium">{language === 'en' ? 'Exported' : '导出时间'}</th><th className="pb-3 font-medium">{language === 'en' ? 'Status' : '状态'}</th><th className="pb-3" /></tr>
               </thead>
               <tbody>
                 {visible.map(entry => <tr key={entry.submission_id} className="border-b border-surface-700/70 hover:bg-surface-700/30">
                   <td className="py-3 text-white max-w-[280px] truncate">{entry.title || '未命名合集'}</td>
                   <td className="py-3 text-surface-400">{entry.game_name || '未记录'}</td>
                   <td className="py-3 text-surface-300">{entry.mod_count || 0}</td>
-                  <td className="py-3 text-surface-500 text-xs">{stamp(entry.created_at)}</td>
-                  <td className="py-3"><StatusBadge status={entry.status} /></td>
-                  <td className="py-3 text-right"><button type="button" className="btn-ghost text-xs" onClick={() => selectDetail(entry)}>查看详情</button></td>
+                  <td className="py-3 text-surface-500 text-xs">{stamp(entry.created_at, language)}</td>
+                  <td className="py-3"><StatusBadge status={entry.status} language={language} /></td>
+                  <td className="py-3 text-right"><button type="button" className="btn-ghost text-xs" onClick={() => selectDetail(entry)}>{language === 'en' ? 'View details' : '查看详情'}</button></td>
                 </tr>)}
               </tbody>
             </table>
@@ -215,8 +224,8 @@ export default function PSharePage({ toast }) {
 
       {detail && <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/65 p-4" role="dialog" aria-modal="true" aria-label="投稿详情">
         <div className="w-full max-w-2xl max-h-[88vh] overflow-y-auto rounded-2xl border border-cyber-cyan/20 bg-surface-900 p-5 shadow-2xl">
-          <div className="flex items-start justify-between gap-3"><div><div className="text-xs text-cyber-cyan tracking-[.18em]">SUBMISSION DETAIL</div><h3 className="text-lg text-white mt-1">{detail.title || '未命名合集'}</h3></div><button className="btn-ghost" onClick={() => setDetail(null)}>关闭</button></div>
-          <div className="grid grid-cols-2 gap-3 mt-5 text-sm"><div className="rounded-lg bg-surface-800 p-3"><div className="text-xs text-surface-500">投稿编号</div><div className="text-surface-200 break-all mt-1">{detail.submission_id}</div></div><div className="rounded-lg bg-surface-800 p-3"><div className="text-xs text-surface-500">当前状态</div><div className="mt-1"><StatusBadge status={detail.status} /></div></div></div>
+          <div className="flex items-start justify-between gap-3"><div><div className="text-xs text-cyber-cyan tracking-[.18em]">SUBMISSION DETAIL</div><h3 className="text-lg text-white mt-1">{detail.title || (language === 'en' ? 'Untitled collection' : '未命名合集')}</h3></div><button className="btn-ghost" onClick={() => setDetail(null)}>{language === 'en' ? 'Close' : '关闭'}</button></div>
+          <div className="grid grid-cols-2 gap-3 mt-5 text-sm"><div className="rounded-lg bg-surface-800 p-3"><div className="text-xs text-surface-500">{language === 'en' ? 'Submission ID' : '投稿编号'}</div><div className="text-surface-200 break-all mt-1">{detail.submission_id}</div></div><div className="rounded-lg bg-surface-800 p-3"><div className="text-xs text-surface-500">{language === 'en' ? 'Current status' : '当前状态'}</div><div className="mt-1"><StatusBadge status={detail.status} language={language} /></div></div></div>
           <div className="mt-4 text-sm text-surface-300 space-y-2"><p>游戏：{detail.game_name || '未记录'} · Mod 数量：{detail.mod_count || 0}</p>{detail.description && <p>简介：{detail.description}</p>}{detail.warning && <p className="text-amber-200">警告：{detail.warning}</p>}{detail.filename && <p className="text-surface-500 text-xs">文件：{detail.filename}</p>}</div>
           {!detail.issue_url ? <div className="mt-5 rounded-xl border border-surface-600 p-4"><p className="text-sm text-surface-300 mb-3">打开官方投稿页后按辅助填报完成提交；提交成功后，在浏览器地址栏按 Ctrl+L、Ctrl+C，再回到这里一键关联。</p><div className="flex flex-wrap gap-2"><input className="input-cyber min-w-[18rem] flex-1 text-sm" value={issueUrl} onChange={event => setIssueUrl(event.target.value)} placeholder="https://github.com/millips/ModAgent-Share/issues/123" /><button className="btn-ghost text-sm" onClick={saveIssue}>手动关联</button><button className="btn-cyber text-sm" onClick={linkIssueFromClipboard}>从剪贴板关联 Issue</button></div><button className="btn-ghost text-xs mt-3" onClick={() => { setShowSubmissionHelper(true); openExternal(ISSUE_BASE) }}><ExternalLink size={13} /> 打开官方投稿页与辅助填报</button></div> : <div className="mt-5 rounded-xl border border-surface-600 p-4 flex flex-wrap items-center gap-3"><button className="btn-ghost text-sm" onClick={() => openExternal(detail.issue_url)}><ExternalLink size={14} /> 打开 GitHub Issue</button><button className="btn-cyber text-sm" disabled={syncing} onClick={syncIssue}><RefreshCw size={14} className={syncing ? 'animate-spin' : ''} /> {syncing ? '同步中…' : '同步审核状态'}</button>{detail.status === 'published' && !detail.ma_code && <button className="btn-ghost text-xs" disabled={syncing} onClick={lookupShareCode}>查看分享码</button>}{detail.ma_code && <><code className="rounded border border-cyber-green/30 bg-cyber-green/5 px-2 py-1 text-xs text-cyber-green">{detail.ma_code}</code><button className="btn-ghost text-xs" onClick={() => copySubmissionText(detail.ma_code, toast, '正式分享码')}>复制分享码</button></>}</div>}
         </div>

@@ -40,7 +40,7 @@ check("A1 local Info.json wins when API fails",
       f"got {out.get('ws_3677771546')}")
 check("A2 version from Info.json", out.get("ws_3677771546", {}).get("version") == "0.86")
 check("A3 no Info.json + API fail → placeholder",
-      out.get("ws_3711425298", {}).get("name") == "Workshop 3711425298")
+      out.get("ws_3711425298", {}).get("name") == "Steam Workshop #3711425298（标题暂未取得）")
 
 # 场景2:Steam API 可用 → Info.json 仍优先(离线可靠),B 用 API 名
 sw.get_titles = lambda ids: {"3677771546": "STEAM-Pal Analyzer", "3711425298": "Humans Reworked"}

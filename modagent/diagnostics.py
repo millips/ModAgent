@@ -12,6 +12,8 @@ import re
 import shutil
 import sys
 import time
+import tempfile
+import uuid
 import zipfile
 from dataclasses import asdict, is_dataclass
 
@@ -108,6 +110,16 @@ _LOGGER_FRAME_RE = re.compile(
 _UE4SS_MODFAIL_RE = re.compile(r"ModClass for '([^']+)' is not valid", re.I)
 
 
+class DiagnosticLogUnreadable(OSError):
+    pass
+
+
+_LOG_READ_ERROR = (
+    "日志无法完整读取，请检查文件权限和磁盘连接后重试；不能据此判断没有错误。 / "
+    "A log could not be read completely. Check file permissions and drive connectivity, then retry. This does not mean the log has no errors."
+)
+
+
 def _read_tail(path: str, max_bytes: int = 200_000) -> str:
     """只读日志尾部(大日志可达几十 MB),按 UTF-8 宽松解码。"""
     try:
@@ -117,7 +129,7 @@ def _read_tail(path: str, max_bytes: int = 200_000) -> str:
             f.seek(max(0, size - max_bytes))
             return f.read().decode("utf-8", errors="replace")
     except OSError:
-        return ""
+        raise DiagnosticLogUnreadable(_LOG_READ_ERROR) from None
 
 
 def _framework_logs(game_root: str) -> list:
@@ -177,8 +189,14 @@ def game_diagnose(game_root: str, game_slug: str = "", installed_mods=None,
         return name_in_log
 
     findings = []
+    read_errors = []
     for fw, path in logs:
-        lines = _read_tail(path).splitlines()
+        try:
+            lines = _read_tail(path).splitlines()
+        except DiagnosticLogUnreadable:
+            read_errors.append({"framework": fw, "error_code": "DIAGNOSTIC_LOG_UNREADABLE",
+                                "error": _LOG_READ_ERROR})
+            continue
         errs, warns = [], []
         modfails = {}                       # 框架强信号:mod名 → 出现次数(明确的加载失败)
         for ln in lines:
@@ -241,7 +259,8 @@ def game_diagnose(game_root: str, game_slug: str = "", installed_mods=None,
             "attributed_mods": [{"id": mid, **a} for mid, a in attributed.items()],
             "suggestions": suggestions,
         })
-    return {"frameworks": [fw for fw, _ in logs], "findings": findings}
+    return {"frameworks": [fw for fw, _ in logs], "findings": findings,
+            "complete": not read_errors, "read_errors": read_errors}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -254,8 +273,33 @@ def game_diagnose(game_root: str, game_slug: str = "", installed_mods=None,
 _SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_-]{12,}|tvly-[A-Za-z0-9_-]{12,}|[A-Fa-f0-9]{32,})")
 
 
-def _scrub(text: str) -> str:
-    return _SECRET_RE.sub("***REDACTED***", text or "")
+def _scrub(text: str, secrets=()) -> str:
+    text = text or ""
+    # Known configured values need not match a vendor-specific key prefix.
+    # Handle raw logs plus once/twice JSON-encoded operation-log details.
+    variants = set()
+    for secret in secrets:
+        if not isinstance(secret, str) or not secret:
+            continue
+        variants.add(secret)
+        for _ in range(2):
+            secret = json.dumps(secret, ensure_ascii=False)[1:-1]
+            variants.add(secret)
+    for value in sorted(variants, key=len, reverse=True):
+        text = text.replace(value, "***REDACTED***")
+    return _SECRET_RE.sub("***REDACTED***", text)
+
+
+def _configured_secrets(cfg) -> list[str]:
+    if cfg is None:
+        return []
+    try:
+        values = asdict(cfg) if is_dataclass(cfg) else dict(vars(cfg))
+    except TypeError:
+        return []
+    return [value for key, value in values.items()
+            if any(part in key.lower() for part in ("key", "token", "secret", "password"))
+            and isinstance(value, str) and value]
 
 
 def _redact_config(cfg) -> dict:
@@ -276,13 +320,13 @@ def export_diag_bundle(game_root: str, game_slug: str = "", cfg=None,
                        installed_mods=None, operation_log=None,
                        out_dir: str = "", app_version: str = "") -> dict:
     """打诊断包 zip:框架日志 + 操作记录 + 版本/环境 + 脱敏配置。
-    绝不含任何 API key —— 配置按字段名脱敏,所有文本再过一遍 _scrub 兜底。"""
+    配置按字段名脱敏，文本遮盖已知配置密钥及常见密钥模式；分享前仍需人工检查。"""
     if not game_root or not os.path.isdir(game_root):
         return {"error": "游戏目录不存在,无法生成诊断包"}
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_dir = out_dir or os.path.join(CONFIG_DIR, "diagnostics")
-    os.makedirs(out_dir, exist_ok=True)
-    zip_path = os.path.join(out_dir, f"modagent_diag_{game_slug or 'game'}_{ts}.zip")
+    safe_slug = re.sub(r'[^A-Za-z0-9_-]', '_', game_slug or 'game')[:80]
+    zip_path = os.path.join(out_dir, f"modagent_diag_{safe_slug}_{ts}_{uuid.uuid4().hex}.zip")
 
     logs = _framework_logs(game_root)
     manifest = {
@@ -302,17 +346,37 @@ def export_diag_bundle(game_root: str, game_slug: str = "", cfg=None,
     }
 
     contains = ["manifest.json"]
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("manifest.json", _scrub(json.dumps(manifest, ensure_ascii=False, indent=2)))
-        if operation_log is not None:
-            z.writestr("operation_log.json",
-                       _scrub(json.dumps(operation_log, ensure_ascii=False, indent=2)))
-            contains.append("operation_log.json")
-        for fw, path in logs:
-            arc = f"logs/{fw}_{os.path.basename(path)}"
-            z.writestr(arc, _scrub(_read_tail(path, max_bytes=1_000_000)))
-            contains.append(arc)
+    secrets = _configured_secrets(cfg)
+    temporary = None
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix='.modagent-diag-', suffix='.tmp', dir=out_dir)
+        os.close(fd)
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("manifest.json", _scrub(json.dumps(manifest, ensure_ascii=False, indent=2), secrets))
+            if operation_log is not None:
+                z.writestr("operation_log.json",
+                           _scrub(json.dumps(operation_log, ensure_ascii=False, indent=2), secrets))
+                contains.append("operation_log.json")
+            for fw, path in logs:
+                arc = f"logs/{fw}_{os.path.basename(path)}"
+                z.writestr(arc, _scrub(_read_tail(path, max_bytes=1_000_000), secrets))
+                contains.append(arc)
+        size_bytes = os.path.getsize(temporary)
+        os.replace(temporary, zip_path)
+        temporary = None
+    except DiagnosticLogUnreadable:
+        return {"error_code": "DIAGNOSTIC_LOG_UNREADABLE", "error": _LOG_READ_ERROR}
+    except (OSError, ValueError, TypeError, zipfile.BadZipFile):
+        return {"error_code": "DIAGNOSTIC_EXPORT_FAILED",
+                "error": "诊断包未能完整保存。请检查可用空间和输出目录权限后重试；已有诊断包未被替换。 / Diagnostic export could not be saved completely. Check disk space and output-folder permissions, then retry. Existing bundles were not replaced."}
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
-    return {"bundle": zip_path, "size_bytes": os.path.getsize(zip_path),
+    return {"bundle": zip_path, "size_bytes": size_bytes,
             "contains": contains, "redacted": True,
-            "note": "诊断包已生成并脱敏(不含任何 API key)。可手动发给开发者协助排查。"}
+            "note": "诊断包已遮盖已知配置密钥及常见密钥格式。日志仍可能含个人路径或其他敏感信息，请检查后再手动分享。"}

@@ -2,9 +2,13 @@
 
 面向 Windows 的本地 AI Mod 管理器：对话搜索、方案分析、安装确认、Mod 管理与快照回滚。
 
-当前版本：**v1.5.1 稳定版**。
+当前公开测试版：**v1.6.0-beta.1（r29）**；保留 **v1.5.1** 稳定版。新版包含 Agent Core v2、简化首次配置、中英文引导、浏览器后台运行和故障恢复改进，尚未宣称为最终 v1.7。
 
-[下载 v1.5.1 普通版](https://github.com/millips/ModAgent/releases/tag/v1.5.1) · [游戏适配与合作评估](https://github.com/millips/ModAgent/discussions/5) · [提交问题](https://github.com/millips/ModAgent/issues) · [隐私说明](PRIVACY.md)
+English testers: see the [English Quick Start](docs/ENGLISH-QUICKSTART.md).
+
+[下载新版 Beta（普通版 / P）](https://github.com/millips/ModAgent/releases/tag/v1.6.0-beta.1) · [下载 v1.5.1 稳定版](https://github.com/millips/ModAgent/releases/tag/v1.5.1) · [游戏适配与合作评估](https://github.com/millips/ModAgent/discussions/5) · [提交问题](https://github.com/millips/ModAgent/issues) · [隐私说明](PRIVACY.md)
+
+首次启动只需一个兼容的大模型 API Key，Nexus 与 Tavily 用到时再配置；Nexus 文件核验仍可能需要个人 API Key，网页下载可能需要登录。Chrome / Edge / Brave 默认最小化，验证时恢复窗口；升级沿用本机用户资料。同一浏览器保留专用登录资料，不同浏览器各自登录。
 
 ![ModAgent 普通版对话与状态总览](docs/assets/promo/v1.0.0/01-chat-overview.png)
 
@@ -81,7 +85,7 @@ ModAgent 把核心流程整理进一个桌面界面：
 | 官方分享合集导入 | ✓ | ✓ |
 | P Share 创作者投稿与状态追踪 | — | ✓ |
 
-两版目前都需要用户配置自己的大模型 API Key；Nexus 和 Tavily 为可选增强。ModAgent P 首发提供 3 天试用，爱发电兑换码离线验证后开放 60 天。到期只关闭 P 专属体验、P Share 投稿和后续 P 下载权限，不影响核心功能和用户数据。
+两版目前都需要用户配置自己的大模型 API Key；Nexus 和 Tavily 为可选增强。ModAgent P 首发提供 3 天主动试用。爱发电月付支持会在付款后 48 小时内人工发放当月兑换码：当月领取的主题、壁纸和音效内容包永久保留；停止续费只会停止后续月份新内容、P Share 投稿和后续 P 下载权限，不影响核心功能和用户数据。
 
 完整边界和不承诺事项见 [普通版与 P 功能矩阵](docs/EDITION-COMPARISON.md)。GitHub 普通版不包含 P 专有资源和许可证公钥。
 

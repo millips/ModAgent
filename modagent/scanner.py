@@ -129,8 +129,23 @@ def _stored_files(value) -> list:
     return parsed if isinstance(parsed, list) else []
 
 
+class ScanDirectoryUnreadable(RuntimeError):
+    code = "SCAN_DIRECTORY_UNREADABLE"
+
+
+def _unreadable_directory(_error):
+    # os.walk otherwise suppresses read errors and returns a partial tree.
+    # Never import that partial file inventory as a complete package.
+    raise ScanDirectoryUnreadable(
+        "无法完整读取模组目录，请检查文件夹权限或磁盘连接后重新扫描。"
+        " Cannot read the complete mod directory; check folder permissions "
+        "and drive connectivity, then scan again."
+    ) from None
+
+
 def _scan_generic_loaders(game_root: str) -> list:
     """探测通用加载器目录，每个子文件夹 / 松散 .dll 视为一个 mod（不依赖游戏名）。"""
+
     results = []
     for rel in GENERIC_LOADER_DIRS:
         base = os.path.join(game_root, rel.replace("/", os.sep))
@@ -138,14 +153,16 @@ def _scan_generic_loaders(game_root: str) -> list:
             continue
         try:
             entries = os.listdir(base)
-        except PermissionError:
-            continue
+        except OSError as exc:
+            _unreadable_directory(exc)
         for entry in entries:
             full = os.path.join(base, entry)
             if os.path.isdir(full):
                 if entry.lower() in _LOADER_SKIP:
                     continue
-                files = [os.path.join(r, f) for r, _, fs in os.walk(full) for f in fs]
+                files = [os.path.join(r, f)
+                         for r, _, fs in os.walk(full, onerror=_unreadable_directory)
+                         for f in fs]
                 if not files:
                     continue
                 name, ver = _parse_loader_name(entry)
@@ -180,7 +197,10 @@ def _scan_steam_workshop(game_root: str) -> list:
     out = []
     for wid, full in items:
         lname, lver = _workshop_local_meta(full)
-        name = lname or titles.get(wid) or f"Workshop {wid}"
+        # A workshop directory may have no local manifest and Steam's public
+        # title lookup can fail transiently.  Say that plainly rather than
+        # making a numeric ID look like a meaningful Mod title.
+        name = lname or titles.get(wid) or f"Steam Workshop #{wid}（标题暂未取得）"
         # 工坊由 Steam 托管、卸载=取消订阅，DB 只存文件夹路径即可（不存上千个文件）
         out.append({
             "id": "ws_" + wid,
@@ -210,9 +230,10 @@ def _scan_external_mod_root(root: str) -> list[dict]:
     if not os.path.isdir(root):
         return []
     try:
-        entries = list(os.scandir(root))
-    except (OSError, PermissionError):
-        return []
+        with os.scandir(root) as directory:
+            entries = list(directory)
+    except OSError as exc:
+        _unreadable_directory(exc)
     results = []
     for entry in entries:
         if entry.name.lower() in _LOADER_SKIP or entry.name.startswith("."):
@@ -220,7 +241,7 @@ def _scan_external_mod_root(root: str) -> list[dict]:
         if entry.is_dir(follow_symlinks=False):
             files = [
                 os.path.join(base, filename)
-                for base, _, filenames in os.walk(entry.path)
+                for base, _, filenames in os.walk(entry.path, onerror=_unreadable_directory)
                 for filename in filenames
                 if os.path.splitext(filename)[1].lower() in EXTERNAL_MOD_EXTENSIONS
             ]
@@ -254,7 +275,7 @@ def _scan_streetfighter6_overlays(game_root: str, existing_mods: list) -> dict:
         return {"detected": 0, "owned_packages": 0, "unidentified": []}
 
     live_files: set[str] = set()
-    for base, _, filenames in os.walk(natives):
+    for base, _, filenames in os.walk(natives, onerror=_unreadable_directory):
         for filename in filenames:
             lower = filename.lower()
             if any(marker in lower for marker in RE_ENGINE_OVERLAY_SUFFIXES):
@@ -404,7 +425,20 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
         existing_owned_file_sets.append(frozenset(signature))
 
     # 0.5) Steam 创意工坊探测（文件在 game_root 之外的 workshop 目录，已订阅的 mod）
+    existing_by_id = {str(item.id): item for item in existing_mods}
     for w in _scan_steam_workshop(game_root):
+        # Keep a title captured at selection/install if a later offline scan
+        # cannot currently resolve Steam's title.  A temporary API failure
+        # must not downgrade a usable name back to a bare Workshop ID.
+        prior = existing_by_id.get(str(w.get("id") or ""))
+        if (
+            prior
+            and "标题暂未取得" in str(w.get("name") or "")
+            and "标题暂未取得" not in str(prior.name or "")
+        ):
+            w = dict(w)
+            w["name"] = prior.name
+            w["version"] = w.get("version") or prior.version
         detected += 1
         signature = _file_signature(w.get("files"))
         if already_owned_by_package(signature):
@@ -485,6 +519,13 @@ def scan_existing_mods(game_root: str, game_slug: str, api_key: str,
         if name not in groups:
             groups[name] = []
         groups[name].append((rel_path, filename, wk["confidence"] if wk else ""))
+
+    # Stellar Blade packages are commonly distributed as one archive holding
+    # a base outfit plus many independently switchable .pak triplets.  Preserve
+    # that archive-level management boundary whenever the on-disk names give
+    # us enough evidence to recover it.
+    if game_slug == "stellarblade":
+        groups = _collapse_stellarblade_variant_groups(groups)
 
     for name, files in groups.items():
         if name.lower() in existing_names:
@@ -590,7 +631,7 @@ def _scan_dirs(game_root: str, patterns: list[tuple[str, str]]) -> list[tuple[st
         if not os.path.isdir(full):
             continue
         try:
-            for base, _, filenames in os.walk(full):
+            for base, _, filenames in os.walk(full, onerror=_unreadable_directory):
                 for f in filenames:
                     fp = os.path.join(base, f)
                     if f.lower().endswith(ext.lower()):
@@ -599,8 +640,8 @@ def _scan_dirs(game_root: str, patterns: list[tuple[str, str]]) -> list[tuple[st
                         if key not in seen:
                             seen.add(key)
                             found.append((rel, f))
-        except PermissionError:
-            continue
+        except OSError as exc:
+            _unreadable_directory(exc)
     return found
 
 
@@ -628,6 +669,68 @@ def _guess_mod_name(filename: str, game_slug: str) -> str:
         clean = name
 
     return clean[:60]
+
+
+def _unreal_variant_stem(filename: str) -> str:
+    """Return the package stem shared by a .pak/.ucas/.utoc triplet.
+
+    ``_P`` is an Unreal package suffix, not part of the creator's Mod title.
+    Keep this deliberately local to the inventory scanner: it is evidence from
+    the files on disk, never a claim about the upstream source name.
+    """
+    raw = os.path.basename(str(filename or ""))
+    if raw.casefold().endswith(".disabled"):
+        raw = raw[:-len(".disabled")]
+    stem, _ = os.path.splitext(raw)
+    return re.sub(r"(?i)(?:[_\-.]p)$", "", stem).strip()
+
+
+def _collapse_stellarblade_variant_groups(
+    groups: dict[str, list[tuple[str, str, str]]],
+) -> dict[str, list[tuple[str, str, str]]]:
+    """Recover obvious *one archive, many selectable variants* packages.
+
+    A fresh disk scan normally has no download archive to consult.  We only
+    collapse a family when at least three complete package stems share a
+    specific three-token prefix (for example ``Addon_Nier_03_*``).  That is
+    intentionally conservative: two similarly named files can still be two
+    independent Mods, so they remain separate rather than being silently
+    merged into an unsafe uninstall unit.
+    """
+    families: dict[tuple[str, ...], list[str]] = {}
+    labels: dict[tuple[str, ...], str] = {}
+    for name, entries in groups.items():
+        if not entries:
+            continue
+        stem = _unreal_variant_stem(entries[0][1])
+        tokens = re.findall(r"[A-Za-z0-9]+", stem)
+        if len(tokens) < 4:
+            continue
+        key = tuple(token.casefold() for token in tokens[:3])
+        if not all(key):
+            continue
+        families.setdefault(key, []).append(name)
+        labels.setdefault(key, " ".join(tokens[:3]))
+
+    collapsed = dict(groups)
+    for key, members in families.items():
+        # Three or more components with the same precise prefix is a strong
+        # local signature of a configurable/variant package.  Do not merge a
+        # pair: that is too easy to confuse with two normal Mod files.
+        if len(members) < 3:
+            continue
+        combined: list[tuple[str, str, str]] = []
+        for member in members:
+            combined.extend(collapsed.pop(member, []))
+        if not combined:
+            continue
+        title = labels[key]
+        # A collision with a real file-derived title is unlikely, but keep the
+        # scan deterministic and never overwrite unrelated discovered files.
+        if title in collapsed:
+            title = f"{title}（可选组件）"
+        collapsed[title] = combined
+    return collapsed
 
 
 def _verify_on_nexus(candidate: str, game_slug: str, api_key: str) -> dict | None:

@@ -44,11 +44,38 @@ function browserCandidates(env = process.env, dataDir = '') {
 }
 
 function findInstalledBrowser(env = process.env, dataDir = '', exists = fs.existsSync) {
-  for (const candidate of browserCandidates(env, dataDir)) {
-    const executable = candidate.paths.filter(Boolean).find(exists);
-    if (executable) return { ...candidate, executable };
-  }
-  return null;
+  return installedBrowsers(env, dataDir, exists)[0] || null;
+}
+
+function readBrowserPreference(dataDir) {
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(dataDir, 'browser-preference.json'), 'utf8'));
+    const browser = browserCandidates().find(item => item.id === value.id);
+    if (!browser || typeof value.executable !== 'string'
+        || path.basename(value.executable).toLowerCase() !== browser.processName) return {};
+    return value;
+  } catch { return {}; }
+}
+
+function installedBrowsers(env = process.env, dataDir = '', exists = fs.existsSync, preference = readBrowserPreference(dataDir)) {
+  const found = browserCandidates(env, dataDir).map(candidate => {
+    const custom = preference.id === candidate.id && typeof preference.executable === 'string'
+      && path.basename(preference.executable).toLowerCase() === candidate.processName ? preference.executable : '';
+    const executable = [custom, ...candidate.paths].filter(Boolean).find(exists);
+    return executable ? {...candidate, executable} : null;
+  }).filter(Boolean);
+  // A working Edge/Brave profile must not change just because Chrome was installed later.
+  return found.sort((a, b) => Number(b.id === preference.id) - Number(a.id === preference.id));
+}
+
+function saveBrowserPreference(dataDir, value) {
+  fs.mkdirSync(dataDir, {recursive:true});
+  const file = path.join(dataDir, 'browser-preference.json');
+  const temp = file + '.' + require('crypto').randomUUID() + '.tmp';
+  try {
+    fs.writeFileSync(temp, JSON.stringify(value), {flag:'wx'});
+    fs.renameSync(temp, file);
+  } finally { try { fs.unlinkSync(temp); } catch {} }
 }
 
 function profileDirectory(dataDir, browserId) {
@@ -62,4 +89,7 @@ module.exports = {
   browserCandidates,
   findInstalledBrowser,
   profileDirectory,
+  installedBrowsers,
+  readBrowserPreference,
+  saveBrowserPreference,
 };

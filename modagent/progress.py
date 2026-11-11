@@ -170,13 +170,15 @@ def set_name(mod_id, name: str):
         _state["updated"] = time.time()
 
 
-def request_cancel(task_kind: str = "") -> bool:
+def request_cancel(task_kind: str = "", generation=None) -> bool:
     """Cooperatively cancel the current task without killing the backend."""
     with _lock:
         expected = str(task_kind or "").strip()
         if not _state["active"]:
             return False
         if expected and expected != _state["task_kind"]:
+            return False
+        if generation is not None and (type(generation) is not int or generation != _state["generation"]):
             return False
         _state["cancel_requested"] = True
         _state["cancel_reason"] = "用户已取消"

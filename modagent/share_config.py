@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import Any
 from urllib.parse import unquote_to_bytes, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, HTTPRedirectHandler, build_opener
 
 from . import db, installer, snapshot
 from .config import Config, game_storage_id
@@ -24,6 +24,7 @@ from .config import Config, game_storage_id
 
 SCHEMA = "modagent-share/v1"
 MAX_SHARE_BYTES = 512 * 1024
+SHARE_READ_BUDGET_SECONDS = 12.0
 _ALLOWED_REMOTE_HOSTS = {"raw.githubusercontent.com", "gist.githubusercontent.com"}
 _DEP_VERSION_RE = re.compile(
     r"(?:^|[-_.\s])v?(\d+(?:\.\d+){1,4})(?:[-+][a-z0-9.-]+)?$", re.I,
@@ -32,6 +33,27 @@ _DEP_VERSION_RE = re.compile(
 
 class ShareError(ValueError):
     """A safe, user-actionable share input error."""
+
+
+def _allowed_share_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        return (parsed.scheme == 'https' and parsed.hostname in _ALLOWED_REMOTE_HOSTS
+                and parsed.port in (None, 443) and parsed.username is None and parsed.password is None)
+    except ValueError:
+        return False
+
+
+class _ShareRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _allowed_share_url(newurl):
+            raise ShareError('Share redirect left the approved HTTPS GitHub Raw/Gist hosts. Use a direct Raw link.')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def urlopen(request, timeout=12):
+    # Per-request opener: do not alter networking for the rest of the application.
+    return build_opener(_ShareRedirectHandler()).open(request, timeout=timeout)
 
 
 def _dependency_identity(value: Any) -> str:
@@ -89,44 +111,20 @@ def _base_runtime_evidence(cfg: Config, dependency: str) -> dict[str, Any]:
             "note": "Selected game directory is unavailable; loader files could not be checked.",
         }
 
-    if label.startswith("bepinex"):
-        core = os.path.join(root, "BepInEx", "core")
-        candidates = [
-            os.path.join(core, "BepInEx.dll"),
-            os.path.join(core, "BepInEx.Core.dll"),
-        ]
-        hits = [os.path.relpath(path, root).replace("\\", "/") for path in candidates if os.path.isfile(path)]
-        bootstrap = [
-            name for name in ("winhttp.dll", "doorstop_config.ini")
-            if os.path.isfile(os.path.join(root, name))
-        ]
-        if hits:
-            return {
-                "status": "satisfied_base_environment",
-                "matched_version": "runtime files detected",
-                "evidence": hits + bootstrap,
-                "note": "BepInEx runtime files were found in the selected game directory.",
-            }
-    elif label.startswith("smapi"):
-        candidates = ["StardewModdingAPI.exe", "StardewModdingAPI.dll"]
-        hits = [name for name in candidates if os.path.isfile(os.path.join(root, name))]
-        if hits:
-            return {
-                "status": "satisfied_base_environment",
-                "matched_version": "runtime files detected",
-                "evidence": hits,
-                "note": "SMAPI runtime files were found in the selected game directory.",
-            }
-    elif label.startswith("melonloader"):
-        candidates = ["MelonLoader", "version.dll"]
-        hits = [name for name in candidates if os.path.exists(os.path.join(root, name))]
-        if hits:
-            return {
-                "status": "satisfied_base_environment",
-                "matched_version": "runtime files detected",
-                "evidence": hits,
-                "note": "MelonLoader runtime files were found in the selected game directory.",
-            }
+    from .runtime_detection import loader_evidence
+    loader = "BepInEx" if label.startswith("bepinex") else (
+        "SMAPI" if label.startswith("smapi") else (
+            "MelonLoader" if label.startswith("melonloader") else ""
+        )
+    )
+    evidence = loader_evidence(root, loader) if loader else {"installed": False, "evidence": []}
+    if evidence["installed"]:
+        return {
+            "status": "satisfied_base_environment",
+            "matched_version": "runtime files detected",
+            "evidence": evidence["evidence"],
+            "note": f"{loader} runtime files were found in the selected game directory.",
+        }
     return {
         "status": "base_environment_not_found",
         "matched_version": "",
@@ -239,6 +237,25 @@ def _enabled(mod: db.InstalledMod) -> bool:
         return True
 
 
+def _file_state(mod: db.InstalledMod) -> str:
+    """Report observed local file layout, not whether a game actually loads a Mod."""
+    if mod.installed_by == 'steam_workshop' or str(mod.id).startswith('ws_'):
+        return 'unknown'
+    files = _as_files(mod.files_installed)
+    if not files:
+        return 'unknown'
+    try:
+        active = [os.path.isfile(path) for path in files]
+        disabled = [os.path.isfile(path + '.disabled') for path in files]
+        if all(active) and not any(disabled):
+            return 'enabled_files'
+        if all(disabled) and not any(active):
+            return 'disabled_files'
+    except OSError:
+        pass
+    return 'unknown'
+
+
 def _binding_public_view(binding: dict | None) -> dict:
     binding = binding or {}
     # Do not pass on binding metadata: it may contain cache/debug details that
@@ -290,6 +307,7 @@ def build_share_payload(
             "summary": str(note.get("summary") or ""),
             "version": str(mod.version or ""),
             "enabled": _enabled(mod),
+            "file_state": _file_state(mod),
             "load_order": int(mod.load_order or 0),
             "dependencies": db.parse_dependencies(mod.dependencies),
             "source": source,
@@ -372,28 +390,66 @@ def _read_data_uri(value: str) -> str:
     header, separator, body = value.partition(",")
     if not separator or not header.lower().startswith("data:"):
         raise ShareError("Invalid offline share link.")
+    encoded_limit = 4 * ((MAX_SHARE_BYTES + 2) // 3) if ';base64' in header.lower() else 3 * MAX_SHARE_BYTES
+    if len(header) > 256 or len(body) > encoded_limit:
+        raise ShareError("Share is too large (maximum 512 KiB).")
     try:
         data = base64.b64decode(body, validate=True) if ";base64" in header.lower() else unquote_to_bytes(body)
     except Exception as exc:
         raise ShareError("Offline share link is malformed.") from exc
     if len(data) > MAX_SHARE_BYTES:
         raise ShareError("Share is too large (maximum 512 KiB).")
-    return data.decode("utf-8")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ShareError("Offline share must contain valid UTF-8 text.") from exc
 
 
 def _read_remote_share(value: str) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_REMOTE_HOSTS:
+    if not _allowed_share_url(value):
         raise ShareError("Only HTTPS GitHub Raw or Gist Raw links are accepted.")
     request = Request(value, headers={"User-Agent": "ModAgent/1.5 share importer"})
+    deadline = time.monotonic() + SHARE_READ_BUDGET_SECONDS
     try:
         with urlopen(request, timeout=12) as response:
-            data = response.read(MAX_SHARE_BYTES + 1)
+            length_header = response.getheader('Content-Length')
+            expected_bytes = None
+            if length_header is not None:
+                length_text = length_header.strip()
+                if not re.fullmatch(r'[0-9]{1,12}', length_text):
+                    raise ShareError('Share response has an invalid content length. Use a direct Raw link or offline share.')
+                expected_bytes = int(length_text)
+                if expected_bytes > MAX_SHARE_BYTES:
+                    raise ShareError('Share is too large (maximum 512 KiB).')
+            chunks = []
+            received = 0
+            # read1 returns after an underlying read rather than waiting to fill
+            # the entire manifest while a peer trickles bytes indefinitely.
+            while True:
+                if time.monotonic() >= deadline:
+                    raise ShareError("Share response took too long. Retry when the network is stable or use an offline share.")
+                chunk = response.read1(min(65536, MAX_SHARE_BYTES + 1 - received))
+                if time.monotonic() >= deadline:
+                    raise ShareError("Share response took too long. Retry when the network is stable or use an offline share.")
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+                if received > MAX_SHARE_BYTES:
+                    raise ShareError("Share is too large (maximum 512 KiB).")
+            if expected_bytes is not None and received != expected_bytes:
+                raise ShareError('Share response is incomplete. Retry the download or ask for an offline share.')
+            data = b''.join(chunks)
+    except ShareError:
+        raise
     except Exception as exc:
-        raise ShareError(f"Could not fetch the shared manifest: {exc}") from exc
+        raise ShareError("Could not fetch the shared manifest. Check the Raw link and network connection, or ask for an offline share.") from exc
     if len(data) > MAX_SHARE_BYTES:
         raise ShareError("Share is too large (maximum 512 KiB).")
-    return data.decode("utf-8")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ShareError("Remote share must contain valid UTF-8 text.") from exc
 
 
 def read_allowed_remote_url(value: str) -> str:
@@ -412,8 +468,13 @@ def load_share_input(value: str) -> tuple[dict, str]:
     else:
         raw, source = value, "pasted_json"
     try:
+        if len(raw) > MAX_SHARE_BYTES or len(raw.encode('utf-8')) > MAX_SHARE_BYTES:
+            raise ShareError("Share is too large (maximum 512 KiB).")
+    except UnicodeEncodeError as exc:
+        raise ShareError("Share must contain valid UTF-8 text.") from exc
+    try:
         payload = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ShareError("The share is not valid JSON.") from exc
     if not isinstance(payload, dict):
         raise ShareError("The share root must be a JSON object.")
@@ -422,20 +483,36 @@ def load_share_input(value: str) -> tuple[dict, str]:
 
 
 def validate_share_payload(payload: dict) -> None:
+    if not isinstance(payload, dict):
+        raise ShareError("The share root must be a JSON object.")
     if payload.get("schema") != SCHEMA:
         raise ShareError("Unsupported share schema. Expected modagent-share/v1.")
-    if payload.get("kind") not in {"player_share", "official_collection"}:
+    if not isinstance(payload.get("kind"), str) or payload.get("kind") not in {"player_share", "official_collection"}:
         raise ShareError("Unsupported share kind.")
     if not isinstance(payload.get("game"), dict):
         raise ShareError("Share is missing game metadata.")
+    if any(key in payload['game'] and not isinstance(payload['game'][key], str) for key in ('name','slug','mod_loader')):
+        raise ShareError("Share game metadata contains invalid text fields.")
     mods = payload.get("mods")
     if not isinstance(mods, list) or len(mods) > 500:
         raise ShareError("Share must contain 0–500 mod entries.")
     for index, item in enumerate(mods, 1):
-        if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item['name'].strip():
             raise ShareError(f"Mod entry {index} is missing a name.")
-        if not isinstance(item.get("source") or {}, dict):
+        if 'source' in item and not isinstance(item['source'], dict):
             raise ShareError(f"Mod entry {index} has invalid source data.")
+        source = item.get('source', {})
+        if any(key in source and not isinstance(source[key], str) for key in ('type','key','url','version')):
+            raise ShareError(f"Mod entry {index} has invalid source text fields.")
+        if any(key in item and not isinstance(item[key], str) for key in ('local_id','localized_name','version','file_state')):
+            raise ShareError(f"Mod entry {index} has invalid text fields.")
+        if 'enabled' in item and type(item['enabled']) is not bool:
+            raise ShareError(f"Mod entry {index} enabled state must be true or false.")
+        if 'load_order' in item and (type(item['load_order']) is not int or abs(item['load_order']) > 9007199254740991):
+            raise ShareError(f"Mod entry {index} load order must be a safe integer.")
+        for key in ('dependencies', 'warnings'):
+            if key in item and (not isinstance(item[key], list) or any(not isinstance(value, str) for value in item[key])):
+                raise ShareError(f"Mod entry {index} {key} must be a list of text entries.")
 
 
 def inspect_share_import(payload: dict, cfg: Config) -> dict:
@@ -461,12 +538,14 @@ def inspect_share_import(payload: dict, cfg: Config) -> dict:
             "localized_name": str(item.get("localized_name") or ""),
             "version": str(item.get("version") or ""),
             "enabled": bool(item.get("enabled", True)),
+            "file_state": item.get("file_state") if item.get("file_state") in ('enabled_files', 'disabled_files', 'unknown') else 'unknown',
             "load_order": item.get("load_order", 0),
             "source": _binding_public_view(source),
             "dependencies": dependencies,
             "status": status,
             "installed_match": {
                 "id": str(installed.id), "name": installed.name, "version": installed.version,
+                "file_state": _file_state(installed),
             } if installed else None,
             "warnings": list(item.get("warnings") or []),
         })
