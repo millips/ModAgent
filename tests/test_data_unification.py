@@ -37,7 +37,10 @@ with tempfile.TemporaryDirectory() as temp:
     con.close()
     assert os.path.isfile(os.path.join(result["backup"], "canonical-state.db"))
     roots = json.load(open(os.path.join(canonical, "legacy-snapshot-roots.json"), encoding="utf-8"))
-    assert os.path.join(legacy, "snapshots") in roots["roots"]
+    # The merger resolves paths. Windows TEMP may use different casing or an
+    # 8.3 alias, so verify directory identity instead of raw path spelling.
+    assert any(os.path.samefile(os.path.join(legacy, "snapshots"), root)
+               for root in roots["roots"])
 
 with tempfile.TemporaryDirectory() as temp:
     canonical, legacy = os.path.join(temp, ".modagent"), os.path.join(temp, ".modagent-beta")
