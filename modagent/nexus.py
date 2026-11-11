@@ -8,6 +8,8 @@ import re
 from typing import Optional
 
 USER_AGENT = "ModAgent/0.1"
+_API_BODY_DEADLINE = 20.0
+_API_MAX_BYTES = 16 * 1024 * 1024
 
 # Cache for updated mod IDs per game (max 20 entries to prevent unbounded growth)
 _MOD_CACHE: dict[str, tuple[float, list[dict]]] = {}
@@ -63,14 +65,14 @@ def _match_game_catalog(game_name: str, games) -> dict | None:
         if overlap >= required:
             exact = int(_normalise_game_name(title).casefold()
                         == _normalise_game_name(game_name).casefold())
-            candidates.append((exact, overlap, slug, title))
+            candidates.append((exact, overlap, slug, title, item.get("id")))
     if not candidates:
         return None
-    _, _, slug, title = max(candidates)
+    _, _, slug, title, game_id = max(candidates, key=lambda candidate: candidate[:4])
     return {
         "status": "available",
         "slug": slug,
-        "game_id": int(item.get("id") or 0),
+        "game_id": int(game_id or 0),
         "evidence": f"Nexus API games catalogue: {title}",
         "reason": "verified in Nexus official game catalogue",
     }
@@ -129,7 +131,7 @@ def discover_game(game_name: str, tavily_key: str = "",
             "include_domains": ["nexusmods.com"],
             "max_results": 8,
         }).encode()
-        ctx = ssl._create_unverified_context()
+        ctx = ssl.create_default_context()
         try:
             req = urllib.request.Request(
                 "https://api.tavily.com/search",
@@ -183,13 +185,50 @@ def discover_game(game_name: str, tavily_key: str = "",
     return result
 
 
+class _SameOriginApiRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        def origin(url):
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("Redirect credentials are not allowed")
+            return (parsed.scheme.lower(), (parsed.hostname or "").lower(),
+                    parsed.port if parsed.port is not None else (443 if parsed.scheme.lower() == "https" else 80))
+        try:
+            same_origin = origin(req.full_url) == origin(newurl)
+        except ValueError:
+            same_origin = False
+        if not same_origin:
+            fp.close()
+            raise urllib.error.HTTPError(req.full_url, code, "NEXUS_REDIRECT_BLOCKED", headers, None)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _api(url: str, api_key: str) -> dict:
-    ctx = ssl._create_unverified_context()
+    ctx = ssl.create_default_context()
     req = urllib.request.Request(url, headers={
         "apikey": api_key, "Accept": "application/json", "User-Agent": USER_AGENT,
     })
-    with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
-        return json.loads(resp.read())
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx), _SameOriginApiRedirect())
+    with opener.open(req, timeout=10) as resp:
+        # A socket idle timeout alone permits an endless slow-drip response.
+        # read1 returns available data without waiting to fill the whole chunk.
+        # The body budget is checked between reads; an in-flight socket read
+        # can add at most the existing 10-second idle timeout.
+        deadline = time.monotonic() + _API_BODY_DEADLINE
+        body = bytearray()
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("NEXUS_RESPONSE_TIMEOUT")
+            chunk = resp.read1(min(65536, _API_MAX_BYTES + 1 - len(body)))
+            if time.monotonic() >= deadline:
+                raise TimeoutError("NEXUS_RESPONSE_TIMEOUT")
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > _API_MAX_BYTES:
+                raise ValueError("NEXUS_RESPONSE_TOO_LARGE")
+        return json.loads(body)
 
 
 def resolve_game_id(game_slug: str, api_key: str) -> int:
@@ -286,7 +325,7 @@ def _search_via_tavily(query: str, game_slug: str, api_key: str) -> list[dict]:
         "max_results": 10,
     }).encode()
 
-    ctx = ssl._create_unverified_context()
+    ctx = ssl.create_default_context()
     try:
         req = urllib.request.Request(
             "https://api.tavily.com/search",
@@ -345,7 +384,7 @@ def search_tool_entries(query: str, tavily_key: str, api_key: str = "",
         "include_domains": ["nexusmods.com"],
         "max_results": max(1, min(limit, 20)),
     }).encode()
-    ctx = ssl._create_unverified_context()
+    ctx = ssl.create_default_context()
     try:
         req = urllib.request.Request(
             "https://api.tavily.com/search", data=body,

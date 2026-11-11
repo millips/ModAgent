@@ -19,11 +19,12 @@ def _scope_game(game_slug: str = "") -> str:
         return str(game_slug or "")
 
 
-def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
+def migrate_game_scope(legacy_slug: str, instance_id: str, before_commit=None) -> None:
     """Assign unambiguous legacy rows to the currently selected install."""
     if not legacy_slug or not instance_id or legacy_slug == instance_id:
         return
     conn = get_conn()
+    undo = None
     try:
         for table in (
             "installed_mods", "snapshots", "sessions",
@@ -33,7 +34,14 @@ def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
                 f"UPDATE OR IGNORE {table} SET game_slug=? WHERE game_slug=?",
                 (instance_id, legacy_slug),
             )
+        if before_commit is not None:
+            undo = before_commit()
         conn.commit()
+    except Exception:
+        conn.rollback()
+        if callable(undo):
+            undo()
+        raise
     finally:
         conn.close()
 
@@ -244,30 +252,34 @@ def add_mod(mod: InstalledMod):
     mod.game_slug = _scope_game(mod.game_slug)
     conn = get_conn()
     mod.installed_at = time.time()
-    conn.execute(
-        "INSERT OR REPLACE INTO installed_mods VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (mod.id, mod.name, mod.version, mod.snapshot_id, mod.load_order,
-         mod.file_id, mod.installed_at, mod.files_installed, mod.dependencies, mod.installed_by, mod.game_slug),
-    )
-    _log(conn, "install", json.dumps(asdict(mod)))
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO installed_mods VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (mod.id, mod.name, mod.version, mod.snapshot_id, mod.load_order,
+                 mod.file_id, mod.installed_at, mod.files_installed, mod.dependencies, mod.installed_by, mod.game_slug),
+            )
+            _log(conn, "install", json.dumps(asdict(mod)))
+    finally:
+        conn.close()
 
 
 def remove_mod(mod_id: str, game_slug: str = ""):
     game_slug = _scope_game(game_slug)
     conn = get_conn()
-    if game_slug:
-        conn.execute("DELETE FROM installed_mods WHERE id=? AND game_slug=?", (mod_id, game_slug))
-        conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
-        conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
-    else:
-        conn.execute("DELETE FROM installed_mods WHERE id=?", (mod_id,))
-        conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=?", (mod_id,))
-        conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=?", (mod_id,))
-    _log(conn, "uninstall", json.dumps({"mod_id": mod_id, "game_slug": game_slug}))
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            if game_slug:
+                conn.execute("DELETE FROM installed_mods WHERE id=? AND game_slug=?", (mod_id, game_slug))
+                conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
+                conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=? AND game_slug=?", (mod_id, game_slug))
+            else:
+                conn.execute("DELETE FROM installed_mods WHERE id=?", (mod_id,))
+                conn.execute("DELETE FROM mod_source_bindings WHERE mod_id=?", (mod_id,))
+                conn.execute("DELETE FROM mod_catalog_notes WHERE mod_id=?", (mod_id,))
+            _log(conn, "uninstall", json.dumps({"mod_id": mod_id, "game_slug": game_slug}))
+    finally:
+        conn.close()
 
 
 def get_mod(mod_id: str, game_slug: str = "") -> Optional[InstalledMod]:
@@ -745,31 +757,33 @@ def upsert_mod_source_binding(
     game_slug = _scope_game(game_slug)
     now = time.time()
     conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO mod_source_bindings
-        (game_slug,mod_id,source,source_key,source_url,confidence,match_method,
-         latest_version,metadata,bound_at,last_checked_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(game_slug,mod_id) DO UPDATE SET
-          source=excluded.source,
-          source_key=excluded.source_key,
-          source_url=excluded.source_url,
-          confidence=excluded.confidence,
-          match_method=excluded.match_method,
-          latest_version=excluded.latest_version,
-          metadata=excluded.metadata,
-          last_checked_at=excluded.last_checked_at
-        """,
-        (
-            str(game_slug or ""), str(mod_id), str(source), str(source_key),
-            str(source_url or ""), float(confidence or 0),
-            str(match_method or ""), str(latest_version or ""),
-            json.dumps(metadata or {}, ensure_ascii=False), now, now,
-        ),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO mod_source_bindings
+                (game_slug,mod_id,source,source_key,source_url,confidence,match_method,
+                 latest_version,metadata,bound_at,last_checked_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(game_slug,mod_id) DO UPDATE SET
+                  source=excluded.source,
+                  source_key=excluded.source_key,
+                  source_url=excluded.source_url,
+                  confidence=excluded.confidence,
+                  match_method=excluded.match_method,
+                  latest_version=excluded.latest_version,
+                  metadata=excluded.metadata,
+                  last_checked_at=excluded.last_checked_at
+                """,
+                (
+                    str(game_slug or ""), str(mod_id), str(source), str(source_key),
+                    str(source_url or ""), float(confidence or 0),
+                    str(match_method or ""), str(latest_version or ""),
+                    json.dumps(metadata or {}, ensure_ascii=False), now, now,
+                ),
+            )
+    finally:
+        conn.close()
 
 
 def backfill_custom_nexus_bindings(game_slug: str = "") -> list[dict]:
@@ -976,14 +990,27 @@ def get_mod_by_source(game_slug: str, source: str, source_key: str) -> Optional[
     return InstalledMod(**dict(row)) if row else None
 
 
-def get_shared_files(mod_id: str, files: list, game_slug: str = "") -> set:
+def get_shared_files(mod_id: str, files: list, game_slug: str = "", *, game_root: str = "") -> set:
     """返回 files 中【也被除 mod_id 外的其他已装 mod 拥有】的文件集合。
     用于卸载保护:这些是共享文件,卸载本 mod 时不应从磁盘删除。
     返回值为 normcase 后的绝对路径集合,便于调用方比对。
     """
     import os as _os
     import json as _json
-    target = {_os.path.normcase(_os.path.abspath(f)) for f in (files or [])}
+    def path_key(path):
+        if not game_root:
+            return _os.path.normcase(_os.path.abspath(path))
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("Invalid file ownership record")
+        root = _os.path.normcase(_os.path.realpath(game_root))
+        candidate = path if _os.path.isabs(path) else _os.path.join(game_root, path)
+        key = _os.path.normcase(_os.path.realpath(candidate))
+        if _os.path.commonpath([root, key]) != root or key == root:
+            raise ValueError("File ownership record is outside the game")
+        return key
+    # A captured root opts into strict update checks: resolve relative/alias
+    # paths and never treat unreadable ownership metadata as an empty inventory.
+    target = {path_key(f) for f in (files or [])}
     if not target:
         return set()
     shared = set()
@@ -994,9 +1021,13 @@ def get_shared_files(mod_id: str, files: list, game_slug: str = "") -> set:
             other = m.files_installed
             other = _json.loads(other) if isinstance(other, str) else (other or [])
         except Exception:
+            if game_root:
+                raise ValueError("Unreadable file ownership record") from None
             other = []
+        if game_root and not isinstance(other, list):
+            raise ValueError("Invalid file ownership list")
         for f in other:
-            key = _os.path.normcase(_os.path.abspath(f))
+            key = path_key(f)
             if key in target:
                 shared.add(key)
     return shared
@@ -1192,11 +1223,35 @@ def _log(conn: sqlite3.Connection, action: str, details: str):
 
 def log_operation(action: str, details) -> None:
     """记录不隶属于单一 CRUD 的用户可见操作（如快照回滚）。"""
-    conn = get_conn()
     payload = details if isinstance(details, str) else json.dumps(details, ensure_ascii=False)
-    _log(conn, action, payload)
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        with conn:
+            _log(conn, action, payload)
+    finally:
+        conn.close()
+
+
+def pending_snapshot_inventory_cleanup(snapshot_id: str, game_scope: str) -> list[str]:
+    """Read the latest matching receipt, never another game's cleanup request."""
+    conn = get_conn()
+    try:
+        for row in conn.execute(
+            "SELECT details FROM operation_log WHERE action=? ORDER BY id DESC",
+            ("snapshot_restore",),
+        ):
+            try:
+                data = json.loads(row[0])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict) or data.get("snapshot_id") != snapshot_id or data.get("game_instance_id") != game_scope:
+                continue
+            cleanup = data.get("inventory_cleanup") or {}
+            ids = cleanup.get("failed_mod_ids", []) if isinstance(cleanup, dict) else []
+            return [mid for mid in ids if isinstance(mid, str)] if isinstance(ids, list) else []
+        return []
+    finally:
+        conn.close()
 
 
 # ── Sessions ──

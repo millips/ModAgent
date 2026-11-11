@@ -2,7 +2,7 @@ name: Agent Core v2 evals
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, codex/semantic-diagnostics]
   workflow_dispatch:
     inputs:
       suite:
@@ -37,4 +37,3 @@ jobs:
           python -m evals.runner --suite $suite --json
       - name: State, cancellation, retry and idempotency tests
         run: python -m pytest tests/test_agent_core_v2.py tests/test_turn_cancellation.py -q
-

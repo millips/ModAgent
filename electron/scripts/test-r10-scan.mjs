@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { scanInventory } from '../src/components/scanInventory.mjs'
 for (const [data, ok] of [
   [{ identified: [], imported: 0, detected: 129 }, true],
-  [{ identified: [{}], imported: 1 }, true],
+  [{ identified: [{name:'Fixture'}], imported: 1 }, true],
   [{ identified: [], status: 'blocked' }, false],
   [{ error: 'fixture' }, false], [null, false],
 ]) {

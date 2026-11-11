@@ -68,6 +68,7 @@ try {
   assert(log.includes('Packaged smoke test passed'), 'Smoke-test success marker missing')
   if (credentials) {
     assert(log.includes('Credential reuse smoke passed'), 'Inherited credentials never reached backend/workspace')
+    assert(log.includes('Connection panel and packaged API smoke passed'), 'Connection panel or packaged API was not verified')
     const vault = fs.readFileSync(path.join(dataDir, 'smoke-credentials', 'credentials-v2.json'), 'utf8')
     assert(!vault.includes('credential-smoke-fake'), 'Plaintext secret in encrypted vault')
     assert(!log.includes('credential-smoke-fake'), 'Secret leaked to desktop log')

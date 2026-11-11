@@ -1,10 +1,12 @@
 import asyncio
 import json
 import os
+import stat
 import sys
 import threading
 import time
 import uuid
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -20,6 +22,7 @@ from modagent.config import (
     Config, load as load_config, save as save_config, CONFIG_DIR,
     edition_data_dir, current_edition, current_channel, entitlement_tier,
     game_storage_id, make_game_instance_id,
+    read_config_bytes, restore_config_bytes,
 )
 from modagent import db, games, installer, scanner, downloader, __version__
 from modagent import snapshot, confirmation        # ← 快照预览 + 一次性回滚确认令牌
@@ -39,6 +42,7 @@ _agent_last_used: dict[str, float] = {}            # ← 补回:被 _get_agent �
 _AGENT_TTL = 3600                                  # ← 补回:agent 空闲回收时间(秒)
 _chat_tasks: dict[str, dict] = {}
 _chat_tasks_lock = threading.RLock()
+_config_update_lock = threading.RLock()
 
 
 def _new_session_id() -> str:
@@ -116,8 +120,8 @@ async def lifespan(app: FastAPI):
         print(f"legacy Beta data migration deferred: {exc}")
     cfg = load_config()
     if cfg.game_slug and cfg.game_instance_id:
-        db.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
-        snapshot.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
+        db.migrate_game_scope(cfg.game_slug, cfg.game_instance_id,
+            before_commit=lambda: snapshot.migrate_game_scope(cfg.game_slug, cfg.game_instance_id))
     downloader.cleanup_stale_downloads()
     run_startup_checks(build_prompt(cfg), build_tools_definitions(cfg.tier),
                        referenced_tools=PROMPT_REFERENCED_TOOLS)
@@ -314,9 +318,28 @@ def _get_agent(session_id: str) -> Agent:
 @app.get("/status")
 def get_status():
     bg_dir = edition_data_dir("bg")
-    os.makedirs(bg_dir, exist_ok=True)
-    bg_files = [f for f in os.listdir(bg_dir) if os.path.isfile(os.path.join(bg_dir, f))]
-    bg = bg_files[0] if bg_files else None
+    bg_files = []
+    bg_error = None
+    try:
+        bg_names = os.listdir(bg_dir)
+    except FileNotFoundError:
+        bg_names = []  # A new profile need not have a background directory.
+    except OSError:
+        bg_names = []
+        bg_error = "BACKGROUND_READ_FAILED"
+    for name in bg_names:
+        if os.path.splitext(name)[1].lower() not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+            continue
+        try:
+            full_path = os.path.join(bg_dir, name)
+            file_info = os.stat(full_path)
+            if stat.S_ISREG(file_info.st_mode):
+                bg_files.append((file_info.st_mtime_ns, name))
+        except FileNotFoundError:
+            continue  # A background can be removed while status is being read.
+        except OSError:
+            bg_error = "BACKGROUND_READ_FAILED"
+    bg = max(bg_files)[1] if bg_files else None
     return {
         "game_name": cfg.game_name,
         "game_slug": cfg.game_slug,
@@ -330,6 +353,7 @@ def get_status():
         "llm_endpoint": cfg.llm_endpoint,
         "cdp_port": cfg.chrome_cdp_port,
         "bg": bg,
+        "bg_error": bg_error,
         "tavily_set": bool(cfg.tavily_api_key),
         "dev_mode": bool(getattr(cfg, "dev_mode", False)),
         "language": getattr(cfg, "language", "zh-CN"),
@@ -353,9 +377,6 @@ def resolve_game(name: str = ""):
     result = _auto_infer(name)
     if result:
         slug, gid = result
-        cfg.game_slug = slug
-        cfg.game_id = gid
-        save_config(cfg)
         return {"slug": slug, "game_id": gid}
     return {"slug": "", "game_id": 0}
 
@@ -379,6 +400,7 @@ class GameImport(BaseModel):
 
 class ModDirectoryImport(BaseModel):
     path: str
+    expected_game_instance_id: str = ""
 
 
 class ModPackageMerge(BaseModel):
@@ -444,7 +466,8 @@ def _inventory_scan_worker(game_instance_id: str) -> None:
             public_result = _public_scan_result(result, imported)
             error = ""
         except Exception as exc:
-            public_result = {}
+            public_result = ({"error_code": exc.code}
+                             if isinstance(exc, scanner.ScanDirectoryUnreadable) else {})
             error = f"Mod 扫描失败：{exc}"
 
         with _inventory_scan_jobs_lock:
@@ -514,21 +537,20 @@ def import_game(body: GameImport):
         "shipping_exe": alive.get("shipping_exe"),
         "engine": alive.get("engine", ""),
     }
-    manual_games, saved = games.upsert_manual_game(
-        getattr(cfg, "manual_games", []),
-        body.game_name,
-        body.game_root,
-        executable=body.executable,
-        slug=body.game_slug,
-        game_id=body.game_id,
-    )
-    cfg.manual_games = manual_games
-    cfg.game_root = saved["path"]
-    cfg.game_name = saved["name"]
-    cfg.game_slug = saved["slug"]
-    cfg.game_instance_id = saved["game_instance_id"]
-    cfg.game_id = saved["game_id"]
-    save_config(cfg)
+    with _config_update_lock:
+        candidate = deepcopy(cfg)
+        manual_games, saved = games.upsert_manual_game(
+            candidate.manual_games, body.game_name, body.game_root,
+            executable=body.executable, slug=body.game_slug, game_id=body.game_id,
+        )
+        candidate.manual_games = manual_games
+        candidate.game_root = saved["path"]
+        candidate.game_name = saved["name"]
+        candidate.game_slug = saved["slug"]
+        candidate.game_instance_id = saved["game_instance_id"]
+        candidate.game_id = saved["game_id"]
+        save_config(candidate)
+        cfg.__dict__.update(candidate.__dict__)
     resp["saved"] = True
     resp["game"] = games.normalize_manual_game(saved)
     resp["mod_scan"] = _queue_inventory_scan(
@@ -550,6 +572,13 @@ def list_mod_import_directories():
 
 @app.post("/mods/import-directory")
 def import_mod_directory(body: ModDirectoryImport):
+    with _config_update_lock:
+        return _import_mod_directory_locked(body)
+
+
+def _import_mod_directory_locked(body: ModDirectoryImport):
+    if body.expected_game_instance_id and body.expected_game_instance_id != game_storage_id(cfg):
+        raise HTTPException(status_code=409, detail="GAME_SCOPE_CHANGED")
     if not cfg.game_slug or not cfg.game_root:
         raise HTTPException(status_code=400, detail="请先选择游戏")
     selected = os.path.abspath(os.path.expanduser(body.path.strip()))
@@ -562,8 +591,10 @@ def import_mod_directory(body: ModDirectoryImport):
     if os.path.normcase(selected) not in normalized:
         roots.append(selected)
     mapping[scope] = roots
-    cfg.manual_mod_dirs = mapping
-    save_config(cfg)
+    candidate = deepcopy(cfg)
+    candidate.manual_mod_dirs = mapping
+    save_config(candidate)
+    cfg.__dict__.update(candidate.__dict__)
     public = _queue_inventory_scan(
         cfg.game_root, cfg.game_slug, getattr(cfg, "nexus_api_key", ""), roots,
         scope,
@@ -582,6 +613,22 @@ def mod_scan_status(game_instance_id: str = "", game_slug: str = ""):
 
 @app.post("/config")
 def update_config(body: ConfigUpdate):
+    with _config_update_lock:
+        candidate = deepcopy(cfg)
+        result = _save_config_candidate(body, candidate)
+        # Agents retain references to cfg; publish only after persistence succeeds.
+        cfg.__dict__.update(candidate.__dict__)
+        if os.environ.get("MODAGENT_CREDENTIAL_ROUTE") == "1":
+            for key in ("llm_endpoint", "llm_model", "llm_api_key", "nexus_api_key", "tavily_api_key"):
+                os.environ["MODAGENT_" + key.upper()] = str(getattr(cfg, key))
+        if body.llm_endpoint is not None or body.llm_model is not None or body.llm_api_key is not None:
+            for agent in agents.values():
+                agent._client_obj = None
+                agent._network_route = None
+        return result
+
+
+def _save_config_candidate(body: ConfigUpdate, cfg: Config):
     data = body.model_dump(exclude_none=True)
     from .networking import CredentialFormatError, validate_api_key
     # Validate the entire edit before mutating config, environment or storage.
@@ -596,9 +643,6 @@ def update_config(body: ConfigUpdate):
             and str(data["llm_endpoint"]).rstrip("/") != str(cfg.llm_endpoint).rstrip("/")
             and "llm_api_key" not in data):
         data["llm_api_key"] = ""
-    rebuild_llm_client = any(
-        key in data for key in ("llm_api_key", "llm_endpoint", "llm_model")
-    )
     if "api_key" in data:
         cfg.nexus_api_key = data.pop("api_key")
     if "language" in data:
@@ -609,18 +653,27 @@ def update_config(body: ConfigUpdate):
         cfg.agent_core_v2 = requested_core if requested_core in {"off", "shadow", "on"} else "off"
     for key, value in data.items():
         setattr(cfg, key, value)
-        if (os.environ.get("MODAGENT_CREDENTIAL_ROUTE") == "1"
-                and key in {"llm_endpoint", "llm_model", "llm_api_key", "nexus_api_key", "tavily_api_key"}):
-            os.environ["MODAGENT_" + key.upper()] = str(value)
     cfg.tier = entitlement_tier()
-    if cfg.game_slug and cfg.game_instance_id:
-        db.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
-        snapshot.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
-    save_config(cfg)
-    if rebuild_llm_client:
-        for agent in agents.values():
-            agent._client_obj = None
-            agent._network_route = None
+    if cfg.game_slug and cfg.game_instance_id and cfg.game_slug != cfg.game_instance_id:
+        previous = read_config_bytes()
+        def prepare_commit():
+            undo_folders = snapshot.migrate_game_scope(cfg.game_slug, cfg.game_instance_id)
+            try:
+                written = save_config(cfg)
+            except Exception:
+                if callable(undo_folders):
+                    undo_folders()
+                raise
+            def undo():
+                try:
+                    restore_config_bytes(previous, written)
+                finally:
+                    if callable(undo_folders):
+                        undo_folders()
+            return undo
+        db.migrate_game_scope(cfg.game_slug, cfg.game_instance_id, before_commit=prepare_commit)
+    else:
+        save_config(cfg)
     return {"ok": True}
 
 
@@ -1422,6 +1475,27 @@ def open_tools():
     return _open_folder(downloader.ensure_tools_dir())
 
 
+class ConnectionTestRequest(BaseModel):
+    target_id: str = Field(min_length=1, max_length=32)
+
+
+@app.get("/network/targets")
+def network_targets():
+    from .connection_test import TARGETS
+    return {"targets": list(TARGETS)}
+
+
+@app.post("/network/test")
+async def network_test(req: ConnectionTestRequest):
+    from .connection_test import probe_target, ProbeBusy
+    try:
+        return await probe_target(req.target_id)
+    except ValueError:
+        raise HTTPException(400, "unknown_target")
+    except ProbeBusy:
+        raise HTTPException(409, "probe_in_progress")
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "timestamp": time.time()}
@@ -1452,7 +1526,7 @@ def cancel_active_task(body: dict = None):
         progress.abort_active("用户停止了当前对话任务")
         cancelled = True
     else:
-        cancelled = progress.request_cancel(task_kind)
+        cancelled = progress.request_cancel(task_kind, generation=body.get("generation"))
     state = progress.snapshot()
     return {
         "ok": cancelled,

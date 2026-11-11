@@ -23,6 +23,7 @@ def preview_recovery(task_id, cfg):
         raise RecoveryRejected('selection_checkpoint_missing')
     if task.get('state') == 'COMPLETED':
         raise RecoveryRejected('task_already_completed')
+    english = getattr(cfg, 'language', 'zh-CN') == 'en'
     return {
         'ok': True,
         'action': 'rebuild_plan',
@@ -30,9 +31,19 @@ def preview_recovery(task_id, cfg):
         'session_id': spec.get('session_id'),
         'recommendation_selection': targets,
         'selection_action': 'plan',
-        'message': '恢复原来选择的 Mod、版本和变体，先重新核验安装计划；不要搜索其他目标，不要下载安装。',
+        'message': (
+            'Recover the originally selected Mods, versions and variants, and revalidate the installation plan first. '
+            'Do not search for other targets. Do not download or install anything.'
+            if english else
+            '恢复原来选择的 Mod、版本和变体，先重新核验安装计划；不要搜索其他目标，不要下载安装。'
+        ),
         'original_goal': spec.get('user_goal', ''),
         'previous_outcome': task.get('outcome') or {},
         'write_authorized': False,
-        'notice': '已保留原选择；此操作只恢复计划并核验现状，不会重放旧安装。旧副作用记录不能替代文件核验。',
+        'notice': (
+            'Your original selection is retained. This is a read-only plan recovery and current-state check; '
+            'it will not replay previous installations. Previous operation records do not replace file verification.'
+            if english else
+            '已保留原选择；此操作只恢复计划并核验现状，不会重放旧安装。旧副作用记录不能替代文件核验。'
+        ),
     }

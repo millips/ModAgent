@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { upsertTaskResult, taskPresentation, precedingAnswer } from '../src/components/taskPresentation.mjs'
+import { upsertTaskResult, taskPresentation, precedingAnswer, taskActionLabel } from '../src/components/taskPresentation.mjs'
 const event = (state, summary, extra = {}) => ({ task_id: 't1', seq: 2, type: state === 'COMPLETED' ? 'task_completed' : 'task_failed', state, payload: { result: { summary, completed: [], not_completed: [], ...extra } } })
 const answer = '**Mod** 是游戏修改。'.repeat(100)
 assert.equal(taskPresentation(event('COMPLETED', answer), answer).hidden, true)
@@ -21,4 +21,11 @@ assert.equal(upsertTaskResult(messages, compact), messages, 'replay is idempoten
 assert.equal(upsertTaskResult(messages, { ...compact, seq: 1 }), messages, 'older results cannot replace newer ones')
 assert.equal(precedingAnswer(messages, 2), answer)
 assert.equal(precedingAnswer([...messages, { role: 'user', content: '?' }, { role: 'task-result' }], 4), '')
-console.log('15 task presentation checks passed')
+for (const language of ['zh-CN', 'en']) {
+  for (const action of ['review_install_recovery', 'installation_recovery_requires_review']) {
+    const label = taskActionLabel(action, language)
+    assert.notEqual(label, action)
+    assert(language === 'en' ? label.toLowerCase().includes('review') : label.includes('核对'))
+  }
+}
+console.log('Task presentation checks passed, including bilingual recovery review labels')

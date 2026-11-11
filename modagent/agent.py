@@ -2192,7 +2192,7 @@ class Agent:
                     messages.append(build_search_correction_message(search_res))
                     continue
                 if not search_res.ok:
-                    reply = build_search_fallback(persist)
+                    reply = build_search_fallback(persist, language=getattr(self.cfg, "language", "zh-CN"))
             reply = self._ensure_disable_decision_support(reply, persist)
             persist.append({"role": "assistant", "content": reply})
             self.history.extend(persist)
@@ -2943,6 +2943,7 @@ class Agent:
                     break
 
                 final_text = collapse_repeated_response(collected)
+                search_fallback_used = False
 
                 if (
                     _HAS_VALIDATOR
@@ -2991,7 +2992,8 @@ class Agent:
                         messages.append(build_search_correction_message(search_res))
                         continue
                     if not search_res.ok:
-                        final_text = build_search_fallback(persist)
+                        final_text = build_search_fallback(persist, language=getattr(self.cfg, "language", "zh-CN"))
+                        search_fallback_used = True
 
                 final_text = self._ensure_disable_decision_support(final_text, persist)
                 if selection_action == "plan":
@@ -3079,9 +3081,12 @@ class Agent:
                     recommendation_set = self._localize_recommendation_set(
                         recommendation_set
                     )
+                    search_notice = final_text if search_fallback_used else ""
                     final_text = recommendation_analysis_text(
-                        final_text, recommendation_set
+                        final_text, recommendation_set, language=getattr(self.cfg, "language", "zh-CN")
                     )
+                    if search_notice:
+                        final_text = search_notice + "\n\n" + final_text
                     # The structured decision table is the primary interaction.
                     # Emit it before the potentially long narrative so the
                     # renderer does not appear frozen while laying out both.
@@ -3094,8 +3099,8 @@ class Agent:
                         )
                     yield self._emit({"chunk": final_text})
                 else:
-                    if recommendation_set.get('goal_reviewed'):
-                        final_text = recommendation_analysis_text('', recommendation_set)
+                    if recommendation_set.get('goal_reviewed') and not search_fallback_used:
+                        final_text = recommendation_analysis_text('', recommendation_set, language=getattr(self.cfg, "language", "zh-CN"))
                     yield self._emit({"chunk": final_text})        # 缓冲后一次性发出
                 persist.append({"role": "assistant", "content": final_text})
                 break
@@ -3147,11 +3152,11 @@ class Agent:
                     final_text = (
                         "搜索已达到本轮上限，已停止继续扩展关键词；以下是已搜到并通过相关性筛选的候选。"
                         + (" 已检查来源：" + "、".join(sources) + "。\n\n" if sources else "\n\n")
-                        + recommendation_analysis_text("", fallback_recommendations)
+                        + recommendation_analysis_text("", fallback_recommendations, language=getattr(self.cfg, "language", "zh-CN"))
                     )
                     yield self._emit({"recommendations": fallback_recommendations})
                 elif fallback_recommendations.get('goal_reviewed'):
-                    final_text = recommendation_analysis_text('', fallback_recommendations)
+                    final_text = recommendation_analysis_text('', fallback_recommendations, language=getattr(self.cfg, "language", "zh-CN"))
                 final_text = final_text or "本轮操作已安全停止：流程没有在限定步骤内闭环。已完成的下载或文件操作会保留，未确认的破坏性操作不会执行；请点击重试继续未完成步骤。"
                 if self._core_runtime:
                     self._core_runtime.interrupt(final_text, retryable=False)

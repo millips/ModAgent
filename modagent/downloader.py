@@ -1565,9 +1565,35 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
             continue
 
         status = getattr(resp, "status", 200)
+        response_end = None
+        if status == 206:
+            # A 206 alone does not prove that these bytes belong at our offset.
+            # Validate before opening the partial file in append mode.
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", str(resp.headers.get("Content-Range", "")).strip(), re.IGNORECASE)
+            valid_range = False
+            if match:
+                start, end, response_total = map(int, match.groups())
+                length_header = resp.headers.get("Content-Length")
+                try:
+                    valid_range = (
+                        start == downloaded and start <= end < response_total
+                        and (total is None or total == response_total)
+                        and (length_header is None or int(length_header) == end - start + 1)
+                    )
+                except (TypeError, ValueError):
+                    valid_range = False
+            if not valid_range:
+                resp.close()
+                raise DownloadFailure(
+                    "下载来源返回的续传范围与本地断点不一致，已停止拼接；保留已有文件。请重新核验下载链接后重试。",
+                    failure_kind="invalid_resume_response", retryable=False, attempts=attempt + 1,
+                )
+            total = response_total
+            response_end = end + 1
         # 服务器忽略 Range（返回 200 而非 206）→ 从头开始
         if downloaded and status == 200:
             downloaded = 0
+            total = None
         # 确定总大小
         if total is None:
             cr = resp.headers.get("Content-Range", "")
@@ -1594,6 +1620,11 @@ def download_file(url: str, local_path: str, progress_callback: Optional[Callabl
                     break
                 if not chunk:
                     break
+                if response_end is not None and downloaded + len(chunk) > response_end:
+                    raise DownloadFailure(
+                        "下载来源传回的数据超出声明的续传范围，已停止写入；未替换已有完整文件。请重新核验来源后重试。",
+                        failure_kind="invalid_resume_response", retryable=False, attempts=attempt + 1,
+                    )
                 f.write(chunk)
                 downloaded += len(chunk)
                 got += len(chunk)

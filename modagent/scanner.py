@@ -129,8 +129,23 @@ def _stored_files(value) -> list:
     return parsed if isinstance(parsed, list) else []
 
 
+class ScanDirectoryUnreadable(RuntimeError):
+    code = "SCAN_DIRECTORY_UNREADABLE"
+
+
+def _unreadable_directory(_error):
+    # os.walk otherwise suppresses read errors and returns a partial tree.
+    # Never import that partial file inventory as a complete package.
+    raise ScanDirectoryUnreadable(
+        "无法完整读取模组目录，请检查文件夹权限或磁盘连接后重新扫描。"
+        " Cannot read the complete mod directory; check folder permissions "
+        "and drive connectivity, then scan again."
+    ) from None
+
+
 def _scan_generic_loaders(game_root: str) -> list:
     """探测通用加载器目录，每个子文件夹 / 松散 .dll 视为一个 mod（不依赖游戏名）。"""
+
     results = []
     for rel in GENERIC_LOADER_DIRS:
         base = os.path.join(game_root, rel.replace("/", os.sep))
@@ -138,14 +153,16 @@ def _scan_generic_loaders(game_root: str) -> list:
             continue
         try:
             entries = os.listdir(base)
-        except PermissionError:
-            continue
+        except OSError as exc:
+            _unreadable_directory(exc)
         for entry in entries:
             full = os.path.join(base, entry)
             if os.path.isdir(full):
                 if entry.lower() in _LOADER_SKIP:
                     continue
-                files = [os.path.join(r, f) for r, _, fs in os.walk(full) for f in fs]
+                files = [os.path.join(r, f)
+                         for r, _, fs in os.walk(full, onerror=_unreadable_directory)
+                         for f in fs]
                 if not files:
                     continue
                 name, ver = _parse_loader_name(entry)
@@ -213,9 +230,10 @@ def _scan_external_mod_root(root: str) -> list[dict]:
     if not os.path.isdir(root):
         return []
     try:
-        entries = list(os.scandir(root))
-    except (OSError, PermissionError):
-        return []
+        with os.scandir(root) as directory:
+            entries = list(directory)
+    except OSError as exc:
+        _unreadable_directory(exc)
     results = []
     for entry in entries:
         if entry.name.lower() in _LOADER_SKIP or entry.name.startswith("."):
@@ -223,7 +241,7 @@ def _scan_external_mod_root(root: str) -> list[dict]:
         if entry.is_dir(follow_symlinks=False):
             files = [
                 os.path.join(base, filename)
-                for base, _, filenames in os.walk(entry.path)
+                for base, _, filenames in os.walk(entry.path, onerror=_unreadable_directory)
                 for filename in filenames
                 if os.path.splitext(filename)[1].lower() in EXTERNAL_MOD_EXTENSIONS
             ]
@@ -257,7 +275,7 @@ def _scan_streetfighter6_overlays(game_root: str, existing_mods: list) -> dict:
         return {"detected": 0, "owned_packages": 0, "unidentified": []}
 
     live_files: set[str] = set()
-    for base, _, filenames in os.walk(natives):
+    for base, _, filenames in os.walk(natives, onerror=_unreadable_directory):
         for filename in filenames:
             lower = filename.lower()
             if any(marker in lower for marker in RE_ENGINE_OVERLAY_SUFFIXES):
@@ -613,7 +631,7 @@ def _scan_dirs(game_root: str, patterns: list[tuple[str, str]]) -> list[tuple[st
         if not os.path.isdir(full):
             continue
         try:
-            for base, _, filenames in os.walk(full):
+            for base, _, filenames in os.walk(full, onerror=_unreadable_directory):
                 for f in filenames:
                     fp = os.path.join(base, f)
                     if f.lower().endswith(ext.lower()):
@@ -622,8 +640,8 @@ def _scan_dirs(game_root: str, patterns: list[tuple[str, str]]) -> list[tuple[st
                         if key not in seen:
                             seen.add(key)
                             found.append((rel, f))
-        except PermissionError:
-            continue
+        except OSError as exc:
+            _unreadable_directory(exc)
     return found
 
 

@@ -8,6 +8,7 @@ from typing import Any
 from modagent import db
 
 from .models import ExecutionGrant, PlanRevision, TaskResult, TaskSpec, TaskState
+from .outcomes import ToolOutcome
 
 
 def create_task(spec: TaskSpec, state: TaskState = TaskState.RECEIVED) -> None:
@@ -174,15 +175,39 @@ def cancel_task(task_id: str, reason: str) -> bool:
     if state.terminal:
         return False
     summary = str(reason or "任务已取消")
+    cancel_reason = summary
+    review_records = []
+    checkpoint = task.get("checkpoint")
+    steps = checkpoint.get("steps") if isinstance(checkpoint, dict) else None
+    for step in (steps.values() if isinstance(steps, dict) else []):
+        if not isinstance(step, dict):
+            continue
+        outcome = ToolOutcome.from_legacy(step.get("result", ""), legacy_ok=step.get("ok") is True)
+        if outcome.requires_review:
+            review_records.append({
+                "tool": str(step.get("tool") or ""),
+                "target": str(step.get("target") or ""),
+                "status": outcome.status.value, "reason": outcome.reason,
+                "retryable": False, "requires_review": True,
+            })
+    if review_records:
+        english = (task.get("spec") or {}).get("language") == "en"
+        summary = (
+            "Task cancelled; installation recovery or file changes still require review. "
+            "Keep snapshots and recovery files; inspect the current state before retrying."
+            if english else
+            "任务已取消，但安装恢复状态或文件改动仍需核对。请保留快照和恢复文件，检查当前状态后再决定是否重试。"
+        )
     result = TaskResult(
         status="cancelled",
         summary=summary,
-        not_completed=({"reason": summary},),
+        not_completed=tuple(review_records) + ({"reason": cancel_reason},),
+        next_actions=({"action": "review_install_recovery"},) if review_records else (),
         retryable=False,
     )
     update_state(
         task_id, TaskState.CANCELLED,
-        result=result, cancel_reason=summary,
+        result=result, cancel_reason=cancel_reason,
     )
     append_event(
         task_id, "task_cancelled", TaskState.CANCELLED,

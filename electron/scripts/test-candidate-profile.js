@@ -30,3 +30,16 @@ assert.equal(getAppIdentity(pkg).edition, 'free', 'inherited production env cann
 assert.equal(getAppIdentity(pkg).channel, 'beta');
 assert.throws(() => getAppIdentity({ ...pkg, modagentChannel: 'stable' }));
 console.log('ISOLATED CANDIDATE PROFILE TESTS PASSED');
+const shared = { ...pkg, modagentEdition: 'subscription', modagentProfileMode: 'shared' };
+assert.equal(candidateProfile(shared, 'subscription', 'C:/appdata', productionEnv), null);
+const sharedIdentity = getAppIdentity(shared);
+assert.equal(sharedIdentity.userDataFolder, 'ModAgent P');
+assert.equal(sharedIdentity.appId, 'com.modagent.desktop.pro');
+assert.equal(sharedIdentity.executableName, 'ModAgentPBeta');
+assert.equal(sharedIdentity.manualUpdateManifestUrl, '');
+assert.equal(getAppIdentity({...shared,modagentCandidateId:'another-release-r99'}).userDataFolder, sharedIdentity.userDataFolder);
+const isolatedSharedSmoke = candidateProfile(shared, 'subscription', 'C:/appdata', {MODAGENT_DATA_DIR:'C:/temporary-smoke'}, true);
+assert.equal(isolatedSharedSmoke.dataDir, path.resolve('C:/temporary-smoke'));
+assert.notEqual(isolatedSharedSmoke.userDataDir, 'C:/appdata/ModAgent P');
+assert.throws(()=>candidateProfile({...shared,modagentProfileMode:'invalid'},'subscription','C:/appdata'));
+console.log('SHARED UPGRADE PROFILE + ISOLATED SMOKE TESTS PASSED');

@@ -12,6 +12,11 @@ function candidateId(packageInfo = {}) {
 function candidateProfile(packageInfo, edition, appData, env = {}, smoke = false) {
   const id = candidateId(packageInfo);
   if (!id) return null;
+  if (packageInfo.modagentProfileMode && !['shared', 'isolated'].includes(packageInfo.modagentProfileMode)) {
+    throw new Error('Invalid profile mode');
+  }
+  // User-facing upgrades reuse the normal profile; automated smoke stays isolated.
+  if (packageInfo.modagentProfileMode === 'shared' && !smoke) return null;
   if (!['free', 'subscription'].includes(edition)) throw new Error('Invalid test edition');
   const root = path.join(appData, 'ModAgent-TestProfiles', id, edition);
   // Ordinary test launches must not inherit a production MODAGENT_DATA_DIR.

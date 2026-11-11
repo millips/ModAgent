@@ -5,7 +5,7 @@ import platform
 import urllib.error
 import urllib.parse
 
-from . import _http_json, _safe, _dest
+from . import _http_json, _safe, _dest, _require_record_list
 from .. import downloader
 
 
@@ -116,7 +116,7 @@ def _search_once(query: str, limit: int) -> list:
             raise RuntimeError("GitHub 搜索 API 暂时限流(未登录约每分钟 10 次)。请等 1 分钟再试。")
         raise RuntimeError(f"GitHub 搜索失败: HTTP {e.code}")
     out = []
-    for r in data.get("items", [])[:limit]:
+    for r in _require_record_list(data, "items")[:limit]:
         out.append({
             "name": r.get("name", ""),
             "full_name": r.get("full_name", ""),

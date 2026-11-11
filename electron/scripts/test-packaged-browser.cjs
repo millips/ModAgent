@@ -1,0 +1,20 @@
+const fs=require('node:fs'),path=require('node:path'),os=require('node:os'),assert=require('node:assert/strict');
+const {spawnSync}=require('node:child_process');
+const exe=path.resolve(process.argv[2]);
+const edition=process.argv[3]||'subscription';
+assert(['free','subscription'].includes(edition),'Expected free or subscription edition');
+const root=fs.mkdtempSync(path.join(os.tmpdir(),'modagent-packaged-browser-'));
+const data=path.join(root,'data'),output=path.resolve(__dirname,'../../build/browser-r29-verification');
+fs.mkdirSync(data);fs.mkdirSync(output,{recursive:true});
+fs.writeFileSync(path.join(data,'config.json'),JSON.stringify({llm_api_key:'fixture-browser-key',llm_endpoint:'https://fixture.invalid/v1',llm_model:'fixture-model'}));
+const result=spawnSync(exe,['--smoke-test','--smoke-browser'],{windowsHide:true,encoding:'utf8',timeout:60000,
+  env:{...process.env,MODAGENT_DATA_DIR:data,MODAGENT_USER_DATA_DIR:path.join(root,'ui')}});
+assert.equal(result.status,0,`Browser package check failed; retained fixture: ${root}`);
+const log=fs.readFileSync(path.join(data,`editions/${edition}/logs/desktop.log`),'utf8');
+assert(log.includes('Browser control IPC smoke passed'));
+assert(log.includes('Packaged smoke test passed'));
+assert(!log.includes('fixture-browser-key'));
+const state=JSON.parse(fs.readFileSync(path.join(data,`editions/${edition}/runtime-state.json`),'utf8'));
+assert(state.healthy&&state.lastExitClean);
+fs.writeFileSync(path.join(output,`packaged-browser-${edition}.json`),JSON.stringify({passed:true,edition,fixture:root,real_browser:true,real_accounts:false,real_game_changes:false,secureIpc:true,minimizeRestore:true,cleanExit:true},null,2));
+console.log('PACKAGED BROWSER CONTROLS + IPC + CLEAN EXIT PASSED');

@@ -3,7 +3,6 @@ import os
 import re
 import shutil
 import time
-import filecmp
 
 from .config import CONFIG_DIR
 
@@ -78,24 +77,55 @@ def find_snapshot_dir(snapshot_id: str, game_scope: str = "") -> str:
     return ""
 
 
-def migrate_game_scope(legacy_slug: str, instance_id: str) -> None:
-    """Move legacy snapshot folders under the selected install identity."""
+def migrate_game_scope(legacy_slug: str, instance_id: str):
+    """Move legacy folders and return an undo callback for commit failure."""
     if not legacy_slug or not instance_id or legacy_slug == instance_id:
         return
+    # Scope identifiers are folder names, never paths supplied by a caller.
+    for scope in (legacy_slug, instance_id):
+        if scope in {".", ".."} or any(c in scope for c in ("/", "\\", ":", "\x00")):
+            raise ValueError("Invalid snapshot scope identifier")
     source = os.path.join(SNAPSHOTS_DIR, legacy_slug)
     target = os.path.join(SNAPSHOTS_DIR, instance_id)
+    root = os.path.realpath(SNAPSHOTS_DIR)
+    for folder in (source, target):
+        if os.path.commonpath([root, os.path.realpath(folder)]) != root:
+            raise ValueError("Snapshot scope escapes the snapshot store")
     if not os.path.isdir(source):
         return
     os.makedirs(target, exist_ok=True)
-    for name in os.listdir(source):
-        old = os.path.join(source, name)
-        new = os.path.join(target, name)
-        if not os.path.exists(new):
-            shutil.move(old, new)
+    moved = []
+    def undo():
+        recovery_errors = []
+        for old, new in reversed(moved):
+            try:
+                if any(os.path.commonpath([root, os.path.realpath(folder)]) != root for folder in (source, target)):
+                    raise OSError("Snapshot recovery path changed")
+                os.makedirs(source, exist_ok=True)
+                if os.path.lexists(old):
+                    raise FileExistsError("Original snapshot location is occupied")
+                os.rename(new, old)
+            except OSError:
+                recovery_errors.append(new)
+        if recovery_errors:
+            raise RuntimeError("SNAPSHOT_SCOPE_RECOVERY_REQUIRED: some snapshot folders remain in the destination; preserve both buckets")
+    try:
+        for name in os.listdir(source):
+            old = os.path.join(source, name)
+            new = os.path.join(target, name)
+            if not os.path.lexists(new):
+                # Both buckets are on the same store: rename must either move
+                # the entry or fail, never fall back to partial cross-disk copy.
+                os.rename(old, new)
+                moved.append((old, new))
+    except OSError:
+        undo()
+        raise
     try:
         os.rmdir(source)
     except OSError:
         pass
+    return undo
 
 # 每游戏快照保留上限,超出自动淘汰最老的(最早的原版基线除外)。
 # 硬链接方案下删旧快照是安全的:文件 inode 引用计数还在,新快照不受影响。
@@ -323,13 +353,13 @@ def _workshop_diff(game_root: str, ws: dict) -> tuple[list, list]:
     return sorted(have - want), sorted(want - have)
 
 
-def _reconcile_workshop(game_root: str, ws: dict) -> dict:
+def _reconcile_workshop(game_root: str, ws: dict, planned_diff=None) -> dict:
     """把工坊订阅集恢复到快照时的状态。CDP/Chrome 不可用时绝不阻塞文件回滚,
     把差集如实放进 manual_* 让用户手动处理。"""
     import asyncio
     from .sources import steam_workshop as sw
     appid = ws["appid"]
-    to_unsub, to_resub = _workshop_diff(game_root, ws)
+    to_unsub, to_resub = planned_diff if planned_diff is not None else _workshop_diff(game_root, ws)
     if not to_unsub and not to_resub:
         return {"appid": appid, "in_sync": True}
     result = {"appid": appid, "in_sync": False, "unsubscribed": [], "resubscribed": [],
@@ -353,18 +383,20 @@ def _reconcile_workshop(game_root: str, ws: dict) -> dict:
     return result
 
 
-def _same_file(a: str, b: str) -> bool:
-    try:
-        sa, sb = os.stat(a), os.stat(b)
-        return sa.st_size == sb.st_size and abs(sa.st_mtime - sb.st_mtime) < 2
-    except OSError:
-        return False
-
-
 def _same_content(a: str, b: str) -> bool:
     """回滚判定必须比较真实内容，不能只信可能被保留的 size/mtime。"""
     try:
-        return filecmp.cmp(a, b, shallow=False)
+        # filecmp caches by path, size and mtime even with shallow=False.
+        # A restore preserving metadata must not reuse the pre-restore result.
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as left, open(b, "rb") as right:
+            while True:
+                chunk = left.read(1024 * 1024)
+                if chunk != right.read(1024 * 1024):
+                    return False
+                if not chunk:
+                    return True
     except OSError:
         return False
 
@@ -403,7 +435,9 @@ def _reuse_recent_identical_snapshot(game_root: str, game_instance_id: str,
     Workshop set, and byte-identical managed files. A real change still gets a
     new rollback point.
     """
-    from .db import list_snapshots
+    from .db import list_snapshots, get_installed_mods
+
+    inventory_ids = sorted(str(mod.id) for mod in get_installed_mods(game_instance_id))
 
     now = time.time()
     for row in list_snapshots(game_instance_id)[:3]:
@@ -421,6 +455,8 @@ def _reuse_recent_identical_snapshot(game_root: str, game_instance_id: str,
         except (OSError, ValueError, TypeError):
             continue
         if sorted(manifest.get("files") or []) != rel_files:
+            continue
+        if manifest.get("inventory_mod_ids") != inventory_ids:
             continue
         if (manifest.get("workshop") or None) != (workshop_state or None):
             continue
@@ -443,8 +479,8 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
     相比 v0.8 的三处关键变化:
       1. 快照域收窄到 ModAgent 真正会写的文件(Win64 下只取注入器 + ue4ss),
          不再整目录复制游戏二进制,消除 90s 超时的主因。
-      2. 增量硬链接:与上一份快照内容相同(size+mtime)的文件直接 os.link,
-         零字节拷贝。第二次起的快照接近瞬时。
+      2. 增量硬链接:与上一份快照逐字节相同的文件直接 os.link,
+         避免重复存储；仍需读取文件确认内容一致。
       3. 拷贝失败即整体失败(不再 except: continue)。
          原因:manifest 缺文件会让 restore 把真实游戏文件当成"新增物"删除。
          宁可不出快照,不可出残缺快照。
@@ -501,10 +537,10 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
             dst = os.path.join(snap_dir, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(dst), exist_ok=True)
 
-            # 增量:上一份快照里有同样的文件(size+mtime 一致)→ 硬链接,不拷字节
+            # Metadata can be preserved across edits; only identical bytes may share storage.
             if prev_dir:
                 prev = os.path.join(prev_dir, rel.replace("/", os.sep))
-                if os.path.exists(prev) and _same_file(src, prev):
+                if os.path.exists(prev) and _same_content(src, prev):
                     try:
                         os.link(prev, dst)
                         linked += 1
@@ -521,8 +557,10 @@ def snapshot_create(game_root: str, game_slug: str, trigger_mod_id: str = "",
             f"快照创建失败,已回滚空目录(不写残缺快照,否则 restore 会误删游戏文件): {e}"
         ) from e
 
+    from .db import get_installed_mods
     manifest = {
         "snapshot_id": snap_id,
+        "inventory_mod_ids": sorted(str(mod.id) for mod in get_installed_mods(game_instance_id)),
         "schema": 2,                     # v2: files 为相对路径
         "baseline": not rel_files,       # True = 原版基线(域内无 mod),回滚到它即清空所有 mod
         "workshop": _workshop_state(game_root),  # 工坊订阅集(不在游戏目录,以清单形式入快照)
@@ -765,6 +803,7 @@ def _restore_plan(snap_dir: str, manifest: dict) -> dict:
         "specs": [(s["dir"] if "dir" in s else f"[自定义落点×{len(s['files'])}]") for s in specs],
         "domain_sniffed": not is_known_snapshot_profile(game_slug, game_root),
         "to_delete": to_delete, "to_restore": to_restore,
+        "snapshot_files": sorted(snap_files),
         "unchanged": unchanged, "missing_in_snapshot": missing_in_snapshot,
         "ignored_unsafe_snapshot_files": ignored_unsafe,
     }
@@ -786,7 +825,7 @@ def snapshot_restore_preview(snapshot_id: str) -> dict:
             ws_preview = {"appid": ws["appid"],
                           "to_unsubscribe": to_unsub, "to_resubscribe": to_resub}
         except Exception:
-            ws_preview = None                        # 预览失败不阻塞文件预览(同 reconcile 原则)
+            ws_preview = {"preview_unavailable": True, "error_code": "SNAPSHOT_WORKSHOP_PREVIEW_UNAVAILABLE"}
 
     return {
         "snapshot_id": snapshot_id,
@@ -812,11 +851,20 @@ def snapshot_restore(snapshot_id: str) -> dict:
 
     安全边界:只在快照域内动手 —— 删除"域内存在但快照里没有"的文件(即快照后新增的 mod 文件),
     还原快照里的全部文件。快照域外的任何文件(游戏 exe、官方 dll、存档…)永不触碰。
-    工坊内容不在游戏目录,按订阅清单差集同步(见 _reconcile_workshop),失败不阻塞文件回滚。
+    工坊内容不在游戏目录。差集不可读时在修改前停止；已知差集的远程同步失败转手动处理。
     """
     snap_dir, manifest = _locate_snapshot(snapshot_id)
     plan = _restore_plan(snap_dir, manifest)
     game_root = plan["game_root"]
+
+    # Establish subscription scope before any local file or configuration mutation.
+    ws = manifest.get("workshop")
+    workshop_plan = None
+    if ws and ws.get("appid"):
+        try:
+            workshop_plan = _workshop_diff(game_root, ws)
+        except Exception:
+            raise RuntimeError("SNAPSHOT_WORKSHOP_PREVIEW_UNAVAILABLE") from None
 
     from .diagnostics import classify_oserror
     deleted = restored = 0
@@ -861,7 +909,7 @@ def snapshot_restore(snapshot_id: str) -> dict:
                 pass
 
     ws = manifest.get("workshop")
-    ws_result = _reconcile_workshop(game_root, ws) if ws and ws.get("appid") else None
+    ws_result = _reconcile_workshop(game_root, ws, workshop_plan) if ws and ws.get("appid") else None
     from . import user_config
     external_result = user_config.restore_snapshot(snap_dir, manifest)
     # 执行后用同一差分器重新核验。只有差分归零才叫完成；目录存在与否不能
@@ -878,6 +926,11 @@ def snapshot_restore(snapshot_id: str) -> dict:
         "restored": restored,
         "unchanged_verified": after["unchanged"],
         "verified_target_files": after["unchanged"],
+        "inventory_mod_ids": manifest.get("inventory_mod_ids"),
+        "reverted_files": [os.path.join(game_root, rel.replace("/", os.sep))
+                           for rel in plan["to_restore"] + plan["to_delete"]] if complete else [],
+        "verified_snapshot_files": [os.path.join(game_root, rel.replace("/", os.sep))
+                                    for rel in after["snapshot_files"]] if complete else [],
         "pending_delete": after["to_delete"],
         "pending_restore": after["to_restore"],
         "missing_in_snapshot": after["missing_in_snapshot"],
@@ -888,6 +941,7 @@ def snapshot_restore(snapshot_id: str) -> dict:
         "directories_removed": directories_removed,
         "failed": failed,
         "workshop": ws_result,
+        "workshop_target_ids": [str(pid) for pid in ws.get("ids", [])] if ws else None,
         "external_configs": external_result,
     }
 

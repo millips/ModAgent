@@ -1,6 +1,7 @@
 import json
 import os
 import hashlib
+import tempfile
 from dataclasses import dataclass, asdict, field
 
 CONFIG_DIR = os.path.abspath(os.environ.get(
@@ -160,8 +161,65 @@ def save(cfg: Config):
     if os.environ.get("MODAGENT_SECURE_SECRETS") == "1":
         for field in _SECRET_ENV:
             data.pop(field, None)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # Never truncate the last usable configuration before the replacement is
+    # fully serialized and flushed. Keep the temporary on the same filesystem.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=os.path.dirname(CONFIG_FILE),
+                                         prefix=".config-", suffix=".tmp", delete=False) as f:
+            temporary = f.name
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        # Capture the exact staged bytes before publishing. Reading CONFIG_FILE
+        # after replacement could fail or capture a later writer's contents,
+        # neither of which is a safe identity for transaction rollback.
+        with open(temporary, "rb") as staged:
+            written = staged.read()
+        os.replace(temporary, CONFIG_FILE)
+        temporary = None
+        return written
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def read_config_bytes():
+    try:
+        with open(CONFIG_FILE, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def restore_config_bytes(previous, expected):
+    """Undo our own successful replacement, never overwrite a later edit."""
+    if read_config_bytes() != expected:
+        raise RuntimeError("CONFIG_RECOVERY_REQUIRED: configuration changed after save")
+    if previous is None:
+        if expected is not None:
+            os.unlink(CONFIG_FILE)
+        return
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=os.path.dirname(CONFIG_FILE),
+                                         prefix=".config-recovery-", suffix=".tmp", delete=False) as handle:
+            temporary = handle.name
+            handle.write(previous)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, CONFIG_FILE)
+        temporary = None
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def load_prompt() -> str:

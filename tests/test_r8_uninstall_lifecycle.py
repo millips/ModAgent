@@ -11,6 +11,9 @@ from pathlib import Path
 
 import pytest
 
+if not os.environ.get('MODAGENT_DATA_DIR'):
+    raise RuntimeError('Run via scripts/run-python-regressions.py or set MODAGENT_DATA_DIR to a fresh isolated test directory before importing ModAgent.')
+
 from modagent import db, installer, tools, task_control, downloader, snapshot
 from modagent.config import Config
 from modagent.orchestration.outcomes import ToolOutcome
@@ -38,6 +41,23 @@ def register(cfg, paths, mid='fixture'):
 
 def uninstall(cfg, mid='fixture'):
     return json.loads(tools.execute('mod_uninstall', {'mod_id': mid, 'confirmed': True}, cfg))
+
+
+@pytest.mark.parametrize('workshop', [False, True])
+def test_preview_explains_actual_recovery_boundary(monkeypatch, env, workshop):
+    game, cfg = env
+    mid = 'ws_123456' if workshop else 'fixture'
+    path = game / 'preserve.dll'
+    path.write_bytes(b'unchanged')
+    register(cfg, [path], mid=mid)
+    monkeypatch.setattr(tools.snapshot, 'snapshot_create', lambda *a, **kw: pytest.fail('Preview must not create a snapshot'))
+    result = json.loads(tools.execute('mod_uninstall', {'mod_id': mid}, cfg))
+    assert result['requires_confirmation'] is True
+    assert result['will_unsubscribe'] is workshop
+    assert result['will_delete_count'] == (0 if workshop else 1)
+    assert ('本地快照不能恢复订阅' if workshop else '恢复范围以实际快照内容为准') in result['note']
+    assert path.read_bytes() == b'unchanged'
+    assert db.get_mod(mid, cfg.game_slug) is not None
 
 
 def test_missing_mod_restores_original_instead_of_deleting_backup(env):

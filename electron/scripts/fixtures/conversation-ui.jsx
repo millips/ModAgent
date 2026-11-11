@@ -4,6 +4,14 @@ import ChatPage from '../../src/components/ChatPage'
 
 window.fixtureRequests = []
 window.fixtureErrors = []
+const recoveryMode=new URLSearchParams(location.search).get('recovery')
+if(recoveryMode){
+  const timer=window.setTimeout.bind(window)
+  window.setTimeout=(fn,ms,...a)=>timer(fn,ms===15000?250:ms,...a)
+}
+const sessionOps = new URLSearchParams(location.search).has('session-ops')
+let sessionRows = sessionOps ? [{id:'saved-session',title:'Saved fixture',updated_at:new Date().toISOString()}] : []
+if(new URLSearchParams(location.search).has('session-load')) sessionRows=['saved-a','saved-b'].map(id=>({id,title:id,updated_at:new Date().toISOString()}))
 const item = {
   selection_key: 'nexus:42', source: 'nexus', source_id: '42', mod_id: '42',
   name: 'Training UI Helper [TEST FIXTURE]', summary: 'Training assistance and clearer UI for Fixture Game.',
@@ -23,23 +31,81 @@ window.fetch = async (input, options = {}) => {
   const url = String(input)
   const body = options.body ? JSON.parse(options.body) : {}
   window.fixtureRequests.push({ url, body, method: options.method || 'GET' })
-  if (url.includes('/chat/tasks/active')) return response({ active: false })
+  if(url.endsWith('/tasks/cancel') && window.fixtureCancelMode) {
+    if(window.fixtureCancelMode==='http')return new Response('{}',{status:503})
+    if(window.fixtureCancelMode==='body')return new Response(new ReadableStream({start(c){
+      options.signal?.addEventListener('abort',()=>c.error(new DOMException('Aborted','AbortError')),{once:true})
+    }}))
+    return response({ok:window.fixtureCancelMode!=='missing',chat_cancelled:window.fixtureCancelMode==='invalidated'})
+  }
+  if (url.includes('/chat/tasks/active')) return response(recoveryMode?{active:true,session_id:'saved-a',started:Date.now()/1000}:{ active: false })
+  if(url.includes('/chat/tasks/saved-a?') && recoveryMode){
+    if(recoveryMode==='http')return new Response('{}',{status:503})
+    if(recoveryMode==='invalid')return response({})
+    if(recoveryMode==='complete')return response({events:[],done:true,cursor:0})
+    return new Response(new ReadableStream({start(c){options.signal?.addEventListener('abort',()=>c.error(new DOMException('Aborted','AbortError')),{once:true})}}))
+  }
   if (url.endsWith('/downloads/status')) return response({ active: false })
-  if (url.includes('/sessions') && options.method === 'POST') return response({ id: 'fixture-session' })
-  if (url.includes('/sessions') && !options.method) return response([])
+  if (url.includes('/sessions') && options.method === 'POST') {
+    if(window.fixtureDelaySession) return new Promise(resolve=>{window.resolveDelayedSession=()=>resolve(response({id:'late-session'}))})
+    if(window.fixtureSessionFailure === 'http') return new Response('{}', {status:503})
+    if(window.fixtureSessionFailure === 'id') return response({id:null})
+    if(window.fixtureSessionFailure === 'body') return new Response(new ReadableStream({start(controller) {
+      options.signal?.addEventListener('abort', ()=>controller.error(new DOMException('Aborted','AbortError')), {once:true})
+    }}))
+    return response({ id: 'fixture-session' })
+  }
+  if (url.endsWith('/sessions/saved-session') && ['PUT','DELETE'].includes(options.method)) {
+    if(window.fixtureMutationFailure) return new Response('{}', {status:503})
+    sessionRows=options.method==='DELETE'?[]:[{...sessionRows[0],title:body.title}]
+    return response({ok:true})
+  }
+  if (/\/sessions\/saved-[ab]$/.test(url) && !options.method) {
+    const id=url.endsWith('saved-a')?'saved-a':'saved-b'
+    const data={id,messages:[{role:'assistant',content:'Transcript '+id}]}
+    if(id==='saved-a') {
+      if(window.fixtureLoadMode==='http')return new Response('{}',{status:503})
+      if(window.fixtureLoadMode==='invalid')return response({id,messages:{broken:true}})
+      if(window.fixtureLoadMode==='body')return new Response(new ReadableStream({start(c){
+        options.signal?.addEventListener('abort',()=>c.error(new DOMException('Aborted','AbortError')),{once:true})
+      }}))
+      if(window.fixtureLoadMode==='late')return new Promise(resolve=>{window.resolveOldSession=()=>resolve(response(data))})
+    }
+    return response(data)
+  }
+  if (url.includes('/sessions') && !options.method) return response(sessionRows)
   if (url.endsWith('/tasks/saved-task/resume')) return response({
     ok: true, action: 'rebuild_plan', recovery_task_id: 'saved-task', session_id: 'fixture-session',
     recommendation_selection: [{ ...item, file_id: '102', variant_id: '42:102', variant_name: 'Large UI' }],
     message: '恢复原选择，重新核验计划；不要下载安装。',
   })
   if (url.endsWith('/chat/stream')) {
+    if (window.fixtureTransportFailure) {
+      if (window.fixtureTransportFailure === 'headers') {
+        return new Promise((_resolve, reject) => options.signal.addEventListener('abort',
+          () => reject(new DOMException('Aborted', 'AbortError')), { once: true }))
+      }
+      return new Response(new ReadableStream({ start(controller) {
+        if (window.fixtureTransportFailure === 'partial') {
+          controller.enqueue(new TextEncoder().encode('data: {"chunk":"Partial fixture response"}\n\n'))
+        }
+        options.signal.addEventListener('abort', () => controller.error(new DOMException('Aborted', 'AbortError')), { once: true })
+      } }), { status: window.fixtureTransportFailure === 'http-body' ? 503 : 200,
+        headers: { 'Content-Type': 'text/event-stream' } })
+    }
     const task = `ui-${++serial}`
     const terminal = (state, summary, extra = {}) => ({ task_event: {
       task_id: task, seq: 5, state, type: state === 'WAITING_CONFIRMATION' ? 'decision_required' : state === 'COMPLETED' ? 'task_completed' : 'task_failed',
       payload: { result: { summary, completed: [], not_completed: [], warnings: [] }, ...extra },
     } })
     let events
-    if (body.selection_action === 'plan') {
+    if (new URLSearchParams(location.search).has('browser_gate')) {
+      const nexus=new URLSearchParams(location.search).get('browser_gate')==='nexus'
+      events=[{tool_result:{name:nexus?'mod_download':'workshop_install',ok:false,status:nexus?'manual_action_required':'login_required',summary:'Fixture: manual verification needed'}},{done:true}]
+    } else if (new URLSearchParams(location.search).has('credential')) {
+      const nexus=new URLSearchParams(location.search).get('credential')==='nexus'
+      events=[{tool_result:{name:nexus?'mod_download':'nexus_search',ok:false,status:nexus?'nexus_api_key_missing':'failed',summary:'Fixture: account setup needed'}}, {done:true}]
+    } else if (body.selection_action === 'plan') {
       const ready = terminal('WAITING_CONFIRMATION', '本轮核验结束，请查看待确认清单。', {
         plan_revision: { task_id: task, revision_id: `plan-${task}` },
       })
@@ -75,6 +141,10 @@ window.fetch = async (input, options = {}) => {
   }
   return response({ ok: true })
 }
-createRoot(document.getElementById('root')).render(<ChatPage
-  status={{ online: true, game: 'Fixture Game', game_slug: 'fixturegame', game_root: 'C:/TEST-ONLY', mods: 0, snaps: 0 }}
-  games={[]} onGameChange={() => {}} onRefresh={() => {}} toast={text => window.fixtureErrors.push(text)} api="http://fixture.invalid" />)
+function FixtureApp(){
+  const [game,setGame]=React.useState('fixturegame')
+  window.fixtureSwitchGame=()=>setGame('otherfixture')
+  return <ChatPage status={{ online:true,game,game_slug:game,game_root:'C:/TEST-ONLY',mods:0,snaps:0,...(new URLSearchParams(location.search).has('credential')?{tavily_set:false}:{}) }}
+    language={new URLSearchParams(location.search).get('language') || 'zh-CN'} games={[]} onGameChange={()=>{}} onRefresh={()=>{}} toast={text=>window.fixtureErrors.push(text)} api="http://fixture.invalid" />
+}
+createRoot(document.getElementById('root')).render(<FixtureApp />)

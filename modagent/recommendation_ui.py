@@ -101,8 +101,78 @@ def _source_coverage_text(payload: dict | None) -> str:
     return "本轮各来源返回候选：" + "、".join(parts) + "。"
 
 
-def recommendation_analysis_text(value: Any, payload: dict | None = None) -> str:
+def _english_recommendation_analysis(value: Any, payload: dict) -> str:
+    items = payload.get("items") or []
+    if not items:
+        if payload.get("goal_reviewed"):
+            return ("No candidates have sufficient evidence of matching your specific request, so none were preselected. "
+                    "This does not mean relevant Mods do not exist. Refine the request or try another source.")
+        # With no structured evidence, do not manufacture a verified candidate list.
+        return "No structured candidates are available. Review the search results and source status before choosing a Mod."
+    labels = {**SOURCE_LABELS, "workshop": "Steam Workshop"}
+    verified = sum(bool(item.get("detail_verified")) for item in items)
+    lines = [f"Found {len(items)} candidates; source details were retrieved for {verified}. Review features and requirements before choosing.", ""]
+    selected = set(payload.get("selected_keys") or []) | set(payload.get("wanted_keys") or [])
+    selected_names = {_text(item.get("localized_name") or item.get("name")) for item in items
+                      if not item.get("is_prerequisite") and item.get("selection_key") in selected}
+    requirements = [r for r in payload.get("dependency_requirements") or []
+                    if selected_names.intersection(r.get("required_by") or [])]
+    statuses = {"ready": "Installable candidate matched", "needs_resolution": "Matched; resolution required",
+                "satisfied_installed": "Already installed", "satisfied_local": "Satisfied by the current environment",
+                "unresolved": "Source not yet identified"}
+    if requirements:
+        lines.extend(["**Prerequisites / required dependencies**", ""])
+        for requirement in requirements[:8]:
+            required_by = ", ".join(requirement.get("required_by") or [])
+            lines.append(f"- {requirement.get('name') or 'Unnamed dependency'}: {statuses.get(requirement.get('status'), 'Verification pending')}"
+                         + (f"; required by {required_by}" if required_by else ""))
+        if len(requirements) > 8:
+            lines.append(f"- {len(requirements) - 8} more requirements for the selected targets are available in the dependency panel.")
+        lines.append("")
+    for index, item in enumerate(items, 1):
+        source = _text(item.get("source"))
+        identity = (f"Nexus #{item['mod_id']}" if source == "nexus" and item.get("mod_id")
+                    else (labels.get(source, source) + " " + _text(item.get("source_id"))).strip())
+        name = _text(item.get("name"), "Unnamed Mod")
+        lines.append(f"{index}. " + ("**[Prerequisite]** " if item.get("is_prerequisite") else "")
+                     + f"**{name}**" + (f" ({identity})" if identity else ""))
+        content = _text(item.get("content"))
+        lines.append(content if content and content != MISSING_CONTENT_TEXT else
+                     "No feature description was returned by the source; functionality and compatibility remain unverified.")
+        if item.get("goal_fit"):
+            lines.append("Request match: " + ("Supported by the source description." if item['goal_fit'].get('status') == 'matched'
+                                             else "Unconfirmed; this is separate from detail verification."))
+        if item.get("selection_reason"):
+            lines.append(_text(item["selection_reason"]))
+        facts = []
+        version = _text(item.get("version"))
+        if version and version != "待详情核验":
+            facts.append("Version " + version)
+        dependencies = [_text(d) for d in item.get("dependencies") or [] if _text(d)]
+        if dependencies:
+            facts.append("Requires " + ", ".join(dependencies[:5]))
+        if item.get("required_by"):
+            facts.append("Required by " + ", ".join(item['required_by'][:5]))
+        facts.append("Source details verified" if item.get("detail_verified") else
+                     ("Detail verification blocked; not yet eligible for an installation plan"
+                      if item.get("verification_status") == "blocked" else
+                      "Search evidence only; not yet eligible for an installation plan"))
+        conflict = _text(item.get("conflict"))
+        if conflict and conflict not in {"基础详情已核验，安装包仍需检查", "仅有搜索摘要，待详情核验"}:
+            facts.append(conflict)
+        lines.extend(["Selection notes: " + "; ".join(facts) + ".", ""])
+    counts = payload.get("source_counts") or {}
+    coverage = [f"{labels.get(source, source)}: {int(count)}" for source, count in counts.items() if int(count or 0) > 0]
+    if coverage:
+        lines.extend(["Candidates returned by source: " + "; ".join(coverage) + ".", ""])
+    lines.append("Choose based on the features above. Unverified candidates can remain pending, but require source details before entering an installation plan. The downloaded package and target game version still require checks.")
+    return "\n".join(lines).strip()
+
+
+def recommendation_analysis_text(value: Any, payload: dict | None = None, language: str = "zh-CN") -> str:
     """Render every structured candidate; model prose may not omit rows."""
+    if language == "en":
+        return _english_recommendation_analysis(value, payload or {})
     items = (payload or {}).get("items") or []
     if not items:
         if (payload or {}).get('goal_reviewed'):

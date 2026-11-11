@@ -3,11 +3,16 @@ import re
 import time
 import urllib.parse
 
-from . import _http_json, _safe, _dest
+from . import _http_json, _safe, _dest, _require_record_list
 from .. import downloader
 
 _GAME_CACHE = {}                 # game_name(lower) -> (ts, game_id|None)
 _GAME_TTL = 3600
+
+
+class GameDiscoveryFailed(RuntimeError):
+    def __init__(self):
+        super().__init__("GameBanana 游戏识别失败，不能据此判断未收录。请测试连接后重试，或暂用其他来源。 / GameBanana game discovery failed; this does not mean the game is absent. Test the connection and retry, or use another source.")
 
 
 def find_game(game_name: str):
@@ -22,7 +27,7 @@ def find_game(game_name: str):
     try:
         data = _http_json("https://gamebanana.com/apiv11/Util/Game/NameMatch?_sName="
                           + urllib.parse.quote(game_name.strip()))
-        recs = data.get("_aRecords") or []
+        recs = _require_record_list(data, "_aRecords")
         for r in recs:                                   # 精确名优先,退而取首个匹配
             if (r.get("_sName") or "").strip().lower() == key:
                 gid = r.get("_idRow")
@@ -30,7 +35,7 @@ def find_game(game_name: str):
         if gid is None and recs:
             gid = recs[0].get("_idRow")
     except Exception:
-        return None                                      # 站点不可达 → 当没收录,不缓存失败
+        raise GameDiscoveryFailed() from None
     _GAME_CACHE[key] = (time.time(), gid)
     return gid
 
@@ -41,7 +46,7 @@ def search(game_id: int, query: str, limit: int = 10) -> list:
         "https://gamebanana.com/apiv11/Util/Search/Results?_sModelName=Mod&_sOrder=best_match"
         f"&_idGameRow={int(game_id)}&_sSearchString=" + urllib.parse.quote((query or "").strip()))
     out = []
-    for r in (data.get("_aRecords") or [])[:limit]:
+    for r in _require_record_list(data, "_aRecords")[:limit]:
         ts = r.get("_tsDateModified") or r.get("_tsDateAdded") or 0
         out.append({
             "name": r.get("_sName", ""),

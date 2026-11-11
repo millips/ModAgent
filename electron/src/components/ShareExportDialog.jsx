@@ -1,6 +1,9 @@
-import React, { useMemo, useState } from 'react'
+import React, { useMemo, useState, useRef } from 'react'
 import { AlertTriangle, CheckCircle2, Download, FileText, Github, Link2, X } from 'lucide-react'
 import { updatePShareSubmission, upsertPShareSubmission } from '../pshare/pShareStore'
+import { requestLocalJson, localApiFailure } from './localApi.mjs'
+import { readShareResult, validateShareExport, shareRejectionMessage } from './shareResponse.mjs'
+import { writeClipboardText, clipboardFailure } from '../clipboardAction.mjs'
 
 const OFFICIAL_SUBMISSION_URL = 'https://github.com/millips/ModAgent-Share/issues/new?template=collection-submission.yml'
 
@@ -27,12 +30,12 @@ function buildSourceEvidence(mods, language) {
   ].join('\n')
 }
 
-async function copyText(text, toast, label, language) {
+async function copyTextFeedback(text, toast, label, language) {
   try {
-    await navigator.clipboard.writeText(text)
+    await writeClipboardText(text, navigator.clipboard)
     toast(language === 'en' ? `${label} copied.` : `${label}已复制。`)
-  } catch (_) {
-    toast(language === 'en' ? `Could not copy ${label}; select the text manually.` : `无法复制${label}，请手动选择文本。`, 'error')
+  } catch (error) {
+    toast(clipboardFailure(error, language), 'error')
   }
 }
 
@@ -45,7 +48,17 @@ export default function ShareExportDialog({ api, mods, toast, onClose, gameName 
   const [compatibility, setCompatibility] = useState(() => en ? `Target game: ${gameName || 'enter the game name on GitHub'}.\nThe receiving computer will check dependencies, conflicts, versions and local duplicates again before installation.` : `适用游戏：${gameName || '请填写游戏名称'}。\n安装前会在接收方电脑上重新检查依赖、冲突、版本和本机重复项。`)
   const [authorName, setAuthorName] = useState('')
   const [busy, setBusy] = useState(false)
+  const busyRef = useRef(false)
   const [exported, setExported] = useState(null)
+  const [recordWarning, setRecordWarning] = useState(false)
+  const copyLock = useRef(false)
+  const [copying, setCopying] = useState(false)
+  const copyText = async (...args) => {
+    if (copyLock.current) return
+    copyLock.current = true; setCopying(true)
+    try {await copyTextFeedback(...args)}
+    finally {copyLock.current = false; setCopying(false)}
+  }
 
   const unaligned = useMemo(
     () => mods.filter(mod => !(mod.sourceKey && mod.sourceUrl)),
@@ -55,13 +68,15 @@ export default function ShareExportDialog({ api, mods, toast, onClose, gameName 
 
   const exportSubmission = async () => {
     if (!title.trim() || !description.trim() || !sourceEvidence.trim() || !compatibility.trim()) {
-      toast(en ? 'Enter a collection title and description.' : '请填写合集标题和简介', 'error')
+      toast(en ? 'Enter the title, description, source evidence and compatibility notes.' : '请填写合集标题、简介、来源证据和兼容性说明', 'error')
       return
     }
-    if (!ready || busy) return
+    if (!ready || busyRef.current) return
+    busyRef.current = true
     setBusy(true)
+    let contentGenerated = false
     try {
-      const response = await fetch(`${api}/tool/share_export`, {
+      const envelope = await requestLocalJson(`${api}/tool/share_export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -69,21 +84,33 @@ export default function ShareExportDialog({ api, mods, toast, onClose, gameName 
           title: title.trim(),
           description: description.trim(),
           warning: warning.trim(),
-          author_note: `${sourceEvidence.trim()}\n\n兼容性、冲突和警告：\n${compatibility.trim()}`.slice(0, 2000),
+          author_note: `${sourceEvidence.trim()}\n\n${en ? 'Compatibility, conflicts and warnings:' : '兼容性、冲突和警告：'}\n${compatibility.trim()}`.slice(0, 2000),
           author_name: authorName.trim(),
           source_evidence: sourceEvidence.trim(),
           compatibility: compatibility.trim(),
           require_verified_sources: true,
         }),
       })
-      const envelope = await response.json()
-      const result = JSON.parse(envelope.result || '{}')
-      if (result.error) throw new Error(result.error)
+      const result = validateShareExport(readShareResult(envelope), mods.length)
+      contentGenerated = true
       const safeTitle = title.trim().replace(/[\\/:*?"<>|]+/g, '-').slice(0, 48) || 'collection'
       const submissionId = result.manifest?.submission?.id || ''
-      const filename = `modagent-submission-${submissionId || Date.now()}-${safeTitle}.json`
-      downloadJson(result.share_json, filename)
-      upsertPShareSubmission({
+      let filename = `modagent-submission-${submissionId || Date.now()}-${safeTitle}.json`
+      if (!window.modagent?.saveShareFile) {
+        downloadJson(result.share_json, filename)
+        toast(en ? '[SHARE_SAVE_UNCONFIRMED] Download requested. Verify the JSON in Downloads; this browser cannot confirm it was saved.' : '[SHARE_SAVE_UNCONFIRMED] 已请求下载，请在下载目录核对 JSON；当前浏览器无法确认是否保存成功。', 'warn')
+        return
+      }
+      const saved = await window.modagent.saveShareFile({ text: result.share_json, filename })
+      if (saved?.cancelled) {
+        toast(en ? 'Save cancelled. Your draft is still here; nothing was submitted online.' : '已取消保存，草稿已保留，尚未在线投稿。')
+        return
+      }
+      if (saved?.ok !== true || typeof saved.filename !== 'string' || !saved.filename) throw Error('share_save_failed')
+      filename = saved.filename
+      setExported({ submissionId, filename })
+      try {
+      const record = upsertPShareSubmission({
         submission_id: submissionId,
         title: title.trim(),
         description: description.trim(),
@@ -96,27 +123,46 @@ export default function ShareExportDialog({ api, mods, toast, onClose, gameName 
         mod_count: mods.length,
         filename,
       })
-      setExported({
-        submissionId,
-        filename,
-      })
+      if (!record) throw Error('record not saved')
+      setRecordWarning(false)
+      } catch (_) {
+        setRecordWarning(true)
+        toast(en ? '[SHARE_RECORD_FAILED] The JSON file was saved, but local submission tracking could not be saved. Keep the file; nothing was submitted online.' : '[SHARE_RECORD_FAILED] JSON 文件已保存，但本地投稿记录未能保存。请保留文件，尚未在线投稿。', 'warn')
+        return
+      }
       toast(en ? `Submission package exported: ${mods.length} Mods. Continue to the official submission page.` : `投稿包已导出：${mods.length} 个 Mod。下一步可前往官方审核投稿页。`)
     } catch (error) {
-      toast(error?.message || (en ? 'Could not export the submission package.' : '导出投稿包失败'), 'error')
+      toast('[SHARE_EXPORT_FAILED] ' + (contentGenerated
+        ? (en ? 'The content was generated, but local export or record saving failed. Check Downloads and available storage before retrying. Nothing was submitted online.' : '内容已生成，但本地导出或记录保存失败。请检查下载目录和可用空间后重试，尚未在线投稿。')
+        : error?.code === 'SHARE_VERIFICATION_REJECTED' ? shareRejectionMessage(language) : localApiFailure(error, language)), 'error')
     } finally {
       setBusy(false)
+      busyRef.current = false
     }
   }
 
   const openSubmissionPage = async () => {
+    if (busyRef.current || !exported) return
+    busyRef.current = true
     setBusy(true)
+    let timer, opened = false
     try {
-      const result = await window.modagent?.openExternal?.(OFFICIAL_SUBMISSION_URL)
-      if (!result?.ok) throw new Error(result?.error || (en ? 'Could not open the submission page.' : '无法打开审核投稿页'))
-      if (exported?.submissionId) updatePShareSubmission(exported.submissionId, { status: 'submission_opened' })
-    } catch (error) {
-      toast(error?.message || (en ? 'Could not open the submission page.' : '无法打开审核投稿页'), 'error')
+      const result = await Promise.race([
+        window.modagent?.openExternal?.(OFFICIAL_SUBMISSION_URL),
+        new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('timeout')),20000)}),
+      ])
+      if (result?.ok !== true) throw Error('open unconfirmed')
+      opened = true
+      if (!recordWarning && exported.submissionId && !updatePShareSubmission(exported.submissionId, { status: 'submission_opened' })) throw Error('record missing')
+      toast(en ? 'Submission page opened. Attach your JSON and submit it on GitHub; opening the page does not submit it.' : '投稿页已打开，请在 GitHub 附上 JSON 并提交；打开页面不代表已投稿。')
+    } catch (_) {
+      if (opened) setRecordWarning(true)
+      toast(opened
+        ? (en ? '[SHARE_RECORD_FAILED] The page opened, but local tracking was not updated. Nothing was submitted automatically.' : '[SHARE_RECORD_FAILED] 页面已打开，但本地记录未更新；未自动提交投稿。')
+        : (en ? '[SHARE_PAGE_UNCONFIRMED] Opening the page was not confirmed. Check your browser before retrying. Your saved JSON is retained.' : '[SHARE_PAGE_UNCONFIRMED] 尚未确认页面打开，请检查浏览器后再试。已保存的 JSON 不受影响。'), 'error')
     } finally {
+      clearTimeout(timer)
+      busyRef.current = false
       setBusy(false)
     }
   }
@@ -134,12 +180,14 @@ export default function ShareExportDialog({ api, mods, toast, onClose, gameName 
 
         {exported ? (
           <div className="min-h-0 space-y-3 overflow-y-auto pr-1">
+            {copying && <p role="status" className="text-xs text-cyber-cyan">{en ? 'Waiting for clipboard confirmation…' : '正在等待剪贴板确认…'}</p>}
             <div className="rounded-lg border border-cyber-green/35 bg-cyber-green/5 p-4">
               <div className="flex items-center gap-2 text-sm font-medium text-cyber-green"><CheckCircle2 size={17} />{en ? 'Submission package exported' : '投稿包已导出'}</div>
               <p className="mt-2 text-xs leading-relaxed text-surface-300">
                 {en ? <>Created <span className="font-mono text-cyber-cyan">{exported.filename}</span>. This local file is not public and has not received an official collection code.</> : <>已生成 <span className="font-mono text-cyber-cyan">{exported.filename}</span>。该文件目前仅在本机，尚未公开，也没有获得官方合集码。</>}
               </p>
               {exported.submissionId && <p className="mt-2 text-xs text-surface-500">{en ? 'Draft submission ID: ' : '投稿草稿编号：'}{exported.submissionId}</p>}
+              {recordWarning && <p role="alert" className="mt-2 text-xs text-cyber-yellow">{en ? 'Local tracking is unavailable. Keep the exported file and track the submission on GitHub yourself.' : '本地投稿记录不可用，请保留导出文件，并在 GitHub 自行追踪投稿。'}</p>}
             </div>
             <div className="rounded-lg border border-cyber-cyan/25 bg-surface-900/70 p-4 text-xs space-y-3">
               <div className="flex items-center justify-between gap-3"><span className="font-medium text-white">{en ? 'GitHub submission fields' : 'GitHub 投稿字段（已按官方表单生成）'}</span><span className="text-cyber-cyan">{en ? 'Copy and paste' : '复制后粘贴即可'}</span></div>
@@ -154,7 +202,7 @@ export default function ShareExportDialog({ api, mods, toast, onClose, gameName 
             </div>
           </div>
         ) : (
-        <div className="min-h-0 space-y-3 overflow-y-auto pr-1">
+        <fieldset disabled={busy} className="min-w-0 min-h-0 space-y-3 overflow-y-auto pr-1">
           <label className="block text-xs text-surface-300">{en ? 'Collection title' : '合集标题'} <span className="text-cyber-red">*</span>
             <input className="input-cyber mt-1 w-full" maxLength={100} value={title} onChange={event => setTitle(event.target.value)} placeholder={en ? 'Example: a lightweight co-op collection for beginners' : '例如：REPO 新手联机轻量合集'} />
           </label>
@@ -184,7 +232,7 @@ export default function ShareExportDialog({ api, mods, toast, onClose, gameName 
               <p className="text-surface-500">{en ? 'Every selected item has an aligned original source page. The receiving computer will still verify dependencies, versions, conflicts and local installation state on import.' : '所有已选项都有已对齐的原始发布页；接收者仍会在导入时重新核验依赖、版本、冲突与本机已安装状态。'}</p>
             )}
           </div>
-        </div>
+        </fieldset>
         )}
 
         <div className="mt-4 flex justify-end gap-2 border-t border-surface-600 pt-4">

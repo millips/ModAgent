@@ -6,7 +6,7 @@ This agreement applies to the separately distributed ModAgent P executable and P
 
 ## License grant
 
-Subject to a valid trial or redemption-code entitlement, the project owner grants the authorized user a limited, non-exclusive, non-transferable license to install and use ModAgent P for personal use on devices they control. The v1.3.0 opening offer provides a three-day trial and a separately issued 60-day signed redemption code; it is not an automatic renewal promise.
+Subject to a valid trial or redemption-code entitlement, the project owner grants the authorized user a limited, non-exclusive, non-transferable license to install and use ModAgent P for personal use on devices they control. The v1.5.1 opening offer provides a three-day trial and a separately issued 60-day signed redemption code; it is not an automatic renewal promise.
 
 ## Restrictions
 
@@ -24,7 +24,7 @@ ModAgent does not grant rights to third-party mods, game files, websites or user
 
 ## Open-source and third-party components
 
-This agreement does not restrict rights independently granted under GPL-3.0-only for the open-source edition. P membership expiration only disables P themes, sounds, visual feedback and identity presentation; core Mod management and user data remain available. Third-party components remain governed by their own licenses and notices.
+This agreement does not restrict rights independently granted under GPL-3.0-only for the open-source edition. P membership expiration only disables P-only presentation features, P Share submission and future P download access; core Mod management and user data remain available. Third-party components remain governed by their own licenses and notices.
 
 ## Service changes
 

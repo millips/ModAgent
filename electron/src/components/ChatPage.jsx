@@ -4,13 +4,24 @@ import ChatMarkdown from './ChatMarkdown'
 import DebugPanel from './DebugPanel'
 import { getManualActionQuickReply } from './chatQuickReplies.mjs'
 import { hasSameRecommendation } from './recommendationRecovery.mjs'
-import { apiErrorMessage, canCompleteSelection, canPresentConfirmation, receiptProgress } from './taskOutcome.mjs'
+import { apiErrorMessage, canCompleteSelection, canPresentConfirmation, receiptProgress, cancellationFeedback } from './taskOutcome.mjs'
 import { isTerminalTaskEvent, upsertTaskResult, taskPresentation, precedingAnswer, updateTaskProgress, upsertProgressMessage, pendingPlanCard, taskActionLabel } from './taskPresentation.mjs'
 import { emitFeedback, emitToolFeedback, emitToolStartFeedback } from '../feedback/feedbackBus'
 import { ChatEditionMessage } from '@edition'
 import CommunityImportDialog from './CommunityImportDialog'
+import {sharePlanPrompt} from './sharePlan.mjs'
+import {monitorInventory} from './inventoryMonitor.mjs'
+import {saveModDirectory} from './importDirectory.mjs'
 import { tr } from '../i18n'
 import { scanInventory } from './scanInventory.mjs'
+import { inventoryFeedback } from './inventoryFeedback.mjs'
+import { gameImportFeedback } from './gameImportFeedback.mjs'
+import { createChatWatchdog, chatTimeoutMessage } from './chatTransport.mjs'
+import { LocalApiError, requestLocalJson, localApiFailure } from './localApi.mjs'
+import CredentialGuide from './CredentialGuide'
+import {credentialPromptForTool} from './credentialPrompt.mjs'
+import BrowserControls from './BrowserControls'
+import {revealBrowserForVerification} from './browserVerification.mjs'
 
 // 有副作用的工具(装/卸/下/改文件/动快照)。重新生成时把已完成项传给后端；
 // 后端强制只读生成，副作用不重放、也不撤销。
@@ -471,13 +482,52 @@ function TaskResultCard({ event, language, disabled, onResume, presentation, onS
   )
 }
 
-export default function ChatPage({ status, games, onGameChange, onGameImport, onGamesRefresh, toast, api, onRefresh, language = 'zh-CN' }) {
+export default function ChatPage({ status, games, onGameChange, onGameImport, recoveredGameImport, onGamesRefresh, toast, api, onRefresh, language = 'zh-CN' }) {
   const t = key => tr(language, key)
   const [messages, setMessages] = useState([])
+  const [credentialPrompt, setCredentialPrompt] = useState(null)
+  const credentialPromptsSeen = useRef(new Set())
+  const offerCredentialHelp = event => {
+    const provider=credentialPromptForTool(event,status)
+    if(provider&&!credentialPromptsSeen.current.has(provider)) {
+      credentialPromptsSeen.current.add(provider)
+      setCredentialPrompt(provider)
+    }
+  }
   const [input, setInput] = useState(() => sessionStorage.getItem('chat_draft') || '')
   const [loading, setLoading] = useState(false)
+  const [preparing, setPreparing] = useState(false)
+  const [inventoryScanning, setInventoryScanning] = useState(false)
+  const inventoryScanningRef = useRef(false)
+  const preparingRef = useRef(false)
+  const sessionMutationsRef = useRef(new Set())
+  const sessionLoadEpochRef = useRef(0)
+  const sessionListEpochRef = useRef(0)
+  const preparationEpochRef = useRef(0)
+  const gameScope = status.game_instance_id || status.game_slug || ''
+  const gameScopeRef = useRef(gameScope)
+  gameScopeRef.current = gameScope
+  const inventoryMonitors = useRef(new Map())
+  useEffect(() => () => {
+    for (const controller of inventoryMonitors.current.values()) controller.abort()
+    inventoryMonitors.current.clear()
+  }, [])
   const [sessions, setSessions] = useState([])
   const [activeSession, setActiveSession] = useState(null)
+  const credentialSessionRef=useRef(null)
+  useEffect(()=>{
+    // Creating the first session and receiving its first result can occur in
+    // the same render. Do not erase that result's onboarding prompt afterward.
+    if(credentialSessionRef.current!==null && credentialSessionRef.current!==activeSession){
+      setCredentialPrompt(null)
+      credentialPromptsSeen.current.clear()
+    }
+    credentialSessionRef.current=activeSession
+  },[activeSession])
+  useEffect(()=>{
+    setCredentialPrompt(null)
+    credentialPromptsSeen.current.clear()
+  },[status.game_instance_id,status.game_root,status.game_slug])
   const [sidebarOpen, setSidebarOpen] = useState(
     () => !window.matchMedia('(max-width: 1100px)').matches
   )
@@ -493,6 +543,11 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   const [gameOpen, setGameOpen] = useState(false)
   const [gameImportOpen, setGameImportOpen] = useState(false)
   const [gameImportBusy, setGameImportBusy] = useState(false)
+  const gameImportLock = useRef(false)
+  const gamePickerLock = useRef(false)
+  const [gamePickerBusy, setGamePickerBusy] = useState(false)
+  const modDirectoryLock = useRef(false)
+  const [modDirectoryBusy, setModDirectoryBusy] = useState(false)
   const [gameScanBusy, setGameScanBusy] = useState(false)
   const [gameImportForm, setGameImportForm] = useState({
     game_name: '',
@@ -515,6 +570,20 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   // old task can never overwrite a newer conversation.
   const streamEpochRef = useRef(0)
 
+  const detachTaskView = () => {
+    const attached = Boolean(abortRef.current || recoveryTimerRef.current)
+    streamEpochRef.current++
+    abortRef.current?.abort()
+    abortRef.current = null
+    if (recoveryTimerRef.current) clearInterval(recoveryTimerRef.current)
+    recoveryTimerRef.current = null
+    setLoading(false)
+    setTaskProgress(null)
+    if (attached) toast(language === 'en'
+      ? '[TASK_VIEW_DETACHED] View changed; the previous task may still run in the background. Check its original conversation before retrying.'
+      : '[TASK_VIEW_DETACHED] 已切换视图，旧任务可能仍在后台运行。请返回原会话核对状态后再重试。', 'warn')
+  }
+
   useEffect(() => {
     const query = window.matchMedia('(max-width: 1100px)')
     const handleCompactChange = event => {
@@ -528,23 +597,15 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
 
   useEffect(() => {
     const handleSharePlanRequest = event => {
-      const share = String(event.detail?.share || '').trim()
-      const officialCode = String(event.detail?.shareId || '').trim()
-      if (officialCode) {
-        setInput(
-          `请读取并核验官方 ModAgent 合集 ${officialCode}，先输出明确的安装计划、已安装项、缺失依赖和风险；不要直接安装。`
-        )
-        toast('官方合集已带入聊天，请确认后发送以生成安装计划。')
-      } else if (share) {
-        setInput(
-          '请导入并核验以下 ModAgent 分享配置，先输出明确的安装计划、已安装项、缺失依赖和风险；不要直接安装：\n' + share
-        )
-        toast('分享配置已带入聊天，请确认后发送以生成安装计划。')
-      }
+      const prompt = sharePlanPrompt(event.detail, language)
+      if (!prompt) return
+      setInput(prompt)
+      sessionStorage.setItem('chat_draft', prompt)
+      toast(language === 'en' ? 'Share added to the draft. Review it before sending; nothing has been installed.' : '分享已带入草稿，请核对后再发送，尚未执行安装。')
     }
     window.addEventListener('modagent:share-plan', handleSharePlanRequest)
     return () => window.removeEventListener('modagent:share-plan', handleSharePlanRequest)
-  }, [toast])
+  }, [toast, language])
 
   const mkId = () => `m${Date.now()}_${++idRef.current}`
 
@@ -637,18 +698,28 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     return () => { cancelled = true; clearInterval(timer) }
   }, [api, loading])
 
-  useEffect(() => { loadSessions(); setActiveSession(null); setMessages([]) }, [status.game_slug, status.game_instance_id])
+  useEffect(() => {
+    sessionLoadEpochRef.current++
+    preparationEpochRef.current++
+    preparingRef.current = false
+    setPreparing(false)
+    detachTaskView()
+    activeSessionRef.current = null
+    setSessions([])
+    setSkeleton(false)
+    loadSessions(); setActiveSession(null); setMessages([])
+  }, [status.game_slug, status.game_instance_id])
 
   const loadSessions = async () => {
+    const epoch = ++sessionListEpochRef.current
+    const scope = gameScope
+    const current = () => epoch === sessionListEpochRef.current && scope === gameScopeRef.current
     try {
-      const scope = status.game_instance_id || status.game_slug || ''
       const url = scope ? `${api}/sessions?game_slug=${encodeURIComponent(scope)}` : `${api}/sessions`
-      const r = await fetch(url)
-      if (!r.ok) throw new Error(`sessions request failed: ${r.status}`)
-      const data = await r.json()
+      const data = await requestLocalJson(url)
       if (!Array.isArray(data)) throw new Error('sessions response is not an array')
-      setSessions(data)
-    } catch (_) { toast('加载会话失败', 'error') }
+      if (current()) setSessions(data)
+    } catch (_) { if (current()) toast(language === 'en' ? 'Could not load conversations.' : '加载会话失败', 'error') }
   }
 
   // 把前端展示用的 messages 投影成后端可用的干净历史（仅 user/assistant）
@@ -660,11 +731,11 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   // 截断时把后端会话历史覆盖为指定快照
   const syncHistory = async (sid, msgs) => {
     try {
-      const response = await fetch(`${api}/sessions/${sid}/messages`, {
+      const response = await requestLocalJson(`${api}/sessions/${sid}/messages`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: buildHistory(msgs) }),
       })
-      if (!response.ok) throw new Error(`history sync failed: ${response.status}`)
+      if (response?.ok !== true) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
       return true
     } catch (_) {
       return false
@@ -682,10 +753,19 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   }
 
   const selectSession = async (s) => {
+    if (preparingRef.current) return
+    const epoch = ++sessionLoadEpochRef.current
+    const current = () => epoch === sessionLoadEpochRef.current
     setSkeleton(true)
     try {
-      const r = await fetch(api + '/sessions/' + s.id)
-      const d = await r.json()
+      const d = await requestLocalJson(api + '/sessions/' + encodeURIComponent(s.id))
+      if (!current()) return
+      if (d?.id !== s.id || !Array.isArray(d.messages)
+        || d.messages.some(m => !m || !['user','assistant'].includes(m.role) || typeof m.content !== 'string')) {
+        throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      }
+      detachTaskView()
+      activeSessionRef.current = d.id
       setActiveSession(d.id)
       // 归一化：后端存的是 assistant，前端用 agent；补上稳定 id
       const norm = (d.messages || []).map(m => ({
@@ -703,8 +783,9 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       if (window.matchMedia?.('(max-width: 1280px)').matches) {
         setSidebarOpen(false)
       }
-    } catch (_) { toast('加载会话失败', 'error') }
-    setSkeleton(false)
+    } catch (error) {
+      if (current()) toast('[SESSION_LOAD_FAILED] ' + localApiFailure(error, language), 'error')
+    } finally { if (current()) setSkeleton(false) }
   }
 
   const applyRecoveredEvents = (events, taskStartedAt) => {
@@ -748,6 +829,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       if (data.tool_result) {
         recoveryAgentRef.current = { id: null, text: '' }
         const tr = data.tool_result
+        offerCredentialHelp(tr)
+        revealBrowserForVerification(tr,`recovery:${activeSessionRef.current}:${tr.name}:${tr.status}`)
         if (tr.ok && REFRESH_AFTER_SUCCESS_TOOLS.has(tr.name)) {
           onRefresh?.()
         }
@@ -813,14 +896,16 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       let taskFinished = false
       try {
         const scope = status.game_instance_id || status.game_slug || ''
-        const response = await fetch(`${api}/chat/tasks/active?game_slug=${encodeURIComponent(scope)}`)
-        const active = await response.json()
+        const active = await requestLocalJson(`${api}/chat/tasks/active?game_slug=${encodeURIComponent(scope)}`)
         if (cancelled || !active?.active || !active.session_id) return
         await selectSession({ id: active.session_id })
-        if (cancelled) return
+        if (cancelled || activeSessionRef.current !== active.session_id) return
+        const epoch = streamEpochRef.current
+        const controller = new AbortController()
+        abortRef.current = controller
+        const current = () => !cancelled && streamEpochRef.current === epoch && activeSessionRef.current === active.session_id
         const startedAt = Number(active.started || 0) * 1000 || Date.now()
         setLoading(true)
-        setProgressClock(Date.now())
         setTaskProgress({
           label: '已重新连接，正在恢复任务进度', mode: 'indeterminate', pct: 0,
           startedAt, stageStartedAt: Date.now(), etaSeconds: null, expectedSeconds: 12,
@@ -828,12 +913,18 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
         recoveryCursorRef.current = 0
         recoveryAgentRef.current = { id: null, text: '' }
 
+        let polling = false
         const poll = async () => {
+          if (polling || !current()) return
+          polling = true
           try {
-            const result = await fetch(
-              `${api}/chat/tasks/${encodeURIComponent(active.session_id)}?after=${recoveryCursorRef.current}`
-            ).then(value => value.json())
-            if (cancelled) return
+            const result = await requestLocalJson(
+              `${api}/chat/tasks/${encodeURIComponent(active.session_id)}?after=${recoveryCursorRef.current}`, {signal:controller.signal},
+            )
+            if (!current()) return
+            if (!Array.isArray(result?.events) || typeof result.done !== 'boolean' || !Number.isInteger(result.cursor) || result.cursor < 0) {
+              throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+            }
             applyRecoveredEvents(result.events, startedAt)
             recoveryCursorRef.current = Number(result.cursor) || recoveryCursorRef.current
             if (result.done) {
@@ -842,13 +933,25 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
               recoveryTimerRef.current = null
               setLoading(false)
               setTaskProgress(null)
+              abortRef.current = null
               await selectSession({ id: active.session_id })
               loadSessions()
             }
-          } catch (_) {}
+          } catch (error) {
+            if (current()) {
+              taskFinished = true
+              clearInterval(recoveryTimerRef.current)
+              recoveryTimerRef.current = null
+              abortRef.current = null
+              setLoading(false)
+              setTaskProgress(null)
+              toast('[TASK_RECOVERY_FAILED] ' + localApiFailure(error, language)
+                + (language === 'en' ? ' Background state is unconfirmed; check the original task before retrying.' : ' 后台状态尚未确认，请核对原任务后再重试。'), 'error')
+            }
+          } finally { polling = false }
         }
         await poll()
-        if (!cancelled && !taskFinished && recoveryTimerRef.current == null) {
+        if (current() && !taskFinished && recoveryTimerRef.current == null) {
           recoveryTimerRef.current = setInterval(poll, 650)
         }
       } catch (_) {}
@@ -862,33 +965,57 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
   }, [api, status.game_slug, status.game_instance_id])
 
   const newSession = async () => {
+    if (preparingRef.current) return
+    sessionLoadEpochRef.current++
+    setSkeleton(false)
+    preparingRef.current = true
+    setPreparing(true)
+    const token = ++preparationEpochRef.current
+    const scope = gameScope
+    const current = () => token === preparationEpochRef.current && scope === gameScopeRef.current
     try {
-      const r = await fetch(api + '/sessions', {
+      const d = await requestLocalJson(api + '/sessions', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: '新对话' }),
+        body: JSON.stringify({ title: '新对话', game_slug: scope }),
       })
-      const d = await r.json()
+      if (!current()) return
+      if (typeof d?.id !== 'string' || !d.id.trim()) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      detachTaskView()
+      activeSessionRef.current = d.id
       setActiveSession(d.id)
       setMessages([])
       loadSessions()
-    } catch (_) { toast('创建会话失败', 'error') }
+    } catch (error) { if (current()) toast('[SESSION_CREATE_FAILED] ' + localApiFailure(error, language), 'error') }
+    finally { if (current()) { preparingRef.current = false; setPreparing(false) } }
   }
 
   const delSession = async (sid, e) => {
     e.stopPropagation()
-    await fetch(api + '/sessions/' + sid, { method: 'DELETE' })
-    if (activeSession === sid) { setActiveSession(null); setMessages([]) }
-    loadSessions()
-    toast('会话已删除')
+    if (preparingRef.current || sessionMutationsRef.current.has(sid)) return
+    sessionMutationsRef.current.add(sid)
+    try {
+      const result = await requestLocalJson(api + '/sessions/' + sid, { method: 'DELETE' })
+      if (result?.ok !== true) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      if (activeSessionRef.current === sid) { detachTaskView(); activeSessionRef.current = null; setActiveSession(null); setMessages([]) }
+      loadSessions()
+      toast(language === 'en' ? 'Conversation deleted.' : '会话已删除')
+    } catch (error) { toast('[SESSION_DELETE_FAILED] ' + localApiFailure(error, language), 'error') }
+    finally { sessionMutationsRef.current.delete(sid) }
   }
 
   const renameSession = async (sid) => {
-    await fetch(api + '/sessions/' + sid, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: editTitle }),
-    })
-    setEditingId(null)
-    loadSessions()
+    if (preparingRef.current || sessionMutationsRef.current.has(sid)) return
+    sessionMutationsRef.current.add(sid)
+    try {
+      const result = await requestLocalJson(api + '/sessions/' + sid, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: editTitle }),
+      })
+      if (result?.ok !== true) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      setEditingId(null)
+      loadSessions()
+    } catch (error) { toast('[SESSION_RENAME_FAILED] ' + localApiFailure(error, language), 'error') }
+    finally { sessionMutationsRef.current.delete(sid) }
   }
 
   const copyText = async (text) => {
@@ -954,20 +1081,17 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       setTaskProgress(null)
       emitFeedback('cancel', { source: 'chat-stop' })
       try {
-        const response = await fetch(`${api}/tasks/cancel`, {
+        const result = await requestLocalJson(`${api}/tasks/cancel`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_id: activeSessionRef.current || '' }),
         })
-        const result = await response.json()
-        toast(
-          result?.ok
-            ? '已停止；旧任务不会继续执行'
-            : '界面已停止，但后端未找到匹配任务',
-          result?.ok ? 'success' : 'warn',
-        )
-      } catch (_) {
-        toast('界面已停止；后台取消请求发送失败', 'error')
+        const feedback = cancellationFeedback(result, language)
+        toast(feedback.message, feedback.level)
+      } catch (error) {
+        toast('[TASK_CANCEL_FAILED] ' + (language === 'en'
+          ? 'Display stopped; background cancellation is unconfirmed. '
+          : '界面已停止，尚未确认后台取消。') + localApiFailure(error, language), 'error')
       }
     }
   }
@@ -1087,33 +1211,52 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
 
   const sendMsg = async (overrideText, baseMessages, options = {}) => {
     const text = (overrideText !== undefined && overrideText !== null) ? overrideText : input.trim()
-    if (!text || loading) return
-    if (overrideText === undefined || overrideText === null) { setInput(''); sessionStorage.removeItem('chat_draft') }
+    if (!text || loading || skeleton || preparingRef.current) return
+    preparingRef.current = true
+    setPreparing(true)
 
     let sid = activeSession
-    if (!sid) {
-      const r = await fetch(api + '/sessions', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: text.slice(0, 20) }),
-      })
-      const d = await r.json()
-      sid = d.id
-      // A local/cached response can arrive before React's effect updates the
-      // ref. Establish ownership now, or the first reply is discarded as old.
-      activeSessionRef.current = d.id
-      setActiveSession(d.id)
-      loadSessions()
-    }
+    const preparationToken = ++preparationEpochRef.current
+    const preparationScope = gameScope
+    const ownsPreparation = () => preparationToken === preparationEpochRef.current && preparationScope === gameScopeRef.current
+    try {
+      if (!sid) {
+        const d = await requestLocalJson(api + '/sessions', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: text.slice(0, 20), game_slug: preparationScope }),
+        })
+        if (!ownsPreparation()) return
+        if (typeof d?.id !== 'string' || !d.id.trim()) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+        sid = d.id
+        // Establish ownership before React's active-session effect runs.
+        activeSessionRef.current = d.id
+        setActiveSession(d.id)
+        loadSessions()
+      }
 
     // 若是编辑/重新生成带来的截断，先把后端历史同步成截断后的快照
-    if (baseMessages) {
-      const synced = await syncHistory(sid, baseMessages)
-      if (!synced) {
-        emitFeedback('error', { source: 'chat-history-sync' })
-        toast('无法截断旧回复，重新生成已取消', 'error')
-        return
+      if (baseMessages) {
+        const synced = await syncHistory(sid, baseMessages)
+        if (!ownsPreparation()) return
+        if (!synced) {
+          emitFeedback('error', { source: 'chat-history-sync' })
+          toast(language === 'en' ? 'Could not synchronize history; regeneration was not started.' : '无法截断旧回复，重新生成未开始', 'error')
+          return
+        }
       }
+    } catch (error) {
+      if (!ownsPreparation()) return
+      toast('[SESSION_PREPARE_FAILED] ' + localApiFailure(error, language)
+        + (language === 'en' ? ' Your message was not sent; the draft is retained.' : ' 消息尚未发送，原文已保留。'), 'error')
+      if (options.editionCompletion) {
+        const completion = options.editionCompletion
+        setMessages(prev => prev.map(item => item.id === completion.messageId ? {...item, payload:completion.failed} : item))
+      }
+      return
+    } finally {
+      if (ownsPreparation()) { preparingRef.current = false; setPreparing(false) }
     }
+    if (overrideText === undefined || overrideText === null) { setInput(''); sessionStorage.removeItem('chat_draft') }
 
     const userMsg = { id: mkId(), role: 'user', content: text }
     setMessages(prev => [...(baseMessages || prev), userMsg])
@@ -1148,6 +1291,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     let planTaskId = null
     let planRevisionId = null
     let progressMessageId = null
+    const watchdog = createChatWatchdog(controller)
 
     try {
       const r = await fetch(api + '/chat/stream', {
@@ -1179,6 +1323,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       let sawDoneEvent = false
       while (!sawDoneEvent) {
         const { done, value } = await reader.read()
+        watchdog.touch()
         // An older SSE response may race a newly started turn even after its
         // AbortController was signalled.  Do not render progress, tools, or
         // final text from a run that is no longer the active conversation.
@@ -1238,6 +1383,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             if (data.tool_result) {
               curAgentId = null
               const tr = data.tool_result
+              if(isActiveRun())offerCredentialHelp(tr)
+              if(isActiveRun())revealBrowserForVerification(tr,`${sendSid}:${taskStartedAt}:${tr.name}:${tr.status}`)
               if (tr.execution_complete === true) executionVerified = true
               const terminalSelectionStatuses = new Set([
                 'manual_action_required',
@@ -1413,7 +1560,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       if (!sawDoneEvent) throw new Error(language === 'en' ? 'The response ended without a completion receipt.' : '响应中断，未收到结束确认；不能据此显示计划就绪。')
       loadSessions()
     } catch (e) {
-      if (e.name === 'AbortError') {
+      if (e.name === 'AbortError' && !watchdog.timedOut) {
         if (options.editionCompletion) {
           const completion = options.editionCompletion
           guardedSet(prev => prev.map(item => item.id === completion.messageId
@@ -1432,7 +1579,11 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       // the new conversation or alter that turn's completion state.
       if (!isActiveRun()) return
       streamFailed = true
-      guardedSet(prev => [...prev, { id: mkId(), role: 'error', content: '连接失败: ' + e.message }])
+      guardedSet(prev => [...prev, { id: mkId(), role: 'error', content: watchdog.timedOut
+        ? chatTimeoutMessage(language)
+        : (language === 'en' ? 'Connection failed: ' : '连接失败: ') + e.message }])
+    } finally {
+      watchdog.dispose()
     }
 
     if (options.confirmationPayload && canPresentConfirmation({ streamCompleted, streamFailed, executionFailed, planBlocked })) {
@@ -1740,43 +1891,69 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
     }))
   }
 
-  const monitorInventoryScan = async (gameInstanceId, label) => {
-    if (!gameInstanceId) return
-    for (let attempt = 0; attempt < 180; attempt += 1) {
-      await new Promise(resolve => window.setTimeout(resolve, 1000))
-      try {
-        const response = await fetch(
-          `${api}/mods/scan-status?game_instance_id=${encodeURIComponent(gameInstanceId)}`
-        )
-        if (!response.ok) continue
-        const state = await response.json()
-        if (state.status === 'completed') {
-          const imported = Number(state.imported || 0)
-          const detected = Number(state.detected || 0)
-          toast(
-            imported > 0
-              ? `${label}扫描完成：已导入 ${imported} 个 Mod`
-              : `${label}扫描完成：发现 ${detected} 项，清单无需新增`
-          )
-          onRefresh?.()
-          return
-        }
-        if (state.status === 'failed') {
-          toast(state.error || `${label}扫描失败`, 'error')
-          return
-        }
-      } catch (_) {
-        // The backend may be restarting; the next poll can still recover.
-      }
+  const pickGame = async (executable = false) => {
+    if (gameImportLock.current || gamePickerLock.current) return
+    gamePickerLock.current = true
+    setGamePickerBusy(true)
+    let timer
+    try {
+      const picker = executable ? window.modagent?.selectGameExecutable : window.modagent?.selectGameDirectory
+      if (typeof picker !== 'function') throw new Error('picker unavailable')
+      const selected = await Promise.race([
+        picker(),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('picker timeout')), 60000) }),
+      ])
+      if (selected == null) return // Native dialog cancellation is not a failure.
+      if (typeof selected.path !== 'string' || !selected.path.trim()
+        || (selected.executable !== undefined && typeof selected.executable !== 'string')
+        || (selected.suggestedName !== undefined && typeof selected.suggestedName !== 'string')) throw new Error('invalid picker result')
+      applyGameSelection(selected)
+    } catch {
+      toast(language === 'en'
+        ? '[GAME_PICKER_FAILED] Game selection did not finish. Close any open file dialog, then try again. Your form has been kept.'
+        : '[GAME_PICKER_FAILED] 游戏路径选择未完成。请关闭尚未结束的文件选择窗口后重试；已填写内容保留。', 'warn')
+    } finally {
+      clearTimeout(timer)
+      gamePickerLock.current = false
+      setGamePickerBusy(false)
     }
-    toast(`${label}目录较大，仍在后台扫描；你可以继续使用其他功能`)
   }
 
+  const monitorInventoryScan = async (gameInstanceId, label) => {
+    if (!gameInstanceId) return
+    inventoryMonitors.current.get(gameInstanceId)?.abort()
+    const controller = new AbortController()
+    inventoryMonitors.current.set(gameInstanceId, controller)
+    try {
+      const state = await monitorInventory(api, gameInstanceId, {signal:controller.signal,
+        isCurrent:()=>gameScopeRef.current === gameInstanceId})
+      if (state.status === 'detached') return
+      const feedback = inventoryFeedback(state, language)
+      toast(feedback.message, feedback.kind)
+      if (state.status === 'completed') {
+        onRefresh?.()
+      }
+    } finally {
+      if (inventoryMonitors.current.get(gameInstanceId) === controller) inventoryMonitors.current.delete(gameInstanceId)
+    }
+  }
+
+  useEffect(() => {
+    if (!recoveredGameImport?.game_instance_id) return
+    setGameImportOpen(false)
+    setGameImportForm({ game_name: '', game_root: '', executable: '', game_slug: '' })
+    // The App verified an acknowledged import using a read-only status call.
+    // Resume observation, never repeat the write or assume the scan succeeded.
+    void monitorInventoryScan(recoveredGameImport.game_instance_id, '游戏 Mod')
+  }, [recoveredGameImport])
+
   const submitGameImport = async () => {
+    if (gameImportLock.current || gamePickerLock.current) return
     if (!gameImportForm.game_name.trim() || !gameImportForm.game_root.trim()) {
-      toast('请填写游戏名称并选择游戏目录或主程序', 'error')
+      toast(language === 'en' ? 'Enter the game name and select its folder or main executable.' : '请填写游戏名称并选择游戏目录或主程序', 'error')
       return
     }
+    gameImportLock.current = true
     setGameImportBusy(true)
     try {
       const result = await onGameImport({
@@ -1787,48 +1964,49 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       })
       setGameImportOpen(false)
       setGameImportForm({ game_name: '', game_root: '', executable: '', game_slug: '' })
-      const scan = result.mod_scan || {}
-      const scanCount = Number(scan.identified_count ?? scan.imported ?? (scan.identified || []).length)
-      if (scan.queued) {
-        toast(`已导入 ${result.game?.name || gameImportForm.game_name}；正在后台扫描 Mod`)
+      const feedback = gameImportFeedback(result, language)
+      toast(feedback.message, feedback.kind)
+      if (feedback.monitor) {
         void monitorInventoryScan(result.game?.game_instance_id, '游戏 Mod')
-      } else if (scan.error) {
-        toast(scan.error, 'error')
-      } else {
-        toast(`已导入并扫描 ${result.game?.name || gameImportForm.game_name}：发现 ${scanCount} 个已有 Mod`)
       }
     } catch (error) {
       toast(error.message || '游戏导入失败', 'error')
     } finally {
       setGameImportBusy(false)
+      gameImportLock.current = false
     }
   }
 
   const importModDirectory = async () => {
-    const selected = await window.modagent?.selectModDirectory?.()
-    if (!selected?.path) return
-    emitFeedback('scan-start', { source: 'manual-mod-directory' })
+    if (modDirectoryLock.current || !status.online || !gameScope) return
+    modDirectoryLock.current = true
+    setModDirectoryBusy(true)
+    const scope = gameScope
     try {
-      const response = await fetch(api + '/mods/import-directory', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: selected.path }),
-      })
-      const result = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(result.detail || result.error || 'Mod 目录导入失败')
-      const imported = Number(result.imported || 0)
-      const detected = Number(result.detected || 0)
+      const selected = await window.modagent?.selectModDirectory?.()
+      if (!selected?.path) return
+      if (scope !== gameScopeRef.current) {
+        toast(language === 'en' ? '[GAME_SCOPE_CHANGED] Game changed. Select the directory again for the current game.' : '[GAME_SCOPE_CHANGED] 当前游戏已变化，请为当前游戏重新选择目录。', 'warn')
+        return
+      }
+      const result = await saveModDirectory(api, selected.path, scope)
+      if (scope !== gameScopeRef.current) return
       if (result.queued) {
-        toast('Mod 目录已保存；正在后台扫描，大型目录不会阻塞界面')
-        void monitorInventoryScan(status.game_instance_id || status.game_slug, '外部 Mod')
-      } else if (imported > 0) toast(`已保存目录并导入 ${imported} 个 Mod`)
-      else if (detected > 0) toast(`目录已保存；发现 ${detected} 项，均已在清单中`)
-      else toast('目录已保存，但未发现受支持的 Mod 文件', 'error')
-      emitFeedback('scan-complete', { count: imported })
+        toast(language === 'en' ? 'Mod directory saved. Scanning in the background; you can keep using the app.'
+          : 'Mod 目录已保存；正在后台扫描，你可以继续使用界面。')
+        void monitorInventoryScan(scope, '外部 Mod')
+      } else {
+        const feedback = inventoryFeedback(result, language)
+        toast((language === 'en' ? 'Mod directory saved. ' : 'Mod 目录已保存。') + feedback.message, feedback.kind)
+        emitFeedback(result.missing_roots?.length ? 'scan-partial' : 'scan-complete', {count: result.imported})
+      }
       onRefresh?.()
     } catch (error) {
       emitFeedback('error', { source: 'manual-mod-directory' })
-      toast(error.message || 'Mod 目录导入失败', 'error')
+      if (scope === gameScopeRef.current) toast('[MOD_DIRECTORY_UNCONFIRMED] ' + localApiFailure(error, language), 'error')
+    } finally {
+      modDirectoryLock.current = false
+      setModDirectoryBusy(false)
     }
   }
 
@@ -1839,7 +2017,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
       {sidebarOpen && (
         <div className="chat-session-rail w-56 min-w-[224px] h-full min-h-0 overflow-hidden bg-surface-800 border-r border-surface-600 flex flex-col">
           <div className="chat-session-header shrink-0 flex items-center gap-2 p-3 border-b border-surface-600">
-            <button onClick={newSession} className="btn-cyber min-w-0 flex-1 flex items-center justify-center gap-2">
+            <button onClick={newSession} disabled={preparing} className="btn-cyber min-w-0 flex-1 flex items-center justify-center gap-2">
               <Plus size={14} /> {t('newChat')}
             </button>
             <button
@@ -1861,7 +2039,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
                 <div key={group}>
                   <div className="text-[10px] font-semibold text-surface-500 uppercase px-2 mb-1">{label}</div>
                   {items.map(s => (
-                    <div key={s.id}
+                    <div key={s.id} data-session-id={s.id}
                       className={`group flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-xs transition-all
                         ${activeSession === s.id ? 'bg-cyber-blue/15 text-cyber-cyan' : 'text-surface-400 hover:bg-surface-700 hover:text-white'}`}
                       onClick={() => selectSession(s)}>
@@ -1875,8 +2053,8 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
                         <span className="flex-1 truncate">{s.title || t('newChat')}</span>
                       )}
                       <div className="hidden group-hover:flex items-center gap-0.5">
-                        <button onClick={e => { e.stopPropagation(); setEditingId(s.id); setEditTitle(s.title||'') }} className="p-0.5 rounded hover:bg-surface-600"><PenLine size={10} /></button>
-                        <button onClick={e => delSession(s.id, e)} className="p-0.5 rounded hover:bg-surface-600 text-cyber-red"><Trash2 size={10} /></button>
+                        <button aria-label={(language === 'en' ? 'Rename conversation: ' : '重命名会话：') + s.title} data-session-action="rename" onClick={e => { e.stopPropagation(); setEditingId(s.id); setEditTitle(s.title||'') }} className="p-0.5 rounded hover:bg-surface-600"><PenLine size={10} /></button>
+                        <button aria-label={(language === 'en' ? 'Delete conversation: ' : '删除会话：') + s.title} data-session-action="delete" onClick={e => delSession(s.id, e)} className="p-0.5 rounded hover:bg-surface-600 text-cyber-red"><Trash2 size={10} /></button>
                       </div>
                     </div>
                   ))}
@@ -1979,15 +2157,23 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             </div>
           )}
           {messages.map((msg, i) => renderMessage(msg, i))}
+          {preparing && <p role="status" className="text-xs text-slate-300">{language === 'en' ? 'Preparing conversation… Your draft is retained until ready.' : '正在准备会话…准备完成前保留输入原文。'}</p>}
           {loading && <ActiveTaskProgress task={taskProgress} language={language} />}
           <div ref={bottomRef} />
         </div>
 
+        {credentialPrompt && <CredentialGuide key={`${activeSession}:${credentialPrompt}`} provider={credentialPrompt} api={api} language={language} toast={toast} onClose={()=>setCredentialPrompt(null)} onSaved={()=>onRefresh?.()}/>}
+        <BrowserControls language={language} compact/>
+        <div className="flex justify-end gap-3 px-3 py-1 text-[11px] text-surface-400">
+          <span>{language==='en'?'Connect only when needed:':'按需配置：'}</span>
+          <button type="button" onClick={()=>setCredentialPrompt('nexus')}>Nexus API</button>
+          <button type="button" onClick={()=>setCredentialPrompt('tavily')}>{language==='en'?'Enhanced search (optional)':'增强搜索（可选）'}</button>
+        </div>
         <div className="chat-composer shrink-0 p-3 border-t border-surface-600 bg-surface-800 flex items-end gap-2">
           <button onClick={() => setSidebarOpen(!sidebarOpen)} className="btn-ghost p-2" title={sidebarOpen?'收起':'展开'}>
             {sidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeft size={16} />}
           </button>
-          <textarea value={input} onChange={e => { setInput(e.target.value); sessionStorage.setItem('chat_draft', e.target.value) }} onKeyDown={handleKey}
+          <textarea value={input} readOnly={preparing} onChange={e => { setInput(e.target.value); sessionStorage.setItem('chat_draft', e.target.value) }} onKeyDown={handleKey}
             placeholder={t('messagePlaceholder')} rows={1}
             className="flex-1 px-3 py-2 rounded-md text-sm bg-surface-900 border border-surface-600 text-white placeholder-surface-500 outline-none resize-none max-h-[120px] focus:border-cyber-cyan/50 transition-colors"
             onInput={e => { e.target.style.height='auto'; e.target.style.height=Math.min(e.target.scrollHeight,120)+'px' }} />
@@ -2001,7 +2187,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
                 className="tc-icon-button p-1.5 rounded hover:bg-surface-700 text-surface-500" title="开发者模式">
                 <Bug size={16} />
               </button>
-              <button onClick={() => sendMsg()} disabled={!input.trim() || !status.online}
+              <button onClick={() => sendMsg()} disabled={!input.trim() || !status.online || preparing || skeleton}
               className="tc-icon-button p-2.5 rounded-md bg-cyber-cyan/20 text-cyber-cyan border border-cyber-cyan/30 hover:bg-cyber-cyan/30 disabled:opacity-30 disabled:cursor-not-allowed transition-all">
               <Send size={16} />
             </button>
@@ -2053,15 +2239,15 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
             onClick={openGameImport}
             className="mt-2 w-full px-2 py-1.5 rounded text-xs border border-cyber-cyan/30 text-cyber-cyan hover:bg-cyber-cyan/10 flex items-center justify-center gap-1.5"
           >
-            <FolderPlus size={13} /> 手动导入游戏
+            <FolderPlus size={13} /> {language === 'en' ? 'Import game' : '手动导入游戏'}
           </button>
           <button
             onClick={importModDirectory}
-            disabled={!status.online || !(status.game_instance_id || status.game_slug)}
+            disabled={modDirectoryBusy || !status.online || !(status.game_instance_id || status.game_slug)}
             className="mt-2 w-full px-2 py-1.5 rounded text-xs border border-cyber-purple/30 text-cyber-purple hover:bg-cyber-purple/10 disabled:opacity-40 flex items-center justify-center gap-1.5"
-            title="选择 Vortex 暂存、MO2 mods、Fluffy 或其他外部 Mod 目录；保存后每次扫描都会自动包含"
+            title={language === 'en' ? 'Select a Vortex staging, MO2 mods, Fluffy or other external mod directory. Future scans will include this saved directory.' : '选择 Vortex 暂存、MO2 mods、Fluffy 或其他外部 Mod 目录；保存后每次扫描都会自动包含'}
           >
-            <FolderOpen size={13} /> 添加 Mod 目录
+            <FolderOpen size={13} /> {modDirectoryBusy ? (language === 'en' ? 'Saving directory…' : '正在保存目录…') : (language === 'en' ? 'Add Mod directory' : '添加 Mod 目录')}
           </button>
         </div>
         <div className="h-px bg-surface-600" />
@@ -2071,9 +2257,15 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait"
           onClick={() => sendMsg('请自动对齐当前游戏已安装 Mod 的维护来源，检查所有可用更新，并给出绑定成功、未绑定、版本未知和检查失败的可交互报告。')}
         ><RefreshCw size={14}/> 检查更新</button>
-        <button disabled={!status.online} className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait"
-          onClick={() => scanInventory({ api, toast, emitFeedback, onRefresh })}
-        ><Search size={14}/> 扫描已有 Mod</button>
+        <button disabled={!status.online || inventoryScanning} className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait"
+          onClick={async () => {
+            if (inventoryScanningRef.current) return
+            inventoryScanningRef.current = true
+            setInventoryScanning(true)
+            try { await scanInventory({ api, toast, emitFeedback, onRefresh, language }) }
+            finally { inventoryScanningRef.current = false; setInventoryScanning(false) }
+          }}
+        ><Search size={14}/> {inventoryScanning ? (language === 'en' ? 'Scanning…' : '正在扫描…') : (language === 'en' ? 'Scan existing Mods' : '扫描已有 Mod')}</button>
         <button disabled={!status.online} className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait" onClick={async () => {
           try {
             const r = await fetch(api + '/tool/snapshot_create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trigger_mod_name: '手动快照' }) })
@@ -2088,7 +2280,7 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           className="btn-cyber flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-wait"
           onClick={() => setCommunityImportOpen(true)}
           title="输入审核通过的 ma 合集码，或粘贴私人分享 JSON；会先核验而不会自动安装"
-        ><Download size={14}/> 导入社区合集</button>
+        ><Download size={14}/> {language === 'en' ? 'Import a community collection' : '导入社区合集'}</button>
       </div>
       <DebugPanel api={api} open={devOpen} onClose={() => setDevOpen(false)} />
 
@@ -2100,78 +2292,86 @@ export default function ChatPage({ status, games, onGameChange, onGameImport, on
           onClose={() => setCommunityImportOpen(false)}
           onPlan={request => {
             const prerequisiteOnly = request.action === 'prerequisite_plan'
-            const prompt = request.type === 'official'
+            const prompt = language === 'en'
+              ? `${request.type === 'official' ? `Read official ModAgent collection ${request.shareId}.` : 'Read the ModAgent share below.'} ${prerequisiteOnly
+                ? 'Only verify and plan unresolved base-environment or external prerequisites: check local presence and versions, explain missing components, sources and risks, and prepare a plan requiring confirmation. Do not install the main Mods or claim all dependencies are resolved.'
+                : 'Prepare a main-Mod installation plan requiring confirmation. Preserve the collection goal; do not search for or recommend extra Mods. List installed items, updates, conflicts, risks and planned file changes. Do not install directly.'}${request.type === 'official' ? '' : `\n${request.share}`}`
+              : request.type === 'official'
               ? prerequisiteOnly
                 ? `请读取官方 ModAgent 合集 ${request.shareId}，只检查并补齐其未确认的基础环境/外部前置：先核验本机是否存在、版本是否满足；缺失时说明用途、来源和补齐方案，生成可确认的前置安装计划。不得安装主体 Mod，不得给出无风险或依赖已闭环的结论。`
                 : `请读取官方 ModAgent 合集 ${request.shareId}，直接生成主体 Mod 的可确认安装计划：保留合集目标，不得搜索或推荐额外 Mod；清楚列出已安装项、更新项、冲突、风险和最终需要写入的项目；不要直接安装。`
               : prerequisiteOnly
                 ? `请导入以下 ModAgent 分享配置，只检查并补齐其未确认的基础环境/外部前置；不得安装主体 Mod：\n${request.share}`
                 : `请导入以下 ModAgent 分享配置，直接生成主体 Mod 的可确认安装计划；不要搜索或推荐额外 Mod，也不要直接安装：\n${request.share}`
-            toast(prerequisiteOnly ? '正在检查前置并生成补齐计划。' : '正在生成安装计划。')
+            toast(language === 'en'
+              ? (prerequisiteOnly ? 'Checking prerequisites and preparing a plan.' : 'Preparing an installation plan.')
+              : (prerequisiteOnly ? '正在检查前置并生成补齐计划。' : '正在生成安装计划。'))
             sendMsg(prompt)
           }}
         />
       )}
 
       {gameImportOpen && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[70]" onClick={() => !gameImportBusy && setGameImportOpen(false)}>
-          <div className="bg-surface-800 border border-cyber-cyan/30 rounded-lg p-5 w-[520px] max-w-[90vw] shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[70]" onClick={() => !gameImportBusy && !gamePickerBusy && setGameImportOpen(false)}>
+          <div role="dialog" aria-modal="true" aria-label={language === 'en' ? 'Import game' : '手动导入游戏'} className="bg-surface-800 border border-cyber-cyan/30 rounded-lg p-5 w-[520px] max-w-[90vw] shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
                 <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                  <FolderPlus size={15} className="text-cyber-cyan" /> 手动导入游戏
+                  <FolderPlus size={15} className="text-cyber-cyan" /> {language === 'en' ? 'Import game' : '手动导入游戏'}
                 </h3>
-                <p className="text-xs text-surface-500 mt-1">适用于 EA、WeGame、自定义安装目录和没有启动器的游戏。</p>
+                <p className="text-xs text-surface-500 mt-1">{language === 'en' ? 'For EA, WeGame, custom installation folders, and games without a launcher.' : '适用于 EA、WeGame、自定义安装目录和没有启动器的游戏。'}</p>
               </div>
-              <button disabled={gameImportBusy} onClick={() => setGameImportOpen(false)} className="text-surface-500 hover:text-white"><X size={16} /></button>
+              <button disabled={gameImportBusy || gamePickerBusy} onClick={() => setGameImportOpen(false)} className="text-surface-500 hover:text-white"><X size={16} /></button>
             </div>
 
-            <label className="text-xs text-surface-400 block mb-1">游戏名称</label>
+            <label className="text-xs text-surface-400 block mb-1">{language === 'en' ? 'Game name' : '游戏名称'}</label>
             <input
               className="input-cyber w-full mb-3"
-              value={gameImportForm.game_name}
+              disabled={gameImportBusy || gamePickerBusy} value={gameImportForm.game_name}
               onChange={event => setGameImportForm(prev => ({ ...prev, game_name: event.target.value }))}
-              placeholder="例如：Need for Speed Unbound"
+              placeholder={language === 'en' ? 'For example: Need for Speed Unbound' : '例如：Need for Speed Unbound'}
             />
 
-            <label className="text-xs text-surface-400 block mb-1">游戏目录</label>
+            <label className="text-xs text-surface-400 block mb-1">{language === 'en' ? 'Game folder' : '游戏目录'}</label>
             <div className="flex gap-2 mb-2">
-              <input className="input-cyber flex-1 min-w-0" readOnly value={gameImportForm.game_root} placeholder="尚未选择" />
+              <input className="input-cyber flex-1 min-w-0" readOnly disabled={gameImportBusy || gamePickerBusy} value={gameImportForm.game_root} placeholder={language === 'en' ? 'Not selected' : '尚未选择'} />
               <button
                 className="btn-ghost flex items-center gap-1.5 shrink-0"
-                onClick={async () => applyGameSelection(await window.modagent?.selectGameDirectory?.())}
+                disabled={gameImportBusy || gamePickerBusy}
+                onClick={() => pickGame(false)}
               >
-                <FolderOpen size={14} /> 选目录
+                <FolderOpen size={14} /> {language === 'en' ? 'Choose folder' : '选目录'}
               </button>
             </div>
             <button
               className="w-full px-3 py-2 rounded border border-surface-600 text-xs text-surface-300 hover:border-cyber-cyan/40 hover:text-cyber-cyan flex items-center justify-center gap-2 mb-3"
-              onClick={async () => applyGameSelection(await window.modagent?.selectGameExecutable?.())}
+              disabled={gameImportBusy || gamePickerBusy}
+              onClick={() => pickGame(true)}
             >
-              <FileType2 size={14} /> 或直接选择游戏主 EXE（特殊游戏推荐）
+              <FileType2 size={14} /> {language === 'en' ? 'Or select the main game EXE (recommended for unusual layouts)' : '或直接选择游戏主 EXE（特殊游戏推荐）'}
             </button>
 
             {gameImportForm.executable && (
               <div className="text-[11px] text-emerald-400/80 bg-emerald-400/5 border border-emerald-400/20 rounded px-2 py-1.5 mb-3 truncate">
-                已确认主程序：{gameImportForm.executable}
+                {language === 'en' ? 'Selected executable: ' : '已确认主程序：'}{gameImportForm.executable}
               </div>
             )}
 
-            <label className="text-xs text-surface-400 block mb-1">Nexus 游戏标识（可选）</label>
+            <label className="text-xs text-surface-400 block mb-1">{language === 'en' ? 'Nexus game ID (optional)' : 'Nexus 游戏标识（可选）'}</label>
             <input
               className="input-cyber w-full"
-              value={gameImportForm.game_slug}
+              disabled={gameImportBusy || gamePickerBusy} value={gameImportForm.game_slug}
               onChange={event => setGameImportForm(prev => ({ ...prev, game_slug: event.target.value }))}
-              placeholder="不确定可以留空，ModAgent 会自动匹配"
+              placeholder={language === 'en' ? 'Leave blank if unsure; ModAgent will try to match it' : '不确定可以留空，ModAgent 会自动匹配'}
             />
-            <p className="text-[11px] text-surface-500 mt-2">选目录会继续执行结构检测；直接选 EXE 则视为用户已确认该游戏，适合小型 Unity 游戏或特殊启动结构。</p>
+            <p className="text-[11px] text-surface-500 mt-2">{language === 'en' ? 'Folders are checked for a valid game layout. Selecting an EXE confirms your choice, useful for small Unity games or unusual launch layouts.' : '选目录会继续执行结构检测；直接选 EXE 则视为用户已确认该游戏，适合小型 Unity 游戏或特殊启动结构。'}</p>
 
             <div className="flex justify-end gap-2 mt-5">
-              <button disabled={gameImportBusy} onClick={() => setGameImportOpen(false)} className="btn-ghost">取消</button>
-              <button disabled={gameImportBusy || !gameImportForm.game_name.trim() || !gameImportForm.game_root}
+              <button disabled={gameImportBusy || gamePickerBusy} onClick={() => setGameImportOpen(false)} className="btn-ghost">{language === 'en' ? 'Cancel' : '取消'}</button>
+              <button disabled={gameImportBusy || gamePickerBusy || !gameImportForm.game_name.trim() || !gameImportForm.game_root}
                 onClick={submitGameImport}
                 className="px-4 py-2 rounded-md text-sm bg-cyber-cyan/80 text-black font-medium hover:bg-cyber-cyan disabled:opacity-40">
-                {gameImportBusy ? '正在导入…' : '导入并切换'}
+                {gameImportBusy ? (language === 'en' ? 'Importing…' : '正在导入…') : (language === 'en' ? 'Import and switch' : '导入并切换')}
               </button>
             </div>
           </div>

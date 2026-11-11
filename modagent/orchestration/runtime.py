@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from dataclasses import replace
 from functools import wraps
 from collections.abc import Callable
 from typing import Any
@@ -176,6 +177,8 @@ class AgentCoreRuntime:
         record = {"tool": str(tool_name), "target": target_key,
                   "status": outcome.status.value, "reason": outcome.reason,
                   "retryable": outcome.retryable}
+        if outcome.requires_review:
+            record["requires_review"] = True
         (self._tool_successes if ok else self._tool_failures).append(record)
         # Shadow observes only. Its receipts cannot suppress a real operation
         # now or become executable checkpoints after changing the feature flag.
@@ -233,6 +236,30 @@ class AgentCoreRuntime:
     def finish(self, result: TaskResult, state: TaskState | None = None) -> None:
         if self._finished:
             return
+        review_records = [item for item in self._tool_failures if item.get("requires_review")]
+        if review_records:
+            pending = list(result.not_completed)
+            completed = list(result.completed)
+            for item in review_records:
+                if item not in pending:
+                    pending.append(item)
+            for item in self._tool_successes:
+                if item not in completed:
+                    completed.append(item)
+            result = replace(
+                result,
+                summary=(
+                    "Installation stopped with unresolved recovery or file changes. "
+                    "Retain snapshots and recovery files; review the task details and current files before retrying."
+                    if self.spec.language == "en" else
+                    "安装已停止，恢复状态或文件改动仍需核对。请保留快照和恢复文件，先核对任务详情及当前文件，不要直接重复安装。"
+                ),
+                completed=tuple(completed), not_completed=tuple(pending),
+                retryable=False, next_actions=({"action": "review_install_recovery"},),
+            )
+            if result.status == "completed" or state == TaskState.COMPLETED:
+                result = replace(result, status="blocked")
+                state = TaskState.BLOCKED
         terminal = state or {
             "completed": TaskState.COMPLETED,
             "partial": TaskState.PARTIAL,

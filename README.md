@@ -2,11 +2,13 @@
 
 面向 Windows 的本地 AI Mod 管理器：对话搜索、方案分析、安装确认、Mod 管理与快照回滚。
 
-当前公开稳定版：**v1.5.1**。当前开发测试版：**v1.6.0-beta.1**，新增中英双语界面与英文 AI 输出支持。
+当前公开测试版：**v1.6.0-beta.1（r29）**；保留 **v1.5.1** 稳定版。新版包含 Agent Core v2、简化首次配置、中英文引导、浏览器后台运行和故障恢复改进，尚未宣称为最终 v1.7。
 
 English testers: see the [English Quick Start](docs/ENGLISH-QUICKSTART.md).
 
-[下载 v1.5.1 普通版](https://github.com/millips/ModAgent/releases/tag/v1.5.1) · [游戏适配与合作评估](https://github.com/millips/ModAgent/discussions/5) · [提交问题](https://github.com/millips/ModAgent/issues) · [隐私说明](PRIVACY.md)
+[下载新版 Beta（普通版 / P）](https://github.com/millips/ModAgent/releases/tag/v1.6.0-beta.1) · [下载 v1.5.1 稳定版](https://github.com/millips/ModAgent/releases/tag/v1.5.1) · [游戏适配与合作评估](https://github.com/millips/ModAgent/discussions/5) · [提交问题](https://github.com/millips/ModAgent/issues) · [隐私说明](PRIVACY.md)
+
+首次启动只需一个兼容的大模型 API Key，Nexus 与 Tavily 用到时再配置；Nexus 文件核验仍可能需要个人 API Key，网页下载可能需要登录。Chrome / Edge / Brave 默认最小化，验证时恢复窗口；升级沿用本机用户资料。同一浏览器保留专用登录资料，不同浏览器各自登录。
 
 ![ModAgent 普通版对话与状态总览](docs/assets/promo/v1.0.0/01-chat-overview.png)
 

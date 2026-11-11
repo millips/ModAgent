@@ -28,6 +28,7 @@ const IDENTITIES = {
 
 function getAppIdentity(packageInfo = {}) {
   const testId = candidateId(packageInfo);
+  const sharedProfile = Boolean(testId && packageInfo.modagentProfileMode === 'shared');
   const requested = testId ? packageInfo.modagentEdition : process.env.MODAGENT_EDITION || packageInfo.modagentEdition;
   const edition = requested === 'subscription' ? 'subscription' : 'free';
   const requestedChannel = testId ? packageInfo.modagentChannel : process.env.MODAGENT_CHANNEL || packageInfo.modagentChannel;
@@ -48,10 +49,10 @@ function getAppIdentity(packageInfo = {}) {
   return {
     ...identity,
     ...(testId ? {
-      productName: `${identity.productName} Core Safety Test (${testId})`,
-      executableName: `${identity.executableName}-CoreSafety`,
-      appId: `${identity.appId}.test.${testId}`,
-      userDataFolder: `${identity.userDataFolder} Test ${testId}`,
+      productName: sharedProfile ? identity.productName : `${identity.productName} Core Safety Test (${testId})`,
+      executableName: sharedProfile ? identity.executableName : `${identity.executableName}-CoreSafety`,
+      appId: sharedProfile ? base.appId : `${identity.appId}.test.${testId}`,
+      userDataFolder: sharedProfile ? base.userDataFolder : `${identity.userDataFolder} Test ${testId}`,
       manualUpdateManifestUrl: '',
       candidateId: testId,
     } : {}),

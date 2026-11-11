@@ -5,6 +5,7 @@ ModAgent incorporates or is distributed with third-party software. Each componen
 | Component | License | Project |
 |---|---|---|
 | Electron | MIT; bundled Chromium notices also apply | https://github.com/electron/electron |
+| ws | MIT | https://github.com/websockets/ws |
 | Chromium and bundled codecs/libraries | Multiple open-source licenses | Included in `LICENSES.chromium.html` in the Windows package |
 | React / React DOM | MIT | https://github.com/facebook/react |
 | Lucide React | ISC | https://github.com/lucide-icons/lucide |

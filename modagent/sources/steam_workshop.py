@@ -13,6 +13,10 @@ import urllib.request
 from datetime import datetime, timezone
 
 
+class SteamLoginRequired(RuntimeError):
+    """A browser sign-in step is required before this operation can continue."""
+
+
 # ── AppID 与工坊目录 ──
 
 def resolve_appid(game_root: str):
@@ -133,7 +137,7 @@ async def search(query: str, appid: int, cdp_port: int = 18888) -> list:
     """在已登录的 Steam 标签页内 fetch 工坊浏览页并解析（同源，无需 API key）。"""
     ws_url = _steam_ws(cdp_port)
     if not ws_url:
-        raise RuntimeError("未找到已登录的 Steam 标签页，请在 ModAgent 打开的浏览器中登录 steamcommunity.com")
+        raise SteamLoginRequired("未找到 Steam 标签页，请在 ModAgent 专用浏览器中打开 steamcommunity.com 并检查登录")
     q = (query or "").replace("'", "")
     expr = (
         "(async () => {"
@@ -192,7 +196,7 @@ async def search(query: str, appid: int, cdp_port: int = 18888) -> list:
 async def _sub_action(action: str, pubfileid: str, appid: int, cdp_port: int) -> dict:
     ws_url = _steam_ws(cdp_port)
     if not ws_url:
-        raise RuntimeError("未找到已登录的 Steam 标签页，请在 ModAgent 打开的浏览器中登录 steamcommunity.com")
+        raise SteamLoginRequired("未找到 Steam 标签页，请在 ModAgent 专用浏览器中打开 steamcommunity.com 并检查登录")
     pid = re.sub(r"\D", "", str(pubfileid))
     expr = (
         "(async () => {"

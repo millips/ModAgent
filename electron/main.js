@@ -2,7 +2,7 @@ const {
   app, BrowserWindow, Menu, ipcMain, shell, dialog, crashReporter,
   Notification, clipboard, safeStorage, net,
 } = require('electron');
-const { spawn, exec } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -12,10 +12,15 @@ const fs = require('fs');
 const { getAppIdentity } = require('./appIdentity');
 const { candidateProfile } = require('./candidateProfile');
 const { createCredentialBroker, credentialOptions } = require('./credentialBroker');
+const { registerShareFileIpc } = require('./shareFile');
+const { createDiagnosticExporter } = require('./diagnosticExport');
+const { storeBackground } = require('./backgroundStore');
+const { validateBackgroundImage } = require('./backgroundDecode');
 const { createLicenseStore, canUsePBenefits } = require('./licenseStore');
 const { createRuntimeDiagnostics, buildDiagnosticReport } = require('./runtimeDiagnostics');
 const { setupAutoUpdater } = require('./updater');
-const { findInstalledBrowser, profileDirectory } = require('./browserLauncher');
+const { browserCandidates } = require('./browserLauncher');
+const { createBrowserController } = require('./browserController');
 
 const PACKAGE_INFO = require('./package.json');
 const IDENTITY = getAppIdentity(PACKAGE_INFO);
@@ -111,7 +116,7 @@ app.setPath('crashDumps', path.join(diagnostics.logsDir, 'crashes'));
 
 let mainWindow = null;
 let pythonProcess = null;
-let browserProcess = null;
+let browserController = null;
 let backendRestartTimer = null;
 let backendRestartCount = 0;
 let backendReady = false;
@@ -133,6 +138,7 @@ process.env.MODAGENT_EDITION = APP_EDITION;
 process.env.MODAGENT_CHANNEL = IDENTITY.channel;
 process.env.MODAGENT_SECURE_SECRETS = '1';
 if (TEST_PROFILE) process.env.MODAGENT_AGENT_CORE_V2 = TEST_PROFILE.coreMode;
+else if (IDENTITY.candidateId) process.env.MODAGENT_AGENT_CORE_V2 = 'on';
 
 // A packaged smoke run has an isolated user-data directory and must be able to
 // start beside the normal desktop client.  Keeping the normal single-instance
@@ -293,48 +299,13 @@ function findAvailableApiPort(preferredPort) {
   });
 }
 
-function killStaleCdpBrowser(callback) {
-  // A candidate owns a fresh debugging port and must never close another
-  // build's browser session merely because it is running beside it.
-  if (TEST_PROFILE) { callback(); return; }
-  const ps = "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('chrome.exe','msedge.exe','brave.exe') -and $_.CommandLine -like '*remote-debugging-port=" + CDP_PORT + "*' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }";
-  exec(`powershell -NoProfile -Command "${ps}"`, () => callback());
-}
-
 function startCdpBrowser() {
-  killStaleCdpBrowser(() => {
-      const browser = findInstalledBrowser(process.env, DATA_DIR);
-      if (!browser) {
-        logger.error('No supported Chromium browser found', {
-          supported: ['Microsoft Edge', 'Google Chrome', 'Brave'],
-          port: CDP_PORT,
-        });
-        return;
-      }
-      const args = [
-        `--remote-debugging-port=${CDP_PORT}`,
-        `--user-data-dir=${profileDirectory(DATA_DIR, browser.id)}`,
-        '--window-size=1000,720',
-        '--window-position=120,80',
-        '--no-first-run',
-        '--no-default-browser-check',
-        'https://www.nexusmods.com/',
-        'https://steamcommunity.com/',
-      ];
-      try {
-        browserProcess = spawn(browser.executable, args, { stdio: 'ignore', detached: true });
-        browserProcess.unref();
-        browserProcess.once('error', spawnError => {
-          logger.error(`${browser.name} CDP failed to start`, spawnError);
-        });
-        logger.info('CDP browser started', {
-          browser: browser.name,
-          executable: browser.executable,
-          port: CDP_PORT,
-        });
-      } catch (spawnError) {
-        logger.error(`${browser.name} CDP failed to start`, spawnError);
-      }
+  browserController = createBrowserController({dataDir:DATA_DIR,port:CDP_PORT,
+    ...(IS_SMOKE_TEST ? {warmupSites:[]} : {})});
+  browserController.start().then(state => {
+    logger.info('ModAgent browser startup', {phase:state.phase,browser:state.id,attempts:state.attempts});
+  }).catch(() => {
+    logger.error('ModAgent browser startup failed');
   });
 }
 
@@ -438,6 +409,22 @@ function markHealthyWhenReady() {
   if (!backendReady || !rendererReady || healthMarkScheduled) return;
   healthMarkScheduled = true;
   if (IS_SMOKE_TEST) {
+    if (process.argv.includes('--smoke-browser')) {
+      mainWindow.webContents.executeJavaScript(`(async()=>{
+        const wait=async predicate=>{for(let i=0;i<150;i++){if(await predicate())return;await new Promise(r=>setTimeout(r,100))}throw Error('browser_smoke_timeout')};
+        await wait(async()=> (await window.modagent.getBrowserStatus()).phase==='ready');
+        await wait(()=>document.querySelector('[data-browser-controls]'));
+        if(!(await window.modagent.getBrowserStatus()).minimized)throw Error('not_minimized');
+        if(!(await window.modagent.showBrowser()).ok)throw Error('show_failed');
+        if((await window.modagent.getBrowserStatus()).minimized)throw Error('not_restored');
+        if(!(await window.modagent.minimizeBrowser()).ok)throw Error('minimize_failed');
+        return (await window.modagent.getBrowserStatus()).minimized;
+      })()`).then(ok=>{
+        if(!ok)return finishSmokeTest(false,'browser IPC failed');
+        logger.info('Browser control IPC smoke passed');diagnostics.markHealthy();finishSmokeTest(true);
+      }).catch(()=>finishSmokeTest(false,'browser IPC failed'));
+      return;
+    }
     if (process.argv.includes('--smoke-credential-setup')) {
       // Exercise the actual first-run UI and save-secrets IPC, not just a
       // pre-seeded config. Available only in the isolated smoke entry point.
@@ -450,13 +437,12 @@ function markHealthyWhenReady() {
           throw Error('setup_smoke_timeout');
         };
         const workspace = () => document.querySelector('.is-workspace .app-page-layer');
-        await wait(() => workspace() || document.querySelectorAll('input[type="password"]').length === 3);
+        await wait(() => workspace() || document.querySelector('input[aria-label="LLM API Key"]'));
         if (!workspace()) {
           const field = [...document.querySelectorAll('input[type="password"]')].at(-1);
           Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, 'credential-setup-fake-key');
           field.dispatchEvent(new Event('input', { bubbles: true }));
           await new Promise(r => setTimeout(r, 100));
-          [...document.querySelectorAll('button')].find(b => /下一步|Next/.test(b.textContent)).click();
           await wait(() => [...document.querySelectorAll('button')].some(b => /保存并进入|Save.*Enter/i.test(b.textContent)));
           [...document.querySelectorAll('button')].find(b => /保存并进入|Save.*Enter/i.test(b.textContent)).click();
           await wait(workspace);
@@ -481,13 +467,21 @@ function markHealthyWhenReady() {
           await new Promise(r => setTimeout(r, 100));
         }
         const status = await fetch(${JSON.stringify(API_BASE)} + '/status').then(r => r.json());
+        const targets = await fetch(${JSON.stringify(API_BASE)} + '/network/targets').then(r => r.json());
+        const rejected = await fetch(${JSON.stringify(API_BASE)} + '/network/test', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target_id: 'http://127.0.0.1' }),
+        });
         return Boolean(document.querySelector('.is-workspace .app-page-layer'))
+          && targets.targets?.length === 7 && rejected.status === 400
+          && document.querySelectorAll('[data-connection-target]').length === 7
           && status.llm_set && status.api_key_set && status.tavily_set
           && status.llm_endpoint === 'https://credentials.invalid/v1'
           && status.llm_model === 'credential-smoke-model';
       })()`).then(ok => {
         if (!ok) return finishSmokeTest(false, 'credential reuse or setup bypass failed');
         logger.info('Credential reuse smoke passed');
+        logger.info('Connection panel and packaged API smoke passed');
         diagnostics.markHealthy();
         finishSmokeTest(true);
       }).catch(() => finishSmokeTest(false, 'credential reuse smoke failed'));
@@ -608,10 +602,6 @@ function stopChildren() {
     pythonProcess.kill();
     pythonProcess = null;
   }
-  if (browserProcess) {
-    try { browserProcess.kill(); } catch (_) {}
-    browserProcess = null;
-  }
 }
 
 if (gotSingleInstanceLock) {
@@ -659,7 +649,7 @@ if (gotSingleInstanceLock) {
         45000,
       );
     }
-    if (!IS_SMOKE_TEST) startCdpBrowser();
+    if (!IS_SMOKE_TEST || process.argv.includes('--smoke-browser')) startCdpBrowser();
     startBackend();
     await createWindow();
     setupAutoUpdater({ identity: IDENTITY, diagnostics, getMainWindow: () => mainWindow });
@@ -684,16 +674,56 @@ if (gotSingleInstanceLock) {
 }
 
 app.on('window-all-closed', () => app.quit());
-app.on('before-quit', () => {
+app.on('before-quit', event => {
+  if (isQuitting) return;
+  event.preventDefault();
   isQuitting = true;
-  diagnostics.markCleanExit();
   stopChildren();
+  // Give the dedicated browser time to flush its login profile before exiting.
+  Promise.resolve(browserController?.stop()).catch(() => {}).finally(() => {
+    diagnostics.markCleanExit();
+    app.quit();
+  });
 });
 app.on('activate', () => {
   if (mainWindow === null) createWindow();
 });
 
 ipcMain.handle('get-api-base', () => API_BASE);
+const trustedBrowserSender = event => Boolean(mainWindow && event.sender === mainWindow.webContents
+  && event.senderFrame === mainWindow.webContents.mainFrame);
+ipcMain.handle('browser-status', event => trustedBrowserSender(event)
+  ? browserController?.status() || {phase:'disabled'} : {phase:'unavailable'});
+ipcMain.handle('browser-show', (event, options = {}) => {
+  if (!trustedBrowserSender(event) || !browserController) return {ok:false,error:'browser_unavailable'};
+  return browserController.show({site:['nexus','steam'].includes(options?.site)?options.site:undefined,
+    automatic:options?.automatic===true,key:String(options?.key||'').slice(0,200)});
+});
+ipcMain.handle('browser-minimize', event => trustedBrowserSender(event)
+  ? browserController?.minimize() || {ok:false,error:'browser_unavailable'} : {ok:false,error:'untrusted_window'});
+ipcMain.handle('browser-retry', async event => {
+  if (!trustedBrowserSender(event) || !browserController) return {ok:false};
+  const state=await browserController.status();
+  if (state.phase==='ready' || state.phase==='starting') return {ok:true};
+  return {ok:(await browserController.start()).phase==='ready'};
+});
+ipcMain.handle('browser-select', async event => {
+  if (!trustedBrowserSender(event) || !browserController) return {ok:false};
+  const state=await browserController.status();
+  if (['ready','starting'].includes(state.phase)) return {ok:false,error:'browser_running'};
+  const result=await dialog.showOpenDialog(mainWindow,{title:'选择 Chrome / Edge / Brave',properties:['openFile'],
+    filters:[{name:'Browser',extensions:['exe']}]});
+  if(result.canceled || !result.filePaths.length)return {ok:false,cancelled:true};
+  const executable=path.resolve(result.filePaths[0]);
+  const candidate=browserCandidates().find(b=>b.processName===path.basename(executable).toLowerCase());
+  if(!candidate)return {ok:false,error:'browser_unsupported'};
+  return {ok:(await browserController.start({id:candidate.id,executable})).phase==='ready'};
+});
+const BROWSER_DOWNLOADS = Object.freeze({chrome:'https://www.google.com/chrome/',edge:'https://www.microsoft.com/edge/download',brave:'https://brave.com/download/'});
+ipcMain.handle('browser-download-page', async (event, id) => {
+  if(!trustedBrowserSender(event) || !Object.hasOwn(BROWSER_DOWNLOADS,id))return {ok:false};
+  try {await shell.openExternal(BROWSER_DOWNLOADS[id]);return {ok:true};}catch{return {ok:false};}
+});
 ipcMain.on('get-api-base-sync', event => { event.returnValue = API_BASE; });
 ipcMain.on('get-app-identity-sync', event => {
   event.returnValue = {
@@ -732,6 +762,7 @@ ipcMain.handle('activate-p-license', (_, code) => {
   }
 });
 ipcMain.handle('open-external', (_, url) => openTrustedExternal(url));
+registerShareFileIpc({ ipcMain, dialog, getWindow: () => mainWindow });
 ipcMain.handle('read-submission-issue-from-clipboard', () => {
   const text = String(clipboard.readText() || '').trim();
   const match = text.match(/^https:\/\/github\.com\/millips\/ModAgent-Share\/issues\/(\d+)\/?$/i);
@@ -1039,30 +1070,36 @@ ipcMain.handle('open-legal-document', (_, filename) => {
   if (!fs.existsSync(legalPath)) return 'Legal document is missing';
   return shell.openPath(legalPath);
 });
-ipcMain.handle('export-runtime-diagnostics', async () => {
-  const report = buildDiagnosticReport({
+const exportRuntimeDiagnostics = createDiagnosticExporter({
+  buildReport: () => buildDiagnosticReport({
     diagnostics, productName: IDENTITY.productName,
     version: PACKAGE_INFO.version, edition: APP_EDITION,
-  });
-  const preview = await dialog.showMessageBox(mainWindow, {
+  }),
+  preview: async (report, language) => {
+    const en = language === 'en';
+    const preview = await dialog.showMessageBox(mainWindow, {
     type: 'info',
-    title: '预览脱敏后的诊断信息',
-    message: '诊断内容已统一脱敏。请在保存前检查以下预览。',
-    detail: report.slice(0, 12000) + (report.length > 12000 ? '\n\n[预览已截断，导出文件包含完整脱敏内容]' : ''),
-    buttons: ['继续保存', '取消'],
+    title: en ? 'Preview redacted diagnostics' : '预览脱敏后的诊断信息',
+    message: en ? 'Automatic redaction has been applied. Review the preview before saving or sharing.' : '已执行自动脱敏，请在保存或分享前检查以下预览。',
+    detail: report.slice(0, 12000) + (report.length > 12000 ? (en ? '\n\n[Preview truncated; the exported file contains the full redacted report.]' : '\n\n[预览已截断，导出文件包含完整脱敏内容]') : ''),
+    buttons: en ? ['Continue to save', 'Cancel'] : ['继续保存', '取消'],
     defaultId: 0,
     cancelId: 1,
     noLink: true,
   });
-  if (preview.response !== 0) return null;
-  const result = await dialog.showSaveDialog(mainWindow, {
-    title: '导出 ModAgent 诊断信息',
+    return preview.response === 0;
+  },
+  choosePath: language => dialog.showSaveDialog(mainWindow, {
+    title: language === 'en' ? 'Export ModAgent diagnostics' : '导出 ModAgent 诊断信息',
     defaultPath: path.join(app.getPath('documents'), `${IDENTITY.artifactPrefix}-diagnostics.txt`),
     filters: [{ name: 'Text', extensions: ['txt'] }],
-  });
-  if (result.canceled || !result.filePath) return null;
-  fs.writeFileSync(result.filePath, report, 'utf8');
-  return result.filePath;
+  }),
+});
+ipcMain.handle('export-runtime-diagnostics', (event, language) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) {
+    return { ok: false, error: 'DIAGNOSTICS_UNTRUSTED' };
+  }
+  return exportRuntimeDiagnostics(language === 'en' ? 'en' : 'zh-CN');
 });
 
 ipcMain.handle('get-bg-data-url', (_, filename) => {
@@ -1076,7 +1113,12 @@ ipcMain.handle('get-bg-data-url', (_, filename) => {
   return `data:${mime};base64,${fs.readFileSync(filePath).toString('base64')}`;
 });
 
-ipcMain.handle('select-bg', async () => {
+let backgroundBusy = false;
+ipcMain.handle('select-bg', async event => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) throw Error('BACKGROUND_UNTRUSTED');
+  if (backgroundBusy) throw Error('BACKGROUND_BUSY');
+  backgroundBusy = true;
+  try {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: '选择背景图片',
     filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp'] }],
@@ -1084,15 +1126,13 @@ ipcMain.handle('select-bg', async () => {
   });
   if (result.canceled || !result.filePaths.length) return null;
   const source = result.filePaths[0];
-  const extension = path.extname(source);
-  fs.rmSync(BG_DIR, { recursive: true, force: true });
-  fs.mkdirSync(BG_DIR, { recursive: true });
-  const destination = path.join(BG_DIR, `bg_${Date.now()}${extension}`);
-  fs.copyFileSync(source, destination);
-  return path.basename(destination);
+  return await storeBackground(source, BG_DIR, undefined, (bytes, extension) => validateBackgroundImage(bytes, extension, BrowserWindow));
+  } finally { backgroundBusy = false; }
 });
 
-ipcMain.handle('remove-bg', () => {
+ipcMain.handle('remove-bg', event => {
+  if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) throw Error('BACKGROUND_UNTRUSTED');
+  if (backgroundBusy) throw Error('BACKGROUND_BUSY');
   fs.rmSync(BG_DIR, { recursive: true, force: true });
   return true;
 });

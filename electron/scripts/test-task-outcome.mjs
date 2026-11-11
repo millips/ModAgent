@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { canPresentConfirmation, canCompleteSelection, apiErrorMessage, receiptProgress } from '../src/components/taskOutcome.mjs'
+import { canPresentConfirmation, canCompleteSelection, apiErrorMessage, receiptProgress, cancellationFeedback } from '../src/components/taskOutcome.mjs'
 
 const good = { streamCompleted: true, streamFailed: false, executionFailed: false, planBlocked: false }
 assert.equal(canPresentConfirmation(good), true)
@@ -16,3 +16,10 @@ assert.match(receiptProgress({ ok: true, outcome_status: 'waiting_user' }, '下�
 assert.match(receiptProgress({ ok: false, outcome_status: 'failed' }, '下载', 'zh-CN'), /未完成/)
 assert.match(receiptProgress({ ok: true, outcome_status: 'success' }, '下载', 'en'), /step completed/)
 console.log('task outcome tests passed')
+for (const language of ['en','zh-CN']) {
+  assert.match(cancellationFeedback({ok:true},language).message,/TASK_CANCEL_REQUESTED/)
+  assert.equal(cancellationFeedback({ok:true},language).level,'warn')
+  assert.match(cancellationFeedback({ok:true,chat_cancelled:true},language).message,/TASK_TURN_INVALIDATED/)
+  for(const response of [{ok:false},{},null,{ok:'true'}]) assert.match(cancellationFeedback(response,language).message,/TASK_CANCEL_UNCONFIRMED/)
+}
+console.log('cancellation feedback distinctions passed in both languages')

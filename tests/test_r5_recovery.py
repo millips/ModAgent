@@ -11,11 +11,11 @@ from modagent.orchestration.models import TaskSpec, TaskState, AgentMode
 from modagent.orchestration.recovery import preview_recovery, RecoveryRejected
 
 
-@pytest.fixture
-def recovery(monkeypatch, tmp_path):
+@pytest.fixture(params=['zh-CN', 'en'])
+def recovery(monkeypatch, tmp_path, request):
     monkeypatch.setattr(db, 'DB_FILE', str(tmp_path / 'state.db'))
     db.init_db()
-    cfg = Config(game_root=str(tmp_path / 'game'), game_slug='fixture', agent_core_v2='on')
+    cfg = Config(game_root=str(tmp_path / 'game'), game_slug='fixture', agent_core_v2='on', language=request.param)
     db.create_session('recovery-session', 'test', 'fixture')
     spec = TaskSpec.create(session_id='recovery-session', game_id='fixture', intent=AgentMode.EXECUTE_PLAN,
         user_goal='安装已经选择的变体', targets=[{'source': 'nexus', 'mod_id': '42', 'file_id': '102', 'version': '1.0'}],
@@ -30,6 +30,14 @@ def test_recovery_preserves_selection_but_never_write_authorization(recovery):
     assert result['recommendation_selection'][0]['file_id'] == '102'
     assert result['selection_action'] == 'plan'
     assert result['write_authorized'] is False
+    if cfg.language == 'en':
+        assert 'Do not download or install' in result['message']
+        assert 'read-only' in result['notice']
+        assert not any('\u4e00' <= char <= '\u9fff' for char in result['message'] + result['notice'])
+    else:
+        assert '不要下载安装' in result['message']
+        assert '不会重放旧安装' in result['notice']
+    assert result['original_goal'] == spec.user_goal
 
 
 def test_recovery_rejects_another_game_install(recovery):
@@ -44,12 +52,13 @@ def test_actual_new_process_recovers_exact_targets(recovery):
     env = {**os.environ, 'MODAGENT_DATA_DIR': str(root), 'PYTHONIOENCODING': 'utf-8'}
     code = ('import json,sys; from modagent.config import Config; '
             'from modagent.orchestration.recovery import preview_recovery; '
-            'print(json.dumps(preview_recovery(sys.argv[1],Config(game_root=sys.argv[2]))))')
-    output = subprocess.run([sys.executable, '-c', code, spec.task_id, cfg.game_root],
+            'print(json.dumps(preview_recovery(sys.argv[1],Config(game_root=sys.argv[2],language=sys.argv[3]))))')
+    output = subprocess.run([sys.executable, '-c', code, spec.task_id, cfg.game_root, cfg.language],
                             env=env, capture_output=True, text=True, timeout=15, check=True)
     result = json.loads(output.stdout)
     assert result['recommendation_selection'] == spec.to_dict()['targets']
     assert result['write_authorized'] is False
+    assert result['message'] == preview_recovery(spec.task_id, cfg)['message']
 
 
 def test_api_recovery_cannot_inject_new_targets_or_confirmation(monkeypatch, recovery):
@@ -59,7 +68,7 @@ def test_api_recovery_cannot_inject_new_targets_or_confirmation(monkeypatch, rec
         def __init__(self, cfg):
             self.history = []
         def chat_stream(self, message, **kwargs):
-            calls.append(kwargs)
+            calls.append({**kwargs, 'message':message})
             kwargs['core_runtime'].finalize_from_text('核验计划', waiting_confirmation=True)
             yield json.dumps({'chunk': '核验计划，不执行安装'})
             yield json.dumps({'done': True})
@@ -79,3 +88,6 @@ def test_api_recovery_cannot_inject_new_targets_or_confirmation(monkeypatch, rec
     assert calls[0]['selection_action'] == 'plan'
     assert calls[0]['recommendation_selection'] == spec.to_dict()['targets']
     assert not calls[0]['task_spec'].authorization['install']
+    assert calls[0]['message'] == preview_recovery(spec.task_id, cfg)['message']
+    if cfg.language == 'en':
+        assert 'Do not download or install' in calls[0]['message']

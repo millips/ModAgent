@@ -4,9 +4,12 @@ const { getAppIdentity } = require('./appIdentity');
 
 const buildEdition = process.env.MODAGENT_EDITION === 'free' ? 'free' : 'subscription';
 const candidate = process.env.MODAGENT_CANDIDATE_ID || '';
+const profileMode = process.env.MODAGENT_PROFILE_MODE || 'isolated';
+if (!['isolated', 'shared'].includes(profileMode)) throw new Error('Invalid build profile mode');
 const buildPackageInfo = { ...packageInfo, modagentEdition: buildEdition,
   modagentChannel: process.env.MODAGENT_CHANNEL || packageInfo.modagentChannel,
   ...(candidate ? { modagentCandidateId: candidate } : {}),
+  ...(candidate ? { modagentProfileMode: profileMode } : {}),
 };
 const identity = getAppIdentity(buildPackageInfo);
 const frontendRoot = path.resolve(process.env.MODAGENT_FRONTEND_DIR || path.join(__dirname, 'dist'));
@@ -86,6 +89,7 @@ module.exports = {
     modagentEdition: identity.edition,
     modagentChannel: identity.channel,
     ...(candidate ? { modagentCandidateId: candidate } : {}),
+    ...(candidate ? { modagentProfileMode: profileMode } : {}),
   },
   artifactName: `${identity.artifactPrefix}-Setup-${packageInfo.version}.${'${ext}'}`,
   asar: true,
@@ -107,13 +111,18 @@ module.exports = {
         ]),
     'main.js',
     'browserLauncher.js',
+    'browserController.js',
     'preload.js',
     'appIdentity.js',
     'candidateProfile.js',
     'securityStore.js',
     'credentialBroker.js',
+    'shareFile.js',
     'licenseStore.js',
     'runtimeDiagnostics.js',
+    'diagnosticExport.js',
+    'backgroundStore.js',
+    'backgroundDecode.js',
     'updater.js',
     'package.json',
   ],

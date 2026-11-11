@@ -45,11 +45,11 @@ export function upsertPShareSubmission(submission) {
   if (!submission?.submission_id) return null
   const entries = readPShareSubmissions()
   const now = new Date().toISOString()
+  const index = entries.findIndex(item => item.submission_id === submission.submission_id)
+  const existing = index >= 0 ? entries[index] : null
   const normalized = {
     version: 1,
     status: 'draft',
-    created_at: now,
-    updated_at: now,
     title: '未命名合集',
     game_name: '',
     game_slug: '',
@@ -58,11 +58,12 @@ export function upsertPShareSubmission(submission) {
     description: '',
     issue_url: '',
     ma_code: '',
+    ...existing,
     ...submission,
+    created_at: existing?.created_at || submission.created_at || now,
     updated_at: now,
   }
-  const index = entries.findIndex(item => item.submission_id === normalized.submission_id)
-  if (index >= 0) entries[index] = { ...entries[index], ...normalized }
+  if (index >= 0) entries[index] = normalized
   else entries.unshift(normalized)
   window.localStorage.setItem(SUBMISSIONS_KEY, JSON.stringify(entries))
   notify()

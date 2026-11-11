@@ -4,8 +4,16 @@ import { emitFeedback } from '../feedback/feedbackBus'
 import { isPAccessEnabled, usePLicenseStatus } from '../license/pLicense'
 import { usePShareProfile } from '../pshare/pShareStore'
 import ShareExportDialog from './ShareExportDialog'
+import DirectInstallReview from './DirectInstallReview'
+import {parseManualSourceUrl, validateSourceReceipt} from './manualSource.mjs'
 import { tr } from '../i18n'
 import { uninstallOutcome } from './uninstallOutcome.mjs'
+import { requestLocalJson, localApiFailure, LocalApiError } from './localApi.mjs'
+import { updateMod, updateFailure } from './modUpdate.mjs'
+import { validateUpdateCheckResponse } from './updateCheckResponse.mjs'
+import { validateUninstallPreview } from './uninstallPreview.mjs'
+import { validateToggleReceipt } from './toggleReceipt.mjs'
+import { validateTogglePreview } from './togglePreview.mjs'
 
 const MOCK_MODS = [
   { id: '107', name: 'Cyber Engine Tweaks', name_cn: 'CET 脚本框架', version: '1.32.2', latest: null, category: '框架', desc: '所有脚本 mod 的前置依赖', size: '2.3MB', hasConflict: false, disabled: false },
@@ -30,6 +38,7 @@ const FILTERS = [
 
 export default function ModsPage({ toast, api, onRefresh, refreshKey, status, language = 'zh-CN' }) {
   const t = key => tr(language, key)
+  const ui = (zh, en) => language === 'en' ? en : zh
   const pLicense = usePLicenseStatus()
   const pShareProfile = usePShareProfile()
   const canCreateShare = isPAccessEnabled(pLicense) && Boolean(pShareProfile)
@@ -49,6 +58,8 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
   const [showDownload, setShowDownload] = useState(false)
   const [dlUrl, setDlUrl] = useState('')
   const [dlBusy, setDlBusy] = useState(false)
+  const [downloadReview, setDownloadReview] = useState(null)
+  const downloadLockRef = useRef(false)
   const [checking, setChecking] = useState(false)
   const [updateProgress, setUpdateProgress] = useState(null)
   const [updateReview, setUpdateReview] = useState(null)
@@ -66,16 +77,60 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
   const [packageMerging, setPackageMerging] = useState(false)
   const bindingAbortRef = useRef(null)
   const updateAbortRef = useRef(null)
+  const listEpochRef = useRef(0)
+  const scope = status?.game_instance_id || status?.game_slug || ''
+  const scopeRef = useRef(scope)
+  const scopeEpochRef = useRef(0)
+  if (scopeRef.current !== scope) { scopeRef.current = scope; scopeEpochRef.current++ }
+  const enrichLockRef = useRef(false)
+  const reconcileLockRef = useRef(false)
+  const cancelLockRef = useRef(false)
+  const updateWriteLockRef = useRef(false)
+  const managementLockRef = useRef(false)
+  const packageMergeLockRef = useRef(false)
+  const folderLockRef = useRef(false)
+  const [folderBusy, setFolderBusy] = useState(false)
+  const apiFailure = (code, error) => toast(`[${code}] ${localApiFailure(error, language, {mutation: code.endsWith('_UNCONFIRMED')})}`, 'error')
+
+  const openManagedFolder = async kind => {
+    if (folderLockRef.current) return
+    folderLockRef.current = true
+    setFolderBusy(true)
+    try {
+      const result = await requestLocalJson(`${api}/${kind}/open`, {method:'POST'})
+      if (result?.ok !== true || typeof result.path !== 'string' || !result.path.trim() || result.error) {
+        throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      }
+      emitFeedback('notice', {source:kind})
+      toast(ui('已请求系统打开目录；若未出现窗口，请检查文件管理器。', 'Folder opening requested. If no window appears, check your file manager.'))
+    } catch (error) {
+      emitFeedback('error', {source:kind})
+      toast('[FOLDER_OPEN_UNCONFIRMED] ' + localApiFailure(error, language)
+        + ui(' 请检查目录权限及文件管理器；若窗口已打开，无需重复点击。', ' Check folder permissions and your file manager; if a window already opened, do not repeat the request.'), 'error')
+    } finally {
+      folderLockRef.current = false
+      setFolderBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    setMods([]); setSelected(new Set()); setShowShareExport(false)
+    setShowDeleteConfirm(null); setBatchDelete(null); setDependencyGate(null)
+    setUpdateReview(null); setAlignmentReview(null); setPackageMerge(null)
+    setManualSource({}); setManualSourcePreview({})
+    setDownloadReview(null); setShowDownload(false)
+  }, [scope])
 
   useEffect(() => { loadFromApi() }, [refreshKey, status?.game_slug, status?.game_instance_id])
 
   const loadFromApi = async () => {
+    const epoch = ++listEpochRef.current
+    const scopeEpoch = scopeEpochRef.current
     try {
       const scope = status?.game_instance_id || status?.game_slug || ''
-      const r = await fetch(scope ? `${api}/mods?game_slug=${encodeURIComponent(scope)}` : `${api}/mods`)
-      if (!r.ok) throw new Error(`mods request failed: ${r.status}`)
-      const apiMods = await r.json()
-      if (!Array.isArray(apiMods)) throw new Error('mods response is not an array')
+      const apiMods = await requestLocalJson(scope ? `${api}/mods?game_slug=${encodeURIComponent(scope)}` : `${api}/mods`)
+      if (epoch !== listEpochRef.current || scopeEpoch !== scopeEpochRef.current) return
+      if (!Array.isArray(apiMods) || apiMods.some(m => !m || !['string','number'].includes(typeof m.id))) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
       const mapped = apiMods.map(m => ({
         id: m.id || '', name: m.name || m.id, name_cn: m.localized_name || '', version: m.version || '?',
         latest: null, category: m.source || '本地', desc: m.summary || '功能简介尚未生成',
@@ -100,19 +155,21 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
       if (mapped.some(mod => !mod.name_cn || !mod.summaryEvidence)) {
         void enrichCatalog(scope)
       }
-    } catch (_) { toast('加载 Mod 列表失败', 'error') }
+    } catch (error) { if (epoch === listEpochRef.current && scopeEpoch === scopeEpochRef.current) apiFailure('MOD_LIST_FAILED', error) }
   }
 
   const enrichCatalog = async (scope = '', force = false) => {
-    if (enriching) return
+    if (enrichLockRef.current) return
+    enrichLockRef.current = true
+    const scopeEpoch = scopeEpochRef.current
     setEnriching(true)
     try {
       const query = new URLSearchParams()
       if (scope) query.set('game_slug', scope)
       if (force) query.set('force', 'true')
-      const response = await fetch(`${api}/mods/enrich?${query.toString()}`, { method: 'POST' })
-      if (!response.ok) throw new Error(`enrichment request failed: ${response.status}`)
-      const result = await response.json()
+      const result = await requestLocalJson(`${api}/mods/enrich?${query.toString()}`, { method: 'POST' }, {timeoutMs:120000})
+      if (scopeEpoch !== scopeEpochRef.current) return
+      if (!result || typeof result !== 'object' || Array.isArray(result)) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
       const notes = result.notes || {}
       setMods(previous => previous.map(mod => {
         const note = notes[String(mod.id)]
@@ -130,19 +187,24 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
         else if (result.status === 'generation_failed') toast('AI 功能简介生成失败，可稍后重试', 'error')
         else toast(result.updated ? `已更新 ${result.updated} 个 Mod 的中文简介` : '中文简介缓存已是最新')
       }
-    } catch (_) {
-      if (force) toast('AI 功能简介生成失败，可稍后重试', 'error')
+    } catch (error) {
+      if (force && scopeEpoch === scopeEpochRef.current) apiFailure('MOD_ENRICH_FAILED', error)
     } finally {
+      enrichLockRef.current = false
       setEnriching(false)
     }
   }
 
   const reconcileMods = async () => {
+    if (reconcileLockRef.current) return
+    reconcileLockRef.current = true
+    const scopeEpoch = scopeEpochRef.current
     toast('对账并同步中...')
     try {
       const scope = status?.game_instance_id || status?.game_slug || ''
-      const r = await fetch(`${api}/mods/reconcile?game_slug=${encodeURIComponent(scope)}&sync_missing=true`, { method: 'POST' })
-      const d = await r.json()
+      const d = await requestLocalJson(`${api}/mods/reconcile?game_slug=${encodeURIComponent(scope)}&sync_missing=true`, { method: 'POST' }, {timeoutMs:120000})
+      if (scopeEpoch !== scopeEpochRef.current) return
+      if (!Number.isInteger(d?.checked) || d.checked < 0 || !Array.isArray(d.issues)) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
       const merged = Number(d.duplicates_merged) || 0
       const removed = Number(d.removed_missing?.length) || 0
       if (d.issues?.length) {
@@ -156,67 +218,76 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
           : `对账完成：${removed ? `已同步移除 ${removed} 个已手动删除的 Mod；` : ''}${d.checked} 个 Mod 账实一致`)
       }
       if (merged || removed) await loadFromApi()
-    } catch (_) { emitFeedback('error', { source: 'mod-reconcile' }); toast('对账失败', 'error') }
+    } catch (error) { emitFeedback('error', { source: 'mod-reconcile' }); apiFailure('MOD_RECONCILE_UNCONFIRMED', error) }
+    finally { reconcileLockRef.current = false }
   }
 
   const cancelLongTask = async (taskKind) => {
+    if (cancelLockRef.current) return
+    cancelLockRef.current = true
     try {
-      const response = await fetch(`${api}/tasks/cancel`, {
+      const result = await requestLocalJson(`${api}/tasks/cancel`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ task_kind: taskKind }),
       })
-      const result = await response.json()
-      if (result.ok) {
-        toast('已请求取消；当前网络请求结束后会安全停止')
+      if (result?.ok === true) {
+        toast(language === 'en' ? '[TASK_CANCEL_REQUESTED] Cancellation requested. The current step may still be finishing; verify its final state.' : '[TASK_CANCEL_REQUESTED] 已请求取消，当前步骤可能仍在收尾，请核对最终状态。')
         emitFeedback('cancel', { source: taskKind })
-      }
+      } else toast(language === 'en' ? '[TASK_CANCEL_UNCONFIRMED] Cancellation was not confirmed. Check the background task before retrying.' : '[TASK_CANCEL_UNCONFIRMED] 后台未确认取消，请检查任务状态，不要立即重复操作。', 'warn')
+    } catch (error) {
+      apiFailure('TASK_CANCEL_FAILED', error)
+    } finally {
       if (taskKind === 'source_align') bindingAbortRef.current?.abort()
       if (taskKind === 'update_check') updateAbortRef.current?.abort()
-    } catch (_) {
-      toast('取消请求发送失败', 'error')
+      cancelLockRef.current = false
     }
   }
 
   // 检查更新：显示逐项进度，完成后由用户勾选要更新的项目。
   const checkUpdates = async () => {
+    if (updateAbortRef.current && !checking) return
     if (checking) {
       await cancelLongTask('update_check')
       return
     }
     setChecking(true)
     setUpdateProgress({ completed: 0, total: mods.length, current: '' })
-    toast('检查更新中...')
+    toast(ui('检查更新中...', 'Checking for updates…'))
     const controller = new AbortController()
+    const scopeEpoch = scopeEpochRef.current
     updateAbortRef.current = controller
     let pollTimer = null
+    let polling = false
     const pollProgress = async () => {
+      if (polling || controller.signal.aborted) return
+      polling = true
       try {
-        const response = await fetch(`${api}/downloads/status`)
-        const state = await response.json()
-        if (state.task_kind !== 'update_check') return
+        const state = await requestLocalJson(`${api}/downloads/status`, {signal:controller.signal})
+        if (state.task_kind !== 'update_check' || scopeEpoch !== scopeEpochRef.current) return
         setUpdateProgress({
           completed: Number(state.completed_count) || 0,
           total: Number(state.total_count) || mods.length,
           current: state.current_item?.name || '',
         })
-      } catch (_) {}
+      } catch (_) {} finally { polling = false }
     }
     try {
       pollTimer = window.setInterval(pollProgress, 400)
-      const r = await fetch(api + '/tool/mod_update_check', {
+      const d = await requestLocalJson(api + '/tool/mod_update_check', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
         signal: controller.signal,
-      })
-      const d = await r.json()
-      const data = JSON.parse(d.result || '{}')
-      if (data.error) throw new Error(data.error)
-      if (data.cancelled) {
-        toast('检查更新已取消；已完成的来源绑定会保留')
+      }, {timeoutMs:120000})
+      if (scopeEpoch !== scopeEpochRef.current) return
+      let data
+      try { data = JSON.parse(d.result) } catch (_) { throw new LocalApiError('LOCAL_API_INVALID_RESPONSE') }
+      validateUpdateCheckResponse(data)
+      if (data.cancelled === true) {
+        toast(ui('检查更新已取消；已完成的来源绑定会保留', 'Update check cancelled; completed source bindings are kept.'))
         return
       }
-      const ups = data.updates_available || []
-      const map = {}
+      const ups = data.updates_available
+      const map = Object.create(null)
       ups.forEach(u => { map[String(u.mod_id)] = u.latest })
       setMods(prev => prev.map(m => ({ ...m, latest: map[String(m.id)] || null })))
       setUpdateProgress({
@@ -231,16 +302,17 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
       emitFeedback('notice', { source: 'update-check', count: ups.length })
       const failed = data.failed_checks?.length || 0
       const checked = (data.checked_nexus || 0) + (data.checked_thunderstore || 0)
-      if (failed) toast(`检查完成：${checked} 个成功，${failed} 个暂时无法查询${ups.length ? `，发现 ${ups.length} 个更新` : ''}`, 'error')
-      else toast(ups.length ? `检测到 ${ups.length} 个可更新项目，请勾选后执行` : `检查完成：${checked} 个已绑定 Mod 均为最新`)
+      if (failed) toast(ui(`检查完成：${checked} 个成功，${failed} 个暂时无法查询${ups.length ? `，发现 ${ups.length} 个更新` : ''}`, `Check finished: ${checked} succeeded, ${failed} unavailable${ups.length ? `; ${ups.length} updates found` : ''}. Unavailable sources have not been verified.`), 'error')
+      else toast(ups.length ? ui(`检测到 ${ups.length} 个可更新项目，请勾选后执行`, `${ups.length} update candidates found. Select and confirm before updating.`) : (checked ? ui(`检查完成：${checked} 个已绑定 Mod 未发现更新（仅限已查询来源）`, `No updates found for ${checked} bound Mods, limited to the sources checked.`) : ui('本次没有成功查询到可检查更新的来源，不能据此判断所有 Mod 已是最新。', 'No update sources were successfully checked. This does not mean all Mods are up to date.')))
     } catch (error) {
       if (error?.name === 'AbortError') {
-        toast('检查更新已取消')
+        toast(language === 'en' ? 'Stopped waiting for update results. Background cancellation depends on its confirmation.' : '已停止等待更新结果；后台是否取消请以取消回执为准。')
         return
       }
       emitFeedback('error', { source: 'update-check' })
-      toast(error?.message || '检查更新失败', 'error')
+      apiFailure('MOD_UPDATE_CHECK_UNCONFIRMED', error)
     } finally {
+      controller.abort()
       if (pollTimer) window.clearInterval(pollTimer)
       updateAbortRef.current = null
       setChecking(false)
@@ -252,38 +324,40 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
     const targets = (updateReview?.updates || []).filter(
       item => updateSelected.has(String(item.mod_id))
     )
-    if (!targets.length || updatingSelected) return
+    if (!targets.length || updateWriteLockRef.current) return
+    updateWriteLockRef.current = true
+    const scopeEpoch = scopeEpochRef.current
     setUpdatingSelected(true)
     const succeeded = []
     const failed = []
     for (const item of targets) {
+      if (scopeEpoch !== scopeEpochRef.current) break
       try {
-        const response = await fetch(api + '/tool/mod_update', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mod_id: String(item.mod_id) }),
-        })
-        const envelope = await response.json()
-        const result = JSON.parse(envelope.result || '{}')
-        if (result.error) throw new Error(result.error)
+        const result = await updateMod(api, item.mod_id, language)
+        if (!result.ok) { failed.push({name:item.name,error:result.message}); toast(result.message,'error'); break }
         succeeded.push(item.name)
+        if (result.warning) toast(result.warning, 'info')
       } catch (error) {
-        failed.push({ name: item.name, error: error?.message || '更新失败' })
+        failed.push({ name: item.name, error: updateFailure(error, language) })
+        toast(updateFailure(error, language), 'error')
+        break // An uncertain write must not be followed by more writes.
       }
     }
+    updateWriteLockRef.current = false
     setUpdatingSelected(false)
     setUpdateReview(null)
     setUpdateSelected(new Set())
-    await loadFromApi()
-    onRefresh?.()
+    if (scopeEpoch === scopeEpochRef.current) { await loadFromApi(); onRefresh?.() }
     if (failed.length) {
-      toast(`更新完成：成功 ${succeeded.length}，失败 ${failed.length}（${failed.slice(0, 3).map(item => item.name).join('、')}）`, 'error')
+      toast(ui(`更新已停止：已确认成功 ${succeeded.length}，失败或未确认 ${failed.length}，未执行 ${targets.length-succeeded.length-failed.length}`, `Updates stopped: ${succeeded.length} confirmed, ${failed.length} failed or unconfirmed, ${targets.length-succeeded.length-failed.length} not started.`), 'error')
     } else {
-      toast(`已更新 ${succeeded.length} 个 Mod`)
+      toast(ui(`已确认更新 ${succeeded.length} 个 Mod${succeeded.length < targets.length ? `；切换游戏后停止后续 ${targets.length-succeeded.length} 项` : ''}`, `Confirmed updates: ${succeeded.length} Mods${succeeded.length < targets.length ? `; ${targets.length-succeeded.length} not started after switching games` : ''}.`))
     }
   }
 
   const runAlignment = async (targetMods = null, forceRebind = false) => {
+    if (bindingAbortRef.current) return
+    const scopeEpoch = scopeEpochRef.current
     const targets = Array.isArray(targetMods)
       ? targetMods
       : mods.filter(mod => !mod.hasVerifiedSource)
@@ -299,21 +373,23 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
       ? `正在单独对齐 ${targets[0]?.name || '该 Mod'}…`
       : `正在对齐 ${targets.length} 个尚未绑定的 Mod…`)
     let pollTimer = null
+    let polling = false
     const pollProgress = async () => {
+      if (polling || controller.signal.aborted) return
+      polling = true
       try {
-        const response = await fetch(`${api}/downloads/status`)
-        const state = await response.json()
-        if (state.task_kind !== 'source_align') return
+        const state = await requestLocalJson(`${api}/downloads/status`, {signal:controller.signal})
+        if (state.task_kind !== 'source_align' || scopeEpoch !== scopeEpochRef.current) return
         setBindingProgress({
           completed: Number(state.completed_count) || 0,
           total: Number(state.total_count) || targets.length,
           current: state.current_item?.name || '',
         })
-      } catch (_) {}
+      } catch (_) {} finally { polling = false }
     }
     try {
       pollTimer = window.setInterval(pollProgress, 400)
-      const response = await fetch(api + '/tool/mod_source_align', {
+      const envelope = await requestLocalJson(api + '/tool/mod_source_align', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           force_refresh: false,
@@ -321,15 +397,18 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
           mod_ids: targetMods ? targets.map(mod => String(mod.id)) : [],
         }),
         signal: controller.signal,
-      })
-      const envelope = await response.json()
-      const result = JSON.parse(envelope.result || '{}')
-      if (result.error) throw new Error(result.error)
+      }, {timeoutMs:120000})
+      if (scopeEpoch !== scopeEpochRef.current) return
+      let result
+      try { result = JSON.parse(envelope.result) } catch (_) { throw new LocalApiError('LOCAL_API_INVALID_RESPONSE') }
+      if (!result || result.error) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
       if (result.cancelled) {
-        toast('来源对齐已取消；此前成功绑定的项目已保留')
+        toast(language === 'en' ? 'Stopped waiting for alignment. Existing bindings remain; background cancellation depends on its confirmation.' : '已停止等待来源对齐；已有绑定保留，后台是否取消请以取消回执为准。')
         return
       }
-      const summary = result.summary || {}
+      if (!result.summary || !Number.isInteger(result.attempted) || result.attempted < 0
+        || !Array.isArray(result.ambiguous) || !Array.isArray(result.unmatched)) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      const summary = result.summary
       const attempted = Number(result.attempted) || targets.length
       setBindingProgress({ completed: attempted, total: attempted, current: '' })
       emitFeedback('notice', { source: 'source-align', count: summary.bound || 0 })
@@ -348,12 +427,13 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
       onRefresh?.()
     } catch (error) {
       if (error?.name === 'AbortError') {
-        toast('来源对齐已取消；此前成功绑定的项目已保留')
+        toast(language === 'en' ? 'Stopped waiting for alignment. Existing bindings remain; background cancellation depends on its confirmation.' : '已停止等待来源对齐；已有绑定保留，后台是否取消请以取消回执为准。')
         return
       }
       emitFeedback('error', { source: 'source-align' })
-      toast(error?.message || '来源绑定失败，已保留此前完成的绑定', 'error')
+      apiFailure('MOD_ALIGNMENT_UNCONFIRMED', error)
     } finally {
+      controller.abort()
       if (pollTimer) window.clearInterval(pollTimer)
       bindingAbortRef.current = null
       setBinding(false)
@@ -368,10 +448,10 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
 
   const confirmAlignmentCandidate = async (item, candidate) => {
     const lockId = `align:${item.mod_id}`
-    if (actionLock) return
+    if (actionLock || managementLockRef.current) return
+    managementLockRef.current = true
     setActionLock(lockId)
-    const controller = new AbortController()
-    const timeoutId = window.setTimeout(() => controller.abort(), 30000)
+    const scopeEpoch = scopeEpochRef.current
     try {
       const body = {
         local_mod_id: String(item.mod_id),
@@ -383,15 +463,12 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
         confirmed: true,
       }
       if (candidate.source === 'nexus') body.nexus_mod_id = Number(candidate.source_key)
-      const response = await fetch(api + '/tool/mod_source_bind', {
+      const envelope = await requestLocalJson(api + '/tool/mod_source_bind', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: controller.signal,
-      })
-      if (!response.ok) throw new Error(`来源绑定请求失败 (${response.status})`)
-      const envelope = await response.json()
-      const result = JSON.parse(envelope.result || '{}')
-      if (result.error || !result.bound) throw new Error(result.error || '绑定失败')
+      }, {timeoutMs:30000})
+      if (scopeEpoch !== scopeEpochRef.current) return
+      validateSourceReceipt(envelope, item.mod_id, candidate, true)
       const remainingItems = (alignmentReview?.items || []).filter(
         row => String(row.mod_id) !== String(item.mod_id),
       )
@@ -406,52 +483,32 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
         delete next[item.mod_id]
         return next
       })
-      toast(`${item.name} 已确认绑定到 ${candidate.name || candidate.source_key}`)
+      toast(ui(`${item.name} 已确认绑定到 ${candidate.name || candidate.source_key}`, `${item.name} linked to ${candidate.name || candidate.source_key}`))
       await loadFromApi()
       onRefresh?.()
     } catch (error) {
-      const message = error?.name === 'AbortError'
-        ? '来源确认超过 30 秒，已停止等待；此前确认项不会丢失，请稍后重试'
-        : (error?.message || '确认绑定失败')
-      toast(message, 'error')
+      if (scopeEpoch === scopeEpochRef.current) apiFailure('MOD_SOURCE_BIND_UNCONFIRMED',error)
     } finally {
-      window.clearTimeout(timeoutId)
+      managementLockRef.current = false
       setActionLock(null)
     }
   }
 
-  const parseManualSourceUrl = (rawUrl) => {
-    let url
-    try { url = new URL(String(rawUrl || '').trim()) } catch (_) { return null }
-    const host = url.hostname.toLowerCase()
-    const path = url.pathname
-    const nexus = path.match(/\/mods\/(\d+)/i)
-    if (host.endsWith('nexusmods.com') && nexus) {
-      return { source: 'nexus', source_key: nexus[1], source_url: url.href }
-    }
-    const thunder = path.match(/\/c\/[^/]+\/p\/([^/]+)\/([^/?#]+)/i)
-    if (host.endsWith('thunderstore.io') && thunder) {
-      return {
-        source: 'thunderstore',
-        source_key: `${decodeURIComponent(thunder[1])}-${decodeURIComponent(thunder[2])}`,
-        source_url: url.href,
-      }
-    }
-    return null
-  }
-
   const inspectManualSource = async (item) => {
+    const scopeEpoch = scopeEpochRef.current
     const rawUrl = String(manualSource[item.mod_id] || '').trim()
     const parsed = parseManualSourceUrl(rawUrl)
     if (!parsed) {
-      toast('请粘贴 Nexus 或 Thunderstore 的具体 Mod 维护页网址', 'error')
+      toast(ui('请粘贴 Nexus 或 Thunderstore 的具体 Mod 维护页网址', 'Paste an HTTPS Nexus or Thunderstore Mod page URL.'), 'error')
       return
     }
     const lockId = `manual-source:${item.mod_id}`
-    if (actionLock) return
+    if (actionLock || managementLockRef.current) return
+    managementLockRef.current = true
+    setManualSourcePreview(previous => { const next={...previous};delete next[item.mod_id];return next })
     setActionLock(lockId)
     try {
-      const response = await fetch(api + '/tool/mod_source_bind', {
+      const envelope = await requestLocalJson(api + '/tool/mod_source_bind', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           local_mod_id: String(item.mod_id),
@@ -459,26 +516,24 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
           nexus_mod_id: parsed.source === 'nexus' ? Number(parsed.source_key) : undefined,
           confirmed: false,
         }),
-      })
-      const envelope = await response.json()
-      const result = JSON.parse(envelope.result || '{}')
-      if (result.error || !result.requires_confirmation) {
-        throw new Error(result.error || '网址未能通过来源核验')
-      }
+      }, {timeoutMs:30000})
+      if (scopeEpoch !== scopeEpochRef.current) return
+      const result = validateSourceReceipt(envelope, item.mod_id, parsed)
       setManualSourcePreview(previous => ({ ...previous, [item.mod_id]: {
-        ...parsed, preview: result.preview || {},
+        ...parsed, preview: result.preview || {}, verifiedInput:rawUrl, scopeEpoch,
       }}))
-      toast('网址已核验，请确认是否绑定到当前 Mod')
+      toast(ui('来源预览已取得，请核对它是否与本地 Mod 相同，再确认绑定。', 'Source preview received. Check that it matches your local Mod before confirming the link.'))
     } catch (error) {
-      toast(error?.message || '网址核验失败', 'error')
+      if (scopeEpoch === scopeEpochRef.current) apiFailure('MOD_SOURCE_PREVIEW_FAILED',error)
     } finally {
+      managementLockRef.current = false
       setActionLock(null)
     }
   }
 
   const confirmManualSource = async (item) => {
     const candidate = manualSourcePreview[item.mod_id]
-    if (!candidate) return
+    if (!candidate || candidate.scopeEpoch !== scopeEpochRef.current || candidate.verifiedInput !== String(manualSource[item.mod_id] || '').trim()) return
     await confirmAlignmentCandidate(item, {
       source: candidate.source,
       source_key: candidate.source_key,
@@ -491,33 +546,74 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
   // 下载新 Mod：粘贴 GitHub/Thunderstore/GameBanana 链接 → 下载（+可选安装）
   const doDownload = async () => {
     const url = dlUrl.trim()
-    if (!url) return
+    if (!url || downloadLockRef.current) return
+    downloadLockRef.current = true
+    const epoch = scopeEpochRef.current
     setDlBusy(true)
+    setDownloadReview(null)
     try {
-      const r = await fetch(api + '/tool/download_from_url', {
+      const d = await requestLocalJson(api + '/tool/download_from_url', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }),
-      })
-      const d = await r.json()
-      const data = JSON.parse(d.result || '{}')
-      if (data.error) { emitFeedback('error', { source: 'download' }); toast(friendlyErr(data.error), 'error'); setDlBusy(false); return }
-      if (data.already_installed) {
+      }, {timeoutMs:120000})
+      if (epoch !== scopeEpochRef.current) return
+      let data
+      try { data = JSON.parse(d.result) } catch (_) { throw new LocalApiError('LOCAL_API_INVALID_RESPONSE') }
+      if (!data || data.error) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      if (data.already_installed === true) {
         emitFeedback('notice', { source: 'download-dedup', name: data.name || '' })
         toast(`${data.name || '该 Mod'} 已安装，已跳过重复下载`)
         setShowDownload(false); setDlUrl(''); setDlBusy(false); loadFromApi(); onRefresh?.(); return
       }
-      toast(`已下载 ${data.name || ''}，正在安装...`)
-      emitFeedback('install-start', { source: 'direct-install', name: data.name || '' })
-      const r2 = await fetch(api + '/tool/mod_install', {
+      if (typeof data.local_path !== 'string' || !data.local_path.trim()) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      const checked = await requestLocalJson(api + '/tool/conflict_check', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ local_path: data.local_path }),
-      })
-      const d2 = await r2.json()
-      const data2 = JSON.parse(d2.result || '{}')
-      if (data2.error) { emitFeedback('error', { source: 'install' }); toast(friendlyErr(data2.error), 'error') }
-      else { emitFeedback('install-complete', { name: data.name || '' }); toast(`已安装 ${data.name || ''}（${(data2.files_installed || []).length} 文件）`); loadFromApi(); onRefresh?.() }
-      setShowDownload(false); setDlUrl('')
-    } catch (_) { emitFeedback('error', { source: 'download' }); toast('下载失败', 'error') }
-    setDlBusy(false)
+      }, {timeoutMs:120000})
+      if (epoch !== scopeEpochRef.current) return
+      let report
+      try { report = JSON.parse(checked.result) } catch (_) { throw new LocalApiError('LOCAL_API_INVALID_RESPONSE') }
+      if (!report || report.error || !Array.isArray(report.archive_contents) || !Array.isArray(report.conflicts)) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      setDownloadReview({url,path:data.local_path,name:data.name || '',report,epoch,
+        ready:report.safe_to_install === true && report.incoming_files_count > 0 && report.conflicts.length === 0})
+      toast(language === 'en' ? 'Download and file preview ready. Nothing has been installed.' : '下载与文件预览已完成，尚未安装。')
+    } catch (error) { emitFeedback('error', { source: 'download' }); apiFailure('DIRECT_DOWNLOAD_UNCONFIRMED', error) }
+    finally { downloadLockRef.current = false; setDlBusy(false) }
+  }
+
+  const confirmDirectInstall = async () => {
+    const review = downloadReview
+    if (downloadLockRef.current || !review?.ready || review.epoch !== scopeEpochRef.current || review.url !== dlUrl.trim()) return
+    downloadLockRef.current = true; setDlBusy(true)
+    try {
+      const envelope = await requestLocalJson(api + '/tool/mod_install', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({local_path:review.path,require_verified_preflight:true,compatibility_confirmed:review.compatibilityRisk === true}),
+      }, {timeoutMs:120000})
+      if (review.epoch !== scopeEpochRef.current) return
+      let result
+      try { result = JSON.parse(envelope.result) } catch (_) { throw new LocalApiError('LOCAL_API_INVALID_RESPONSE') }
+      if (!result) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
+      if (result.requires_confirmation && result.compatibility_confirmation_required && !result.error && !result.install_blocked) {
+        setDownloadReview({...review,fileReport:review.fileReport || review.report,compatibilityRisk:true,report:result})
+        return
+      }
+      if (result.error || result.install_blocked || result.requires_confirmation || !Array.isArray(result.files_installed)
+        || !result.files_installed.length || typeof result.snapshot_id !== 'string' || !result.snapshot_id
+        || result.warnings?.length) {
+        setDownloadReview({...review,fileReport:review.fileReport || review.report,ready:false,report:result})
+        toast(language === 'en' ? '[DIRECT_INSTALL_NOT_COMPLETE] Installation was not confirmed complete. Review the report; use Chat for missing prerequisites or a custom installation plan.' : '[DIRECT_INSTALL_NOT_COMPLETE] 未确认安装完整成功。请检查报告；缺少前置或需要自定义安装方案时，请到对话页继续处理。','error')
+        return
+      }
+      emitFeedback('install-complete',{name:review.name})
+      toast(language === 'en' ? `Installed ${result.files_installed.length} files; in-game behavior is not verified.` : `已安装 ${result.files_installed.length} 个文件；游戏内效果尚未验证。`)
+      if (result.cache_cleanup?.status === 'unconfirmed') {
+        toast(language === 'en' ? '[ARCHIVE_CLEANUP_UNCONFIRMED] Installation completed, but cache cleanup is unconfirmed. Check the cache later; do not reinstall.' : '[ARCHIVE_CLEANUP_UNCONFIRMED] 安装已完成，但缓存清理未确认。可稍后检查缓存，不要重复安装。', 'info')
+      }
+      setShowDownload(false); setDlUrl(''); setDownloadReview(null); loadFromApi(); onRefresh?.()
+    } catch (error) {
+      setDownloadReview(null)
+      apiFailure('DIRECT_INSTALL_UNCONFIRMED',error)
+    } finally { downloadLockRef.current=false;setDlBusy(false) }
   }
 
   const friendlyErr = (raw) => {
@@ -565,16 +661,18 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
   }
 
   const confirmPackageMerge = async () => {
-    if (!packageMerge || packageMerging) return
+    if (!packageMerge || packageMergeLockRef.current) return
     const name = String(packageMerge.name || '').trim()
     if (!name) {
       toast('请为合并后的 Mod 包填写名称', 'error')
       return
     }
+    packageMergeLockRef.current = true
     setPackageMerging(true)
+    const scopeEpoch = scopeEpochRef.current
     try {
       const scope = status?.game_instance_id || status?.game_slug || ''
-      const response = await fetch(`${api}/mods/package-merge`, {
+      const result = await requestLocalJson(`${api}/mods/package-merge`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           mod_ids: packageMerge.items.map(item => item.id),
@@ -582,16 +680,17 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
           game_slug: scope,
         }),
       })
-      const result = await response.json()
-      if (!response.ok || !result.ok) throw new Error(result.detail || result.error || 'package_merge_failed')
+      if (scopeEpoch !== scopeEpochRef.current) return
+      if (result?.ok !== true || typeof result.name !== 'string' || !Number.isInteger(result.file_count)) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
       setSelected(new Set())
       setPackageMerge(null)
       await loadFromApi()
       onRefresh?.()
       toast(`已合并为“${result.name}”：${result.file_count} 个文件；未改动游戏文件`)
     } catch (error) {
-      toast('合并记录失败：' + (error?.message || '请稍后重试'), 'error')
+      apiFailure('MOD_PACKAGE_MERGE_UNCONFIRMED',error)
     } finally {
+      packageMergeLockRef.current = false
       setPackageMerging(false)
     }
   }
@@ -602,124 +701,140 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
   }
 
   const handleDelete = async (mod) => {
+    if (managementLockRef.current) return
+    managementLockRef.current = true
+    const epoch = scopeEpochRef.current
     // 先向后端拿卸载预览(不带 confirmed)——确认前就展示影响(将删文件数/是否退订/依赖警告)
     try {
-      const r = await fetch(api + '/tool/mod_uninstall', {
+      const d = await requestLocalJson(api + '/tool/mod_uninstall', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mod_id: mod.id })
       })
-      const d = await r.json()
-      const preview = JSON.parse(d.result || '{}')
-      if (!r.ok || preview.error || preview.requires_confirmation !== true) throw new Error(preview.error || '无法取得卸载预览')
-      setShowDeleteConfirm({ ...mod, preview })
+      if (epoch !== scopeEpochRef.current) return
+      let preview
+      try { preview = JSON.parse(d.result) } catch (_) { throw new LocalApiError('LOCAL_API_INVALID_RESPONSE') }
+      validateUninstallPreview(preview, mod.id)
+      setShowDeleteConfirm({ ...mod, preview, epoch })
     } catch (e) {
       setShowDeleteConfirm(null)
-      toast(friendlyErr(e?.message || '卸载预览失败，未执行删除'), 'error')
-    }
+      apiFailure('MOD_UNINSTALL_PREVIEW_FAILED',e)
+    } finally { managementLockRef.current = false }
   }
 
   const confirmDelete = async () => {
     const mod = showDeleteConfirm
+    if (!mod || mod.epoch !== scopeEpochRef.current || managementLockRef.current) return
+    managementLockRef.current = true
     setShowDeleteConfirm(null)
     setActionLock(mod.id)
-    toast('卸载中...')
+    toast(ui('卸载中...', 'Uninstalling…'))
     try {
-      const r = await fetch(api + '/tool/mod_uninstall', {
+      const d = await requestLocalJson(api + '/tool/mod_uninstall', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mod_id: mod.id, confirmed: true })
-      })
-      const d = await r.json()
+      }, {timeoutMs:120000})
       const data = JSON.parse(d.result || '{}')
       const outcome = uninstallOutcome(data, language)
-      if (!r.ok || !outcome.complete) {
+      if (!outcome.complete) {
         emitFeedback('error', { source: 'uninstall' })
         toast(outcome.message, 'error')
-        loadFromApi()
-        onRefresh?.()
+        if (mod.epoch === scopeEpochRef.current) { loadFromApi(); onRefresh?.() }
       }
       else {
         emitFeedback('remove-complete', { modId: mod.id, name: mod.name })
-        toast(`${mod.name || mod.id} 已卸载 (${data.removed || 0} 个文件)`)
-        loadFromApi()
-        onRefresh?.()
-        if (data.dependents_warned?.length) toast(`警告: ${data.dependents_warned.join(', ')} 依赖此 Mod`, 'warn')
+        toast(data.unsubscribed === true
+          ? ui(`${mod.name || mod.id} 已退订；文件移除由 Steam 管理`, `${mod.name || mod.id} unsubscribed; Steam manages file removal.`)
+          : ui(`${mod.name || mod.id} 已卸载 (${data.removed || 0} 个文件)`, `${mod.name || mod.id} uninstalled (${data.removed || 0} files)`))
+        if (mod.epoch === scopeEpochRef.current) { loadFromApi(); onRefresh?.() }
+        if (data.dependents_warned?.length) toast(ui(`警告: ${data.dependents_warned.join(', ')} 依赖此 Mod`, `Warning: ${data.dependents_warned.join(', ')} depend on this Mod.`), 'warn')
       }
-    } catch (e) { emitFeedback('error', { source: 'uninstall' }); toast('卸载失败', 'error') }
-    setActionLock(null)
+    } catch (error) { emitFeedback('error', { source: 'uninstall' }); apiFailure('MOD_UNINSTALL_UNCONFIRMED', error) }
+    finally { managementLockRef.current = false; setActionLock(null) }
   }
 
   const toggleMod = async (mod, confirmed = false, confirmationToken = '') => {
+    if (managementLockRef.current) return
+    managementLockRef.current = true
+    const epoch = scopeEpochRef.current
     const enabling = !!mod.disabled
     const action = enabling ? 'mod_enable' : 'mod_disable'
     setActionLock(mod.id)
-    if (!confirmed) toast(`${enabling ? '检查启用条件' : '检查依赖影响'}：${mod.name}...`)
+    if (!confirmed) toast(`${enabling ? ui('检查启用条件', 'Checking enable requirements') : ui('检查依赖影响', 'Checking dependency impact')}: ${mod.name}...`)
     try {
-      const r = await fetch(api + '/tool/' + action, {
+      const d = await requestLocalJson(api + '/tool/' + action, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           mod_id: mod.id,
           ...(confirmed ? { confirmed: true, confirmation_token: confirmationToken } : {}),
         })
-      })
-      const d = await r.json()
-      const data = JSON.parse(d.result || '{}')
+      }, {timeoutMs:120000})
+      if (epoch !== scopeEpochRef.current) return
+      let data
+      try { data = JSON.parse(d.result) } catch (_) { throw new LocalApiError('LOCAL_API_INVALID_RESPONSE') }
+      if (!data) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
       if (data.error) {
         emitFeedback('error', { source: action })
         toast(friendlyErr(data.error), 'error')
       } else if (data.blocked || data.requires_confirmation || data.requires_external_manager) {
-        setDependencyGate({ mod, action, enabling, data })
+        validateTogglePreview(data, mod.id, enabling)
+        setDependencyGate({ mod, action, enabling, data, epoch })
         emitFeedback(data.blocked || !enabling ? 'warning' : 'notice', {
           source: 'dependency-gate', modId: mod.id,
           count: (data.dependencies || data.dependents || data.missing_dependencies || []).length,
         })
       } else {
+        validateToggleReceipt(data, mod.id, enabling)
         const affected = (data.enabled_mods || data.disabled_mods || []).length
         emitFeedback(enabling ? 'enable' : 'disable', { source: action, modId: mod.id, count: affected })
-        toast(`${mod.name} 已${enabling ? '启用' : '禁用'}${affected > 1 ? `，共处理 ${affected} 个 Mod` : ''}`)
+        toast(ui(`${mod.name} 已${enabling ? '启用' : '禁用'}${affected > 1 ? `，共处理 ${affected} 个 Mod` : ''}`, `${mod.name} ${enabling ? 'enabled' : 'disabled'}${affected > 1 ? `; ${affected} Mods processed` : ''}`))
         await loadFromApi()
         onRefresh?.()
       }
     } catch (e) {
+      if (epoch !== scopeEpochRef.current) return
       emitFeedback('error', { source: action })
-      toast('操作失败', 'error')
+      apiFailure('MOD_TOGGLE_UNCONFIRMED',e)
     }
-    setActionLock(null)
+    finally { managementLockRef.current=false;setActionLock(null) }
   }
 
   const confirmDependencyToggle = async () => {
     const gate = dependencyGate
-    if (!gate || gate.data.blocked) return
+    if (!gate || gate.data.blocked || gate.data.requires_external_manager || gate.data.requires_confirmation !== true || gate.epoch !== scopeEpochRef.current) return
     setDependencyGate(null)
     await toggleMod(gate.mod, true, gate.data.confirmation_token || '')
   }
 
   const previewBatchDelete = async () => {
     const targets = mods.filter(mod => selected.has(mod.id))
-    if (!targets.length || batchBusy) return
+    if (!targets.length || batchBusy || managementLockRef.current) return
+    managementLockRef.current = true
+    const epoch = scopeEpochRef.current
     setBatchBusy(true)
     setBatchProgress({ phase: 'preview', completed: 0, total: targets.length, current: '' })
-    toast(`正在核对 ${targets.length} 个 Mod 的卸载影响...`)
+    toast(ui(`正在核对 ${targets.length} 个 Mod 的卸载影响...`, `Reviewing uninstall impact for ${targets.length} Mods…`))
     try {
       const items = []
       for (let index = 0; index < targets.length; index += 1) {
         const mod = targets[index]
         setBatchProgress({ phase: 'preview', completed: index, total: targets.length, current: mod.name })
-        const r = await fetch(api + '/tool/mod_uninstall', {
+        const d = await requestLocalJson(api + '/tool/mod_uninstall', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ mod_id: mod.id }),
         })
-        const d = await r.json()
+        if (epoch !== scopeEpochRef.current) return
         const preview = JSON.parse(d.result || '{}')
-        if (!r.ok || preview.error || preview.requires_confirmation !== true) throw new Error(preview.error || `无法预览 ${mod.name}`)
+        validateUninstallPreview(preview, mod.id)
         items.push({ mod, preview })
         setBatchProgress({ phase: 'preview', completed: index + 1, total: targets.length, current: mod.name })
       }
-      setBatchDelete({ items })
+      setBatchDelete({ items, epoch })
       emitFeedback('warning', { source: 'batch-uninstall-preview', count: items.length })
     } catch (error) {
       emitFeedback('error', { source: 'batch-uninstall-preview' })
-      toast(friendlyErr(error?.message || '批量卸载预览失败'), 'error')
+      apiFailure('BATCH_UNINSTALL_PREVIEW_FAILED', error)
     } finally {
+      managementLockRef.current = false
       setBatchBusy(false)
       setBatchProgress(null)
     }
@@ -727,60 +842,65 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
 
   const confirmBatchDelete = async () => {
     const plan = batchDelete
-    if (!plan || batchBusy) return
+    if (!plan || batchBusy || managementLockRef.current || plan.epoch !== scopeEpochRef.current) return
+    managementLockRef.current = true
     setBatchDelete(null)
     setBatchBusy(true)
     const succeeded = []
     const failed = []
     let snapshotId = ''
     try {
-      setBatchProgress({ phase: 'snapshot', completed: 0, total: plan.items.length, current: '正在创建批量删除前安全快照' })
-      const snapshotResponse = await fetch(api + '/tool/snapshot_create', {
+      setBatchProgress({ phase: 'snapshot', completed: 0, total: plan.items.length, current: '' })
+      const snapshotEnvelope = await requestLocalJson(api + '/tool/snapshot_create', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ trigger_mod_name: `批量删除 ${plan.items.length} 个 Mod 前` }),
-      })
-      const snapshotEnvelope = await snapshotResponse.json()
+      }, {timeoutMs:120000})
       const snapshotData = JSON.parse(snapshotEnvelope.result || '{}')
-      if (snapshotData.error || !snapshotData.snapshot_id) throw new Error(snapshotData.error || '无法创建批量删除前安全快照')
+      if (!snapshotData || snapshotData.error || typeof snapshotData.snapshot_id !== 'string' || !snapshotData.snapshot_id.trim()) throw new LocalApiError('LOCAL_API_INVALID_RESPONSE')
       snapshotId = snapshotData.snapshot_id
     } catch (error) {
       setBatchBusy(false)
       setBatchProgress(null)
       emitFeedback('error', { source: 'batch-uninstall-snapshot' })
-      toast(friendlyErr(error?.message || '无法创建批量删除前安全快照，已取消删除'), 'error')
+      apiFailure('BATCH_UNINSTALL_SNAPSHOT_UNCONFIRMED', error)
+      managementLockRef.current = false
       return
     }
     for (let index = 0; index < plan.items.length; index += 1) {
+      if (plan.epoch !== scopeEpochRef.current) break
       const item = plan.items[index]
       setBatchProgress({ phase: 'delete', completed: index, total: plan.items.length, current: item.mod.name, succeeded: succeeded.length, failed: failed.length })
       try {
-        const r = await fetch(api + '/tool/mod_uninstall', {
+        const d = await requestLocalJson(api + '/tool/mod_uninstall', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ mod_id: item.mod.id, confirmed: true, snapshot_id: snapshotId }),
-        })
-        const d = await r.json()
+        }, {timeoutMs:120000})
         const data = JSON.parse(d.result || '{}')
-        if (!r.ok || !uninstallOutcome(data, language).complete) failed.push(item.mod.name)
+        const outcome = uninstallOutcome(data, language)
+        if (!outcome.complete) { failed.push(item.mod.name); toast(outcome.message, 'error'); break }
         else succeeded.push(item.mod.id)
-      } catch (_) {
+      } catch (error) {
         failed.push(item.mod.name)
+        apiFailure('BATCH_UNINSTALL_UNCONFIRMED',error)
+        break
       }
       setBatchProgress({ phase: 'delete', completed: index + 1, total: plan.items.length, current: item.mod.name, succeeded: succeeded.length, failed: failed.length })
     }
     if (succeeded.length) {
       emitFeedback('remove-complete', { source: 'batch-uninstall', count: succeeded.length })
-      setSelected(prev => new Set([...prev].filter(id => !succeeded.includes(id))))
+      if (plan.epoch === scopeEpochRef.current) setSelected(prev => new Set([...prev].filter(id => !succeeded.includes(id))))
     }
     // A partial removal may change files without removing its management row.
     // Refresh for every outcome, while leaving failed targets selected.
-    await loadFromApi()
-    onRefresh?.()
+    if (plan.epoch === scopeEpochRef.current) { await loadFromApi(); onRefresh?.() }
+    const notStarted = plan.items.length - succeeded.length - failed.length
     if (failed.length) {
       emitFeedback('error', { source: 'batch-uninstall', count: failed.length })
-      toast(`已卸载 ${succeeded.length} 个；${failed.length} 个失败：${failed.slice(0, 3).join('、')}`, 'error')
+      toast(ui(`已卸载 ${succeeded.length} 个；${failed.length} 个失败或未确认：${failed.slice(0, 3).join('、')}；${notStarted} 个未执行`, `Uninstalled ${succeeded.length}; ${failed.length} failed or unconfirmed: ${failed.slice(0, 3).join(', ')}; ${notStarted} not started.`), 'error')
     } else {
-      toast(`已卸载 ${succeeded.length} 个 Mod`)
+      toast(ui(`已卸载 ${succeeded.length} 个 Mod${notStarted ? `；${notStarted} 个因切换游戏未执行` : ''}`, `Uninstalled ${succeeded.length} Mods${notStarted ? `; ${notStarted} not started after switching games` : ''}.`))
     }
+    managementLockRef.current = false
     setBatchBusy(false)
     setBatchProgress(null)
   }
@@ -840,11 +960,11 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
               className={`btn-ghost flex items-center gap-1 ${checking ? 'text-cyber-red' : ''}`}
               onClick={checkUpdates}
               disabled={binding}
-              title={checking ? '取消本轮更新检查' : '逐项检查版本，完成后勾选需要更新的项目'}
+              title={checking ? ui('取消本轮更新检查', 'Cancel this update check') : ui('逐项检查版本，完成后勾选需要更新的项目', 'Check versions, then select updates to apply')}
             >
               {checking ? <XCircle size={14} /> : <RefreshCw size={14} />}
               {checking
-                ? `取消检查 ${updateProgress?.completed || 0}/${updateProgress?.total || mods.length}`
+                ? `${ui('取消检查', 'Cancel check')} ${updateProgress?.completed || 0}/${updateProgress?.total || mods.length}`
                 : t('checkUpdates')}
             </button>
             <button
@@ -874,37 +994,19 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
             <button className="btn-cyber flex items-center gap-1.5" onClick={() => setShowDownload(true)}>
               <Download size={14} /> {t('downloadNewMod')}
             </button>
-            <button className="btn-ghost flex items-center gap-1" title="打开投放文件夹：把手动下载的 mod(三宫六院/3DM/网盘等)拖进去，再让 ModAgent 扫描安装"
-              onClick={async () => {
-                try {
-                  const r = await fetch(api + '/dropbox/open', { method: 'POST' })
-                  const d = await r.json()
-                  if (d.ok) { emitFeedback('notice', { source: 'dropbox' }); toast('已打开投放文件夹，把下载好的 mod 拖进去，再让 ModAgent 扫描安装') }
-                  else { emitFeedback('error', { source: 'dropbox' }); toast('打开失败: ' + (d.error || ''), 'error') }
-                } catch (e) { emitFeedback('error', { source: 'dropbox' }); toast('打开失败', 'error') }
-              }}>
+            <button className="btn-ghost flex items-center gap-1" disabled={folderBusy}
+              title={ui('打开投放目录，放入手动下载的 Mod 后再扫描', 'Open the drop folder for manually downloaded Mods; scan after adding files.')} data-folder-kind="dropbox"
+              onClick={() => openManagedFolder('dropbox')}>
               <FolderInput size={14} /> {t('dropFolder')}
             </button>
-            <button className="btn-ghost flex items-center gap-1" title="打开 ModAgent 为当前游戏保存下载包的目录"
-              onClick={async () => {
-                try {
-                  const r = await fetch(api + '/downloads/open', { method: 'POST' })
-                  const d = await r.json()
-                  if (d.ok) { emitFeedback('notice', { source: 'downloads' }); toast('已打开 Mod 文件夹') }
-                  else { emitFeedback('error', { source: 'downloads' }); toast('打开失败: ' + (d.error || ''), 'error') }
-                } catch (e) { emitFeedback('error', { source: 'downloads' }); toast('打开失败', 'error') }
-              }}>
+            <button className="btn-ghost flex items-center gap-1" disabled={folderBusy}
+              title={ui('打开当前游戏下载包目录', 'Open the managed download folder for the current game.')} data-folder-kind="downloads"
+              onClick={() => openManagedFolder('downloads')}>
               <FolderInput size={14} /> {t('modFolder')}
             </button>
-            <button className="btn-ghost flex items-center gap-1" title="打开独立 Mod 管理器、加载器等工具的受控解压目录"
-              onClick={async () => {
-                try {
-                  const r = await fetch(api + '/tools/open', { method: 'POST' })
-                  const d = await r.json()
-                  if (d.ok) { emitFeedback('notice', { source: 'tools' }); toast('已打开工具目录') }
-                  else { emitFeedback('error', { source: 'tools' }); toast('打开失败: ' + (d.error || ''), 'error') }
-                } catch (e) { emitFeedback('error', { source: 'tools' }); toast('打开失败', 'error') }
-              }}>
+            <button className="btn-ghost flex items-center gap-1" disabled={folderBusy}
+              title={ui('打开独立工具目录', 'Open the managed standalone-tools folder.')} data-folder-kind="tools"
+              onClick={() => openManagedFolder('tools')}>
               <FolderInput size={14} /> {t('toolsFolder')}
             </button>
             <button className="btn-ghost flex items-center gap-1" onClick={toggleAll}>
@@ -1050,30 +1152,29 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
               {mod.latest && (
                 <button disabled={actionLock === mod.id}
                   onClick={async () => {
+                    if (updateWriteLockRef.current) return
+                    updateWriteLockRef.current = true
+                    const scopeEpoch = scopeEpochRef.current
                     setActionLock(mod.id)
                     toast(`更新 ${mod.name}...`)
                     emitFeedback('install-start', { source: 'mod-update', modId: mod.id })
                     try {
-                      const r = await fetch(api + '/tool/mod_update', {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ mod_id: mod.id })
-                      })
-                      const d = await r.json()
-                      const data = JSON.parse(d.result || '{}')
-                      if (data.error) { emitFeedback('error', { source: 'mod-update' }); toast(friendlyErr(data.error), 'error') }
-                      else { emitFeedback('install-complete', { source: 'mod-update', modId: mod.id }); toast(`${mod.name} 已更新`); loadFromApi(); onRefresh?.() }
-                    } catch (e) { emitFeedback('error', { source: 'mod-update' }); toast('更新失败', 'error') }
+                      const result = await updateMod(api, mod.id, language)
+                      if (!result.ok) { emitFeedback('error', { source: 'mod-update' }); toast(result.message, 'error') }
+                      else { emitFeedback('install-complete', { source: 'mod-update', modId: mod.id }); toast(ui(`${mod.name} 已更新`, `${mod.name} updated`)); if (result.warning) toast(result.warning, 'info'); if (scopeEpoch === scopeEpochRef.current) { loadFromApi(); onRefresh?.() } }
+                    } catch (error) { emitFeedback('error', { source: 'mod-update' }); toast(updateFailure(error, language), 'error') }
+                    finally { updateWriteLockRef.current = false }
                     setActionLock(null)
-                  }} className="btn-ghost p-1.5" title="更新">
+                  }} className="btn-ghost p-1.5" title={ui('更新', 'Update')}>
                   {actionLock === mod.id ? <RefreshCw size={14} className="animate-spin" /> : <RefreshCw size={14} className="text-cyber-cyan" />}
                 </button>
               )}
               <button disabled={actionLock === mod.id}
                 onClick={() => toggleMod(mod)}
-                className={`btn-ghost p-1.5 flex items-center gap-1 ${mod.disabled ? 'text-cyber-cyan px-2' : ''}`} title={mod.disabled ? '启用' : '禁用'}>
-                {mod.disabled ? <><RotateCcw size={14} /><span className="text-xs">启用</span></> : <XCircle size={14} />}
+                className={`btn-ghost p-1.5 flex items-center gap-1 ${mod.disabled ? 'text-cyber-cyan px-2' : ''}`} title={mod.disabled ? ui('启用', 'Enable') : ui('禁用', 'Disable')}>
+                {mod.disabled ? <><RotateCcw size={14} /><span className="text-xs">{ui('启用', 'Enable')}</span></> : <XCircle size={14} />}
               </button>
-              <button disabled={actionLock === mod.id} onClick={() => handleDelete(mod)} className="btn-danger p-1.5" title="删除">
+              <button disabled={actionLock === mod.id} onClick={() => handleDelete(mod)} className="btn-danger p-1.5" title={ui('删除', 'Uninstall')}>
                 <Trash2 size={14} />
               </button>
             </div>
@@ -1146,8 +1247,8 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
             <button onClick={previewBatchDelete} disabled={batchBusy} className="btn-ghost text-cyber-red flex items-center gap-1">
               {batchBusy ? <RefreshCw size={12} className="animate-spin" /> : <Trash2 size={12} />}
               {batchBusy && batchProgress
-                ? `${batchProgress.phase === 'preview' ? '核对' : batchProgress.phase === 'snapshot' ? '创建快照' : '删除'} ${batchProgress.completed}/${batchProgress.total}`
-                : '批量删除'}
+                ? `${batchProgress.phase === 'preview' ? ui('核对', 'Review') : batchProgress.phase === 'snapshot' ? ui('创建快照', 'Snapshot') : ui('删除', 'Uninstall')} ${batchProgress.completed}/${batchProgress.total}`
+                : ui('批量删除', 'Uninstall selected')}
             </button>
           </div>
         )}
@@ -1205,15 +1306,15 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
       {/* 更新检测只给出候选；用户勾选后才进入更新流水线。 */}
       {updateReview && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={() => !updatingSelected && setUpdateReview(null)}>
-          <div className="bg-surface-800 border border-cyber-cyan/35 rounded-lg p-5 max-w-2xl w-[min(92vw,680px)] max-h-[82vh] flex flex-col shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
+          <div role="dialog" aria-label={ui('检查更新结果', 'Update check results')} className="bg-surface-800 border border-cyber-cyan/35 rounded-lg p-5 max-w-2xl w-[min(92vw,680px)] max-h-[82vh] flex flex-col shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
-                <h3 className="text-base font-semibold text-white">检测到可更新项目</h3>
+                <h3 className="text-base font-semibold text-white">{ui('检测到可更新项目', 'Update candidates found')}</h3>
                 <p className="text-xs text-surface-400 mt-1">
-                  共检查 {updateReview.summary?.total || mods.length} 项，发现 {updateReview.updates.length} 项可更新。请确认后勾选，不会自动安装。
+                  {ui(`共纳入检查 ${updateReview.summary?.total ?? mods.length} 项，发现 ${updateReview.updates.length} 项可更新。部分来源可能尚未核验；勾选并确认后才会执行，不会自动安装。`, `${updateReview.summary?.total ?? mods.length} items considered; ${updateReview.updates.length} update candidates found. Some sources may remain unverified. Select and confirm to proceed; nothing installs automatically.`)}
                 </p>
               </div>
-              <button className="btn-ghost p-1.5" disabled={updatingSelected} onClick={() => setUpdateReview(null)} title="关闭">
+              <button className="btn-ghost p-1.5" disabled={updatingSelected} onClick={() => setUpdateReview(null)} title={ui('关闭', 'Close')}>
                 <XCircle size={16} />
               </button>
             </div>
@@ -1237,11 +1338,11 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
                     <div className="min-w-0 flex-1">
                       <div className="text-sm text-white">{item.name}</div>
                       <div className="mt-1 text-xs text-surface-400">
-                        {item.current || 'unknown'} → <span className="text-cyber-cyan">{item.latest || '最新版'}</span>
+                        {item.current || ui('未知', 'unknown')} → <span className="text-cyber-cyan">{item.latest || ui('最新版', 'latest')}</span>
                         <span className="ml-2 text-surface-500">{item.source}</span>
                       </div>
                       {item.status === 'version_unknown' && (
-                        <div className="mt-1 text-[11px] text-cyber-yellow">本地版本未知，将按已核验维护页同步最新版</div>
+                        <div className="mt-1 text-[11px] text-cyber-yellow">{ui('本地版本未知，将按已核验维护页同步最新版', 'Local version unknown; sync the latest version from the verified source page.')}</div>
                       )}
                     </div>
                   </label>
@@ -1258,12 +1359,12 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
                     : new Set(updateReview.updates.map(item => String(item.mod_id)))
                 ))}
               >
-                {updateSelected.size === updateReview.updates.length ? '取消全选' : '全选'}
+                {updateSelected.size === updateReview.updates.length ? ui('取消全选', 'Deselect all') : ui('全选', 'Select all')}
               </button>
               <div className="flex gap-2">
-                <button className="btn-ghost" disabled={updatingSelected} onClick={() => setUpdateReview(null)}>稍后更新</button>
+                <button className="btn-ghost" disabled={updatingSelected} onClick={() => setUpdateReview(null)}>{ui('稍后更新', 'Update later')}</button>
                 <button className="btn-cyber" disabled={updatingSelected || !updateSelected.size} onClick={runSelectedUpdates}>
-                  {updatingSelected ? '正在更新…' : `更新所选 ${updateSelected.size} 项`}
+                  {updatingSelected ? ui('正在更新…', 'Updating…') : ui(`更新所选 ${updateSelected.size} 项`, `Update selected ${updateSelected.size}`)}
                 </button>
               </div>
             </div>
@@ -1278,28 +1379,29 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
         const dependents = [...new Set(batchDelete.items.flatMap(item => item.preview.dependents || []))]
         return (
           <div className="fixed inset-0 bg-black/65 flex items-center justify-center z-50" onClick={() => setBatchDelete(null)}>
-            <div className="bg-surface-800 border border-surface-600 rounded-lg p-6 max-w-lg w-full shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>
+            <div role="dialog" aria-label={ui('确认批量卸载', 'Confirm batch uninstall')} className="bg-surface-800 border border-surface-600 rounded-lg p-6 max-w-lg w-full shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>
               <div className="flex items-center gap-3 mb-4">
                 <div className="w-10 h-10 rounded-full bg-cyber-red/10 flex items-center justify-center">
                   <AlertTriangle size={20} className="text-cyber-red" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-semibold text-white">确认批量卸载</h3>
-                  <p className="text-xs text-surface-500">共 {batchDelete.items.length} 个 Mod</p>
+                  <h3 className="text-sm font-semibold text-white">{ui('确认批量卸载', 'Confirm batch uninstall')}</h3>
+                  <p className="text-xs text-surface-500">{ui(`共 ${batchDelete.items.length} 个 Mod`, `${batchDelete.items.length} Mods`)}</p>
                 </div>
               </div>
               <div className="bg-surface-900 rounded-md p-3 mb-4 text-xs text-surface-400 space-y-2">
-                <p>将删除约 <span className="text-cyber-red">{totalFiles}</span> 个本地文件{workshopCount ? `，并退订 ${workshopCount} 个工坊项目` : ''}。</p>
+                <p>{ui(`将删除约 ${totalFiles} 个本地文件${workshopCount ? `，并退订 ${workshopCount} 个工坊项目` : ''}。`, `About ${totalFiles} local files will be removed${workshopCount ? `, and ${workshopCount} Workshop items unsubscribed` : ''}.`)}</p>
                 <div className="max-h-32 overflow-y-auto space-y-1 text-white/80">
                   {batchDelete.items.slice(0, 12).map(item => <p key={item.mod.id}>• {item.mod.name}</p>)}
-                  {batchDelete.items.length > 12 && <p>…另有 {batchDelete.items.length - 12} 个</p>}
+                  {batchDelete.items.length > 12 && <p>{ui(`…另有 ${batchDelete.items.length - 12} 个`, `…and ${batchDelete.items.length - 12} more`)}</p>}
                 </div>
-                {!!dependents.length && <p className="text-cyber-yellow">⚠️ 受影响依赖：{dependents.slice(0, 8).join('、')}{dependents.length > 8 ? ' 等' : ''}</p>}
-                <p className="text-surface-500">确认后会先创建 1 份“批量删除前”安全快照，再逐项删除；单项失败会单独报告，不会伪装成全部成功。</p>
+                {!!dependents.length && <p className="text-cyber-yellow">⚠️ {ui('受影响依赖：', 'Affected dependents: ')}{dependents.slice(0, 8).join(', ')}{dependents.length > 8 ? ui(' 等', ' and more') : ''}</p>}
+                <p className="text-surface-500">{ui('确认后先创建一份本地安全快照，再逐项卸载；失败或未确认会停止后续项目并单独报告。恢复范围以实际快照内容为准。', 'After confirmation, create a local safety snapshot and uninstall one item at a time. A failed or unconfirmed result stops subsequent items and is reported separately. Recovery is limited to the snapshot contents.')}</p>
+                {workshopCount > 0 && <p className="text-cyber-yellow">{ui('工坊退订不能通过本地快照撤销；恢复订阅需要在 Steam 中操作。', 'Local snapshots cannot undo Workshop unsubscription; resubscribe through Steam.')}</p>}
               </div>
               <div className="flex justify-end gap-2">
-                <button onClick={() => setBatchDelete(null)} className="btn-ghost">取消</button>
-                <button onClick={confirmBatchDelete} className="tc-danger-button px-4 py-2 rounded-md text-sm bg-cyber-red/80 text-white hover:bg-cyber-red transition-colors">确认全部卸载</button>
+                <button onClick={() => setBatchDelete(null)} className="btn-ghost">{ui('取消', 'Cancel')}</button>
+                <button onClick={confirmBatchDelete} className="tc-danger-button px-4 py-2 rounded-md text-sm bg-cyber-red/80 text-white hover:bg-cyber-red transition-colors">{ui('确认全部卸载', 'Confirm uninstall selected')}</button>
               </div>
             </div>
           </div>
@@ -1309,27 +1411,27 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
       {batchProgress && (
         <div className="fixed right-5 bottom-14 z-[60] w-80 rounded-lg border border-cyber-cyan/40 bg-surface-900/95 p-3 shadow-2xl text-xs">
           <div className="flex items-center justify-between gap-3 text-white/90">
-            <span>{batchProgress.phase === 'preview' ? '正在核对批量卸载影响' : batchProgress.phase === 'snapshot' ? '正在创建安全快照' : '正在批量删除'}</span>
+            <span>{batchProgress.phase === 'preview' ? ui('正在核对批量卸载影响', 'Reviewing uninstall impact') : batchProgress.phase === 'snapshot' ? ui('正在创建安全快照', 'Creating safety snapshot') : ui('正在批量删除', 'Uninstalling selected Mods')}</span>
             <span className="font-mono text-cyber-cyan">{batchProgress.completed}/{batchProgress.total}</span>
           </div>
           <div className="mt-2 h-1.5 overflow-hidden rounded bg-surface-700">
             <div className="h-full bg-cyber-cyan transition-all" style={{ width: `${batchProgress.total ? (batchProgress.completed / batchProgress.total) * 100 : 0}%` }} />
           </div>
-          <p className="mt-2 truncate text-surface-400">{batchProgress.current || '准备中…'}</p>
-          {batchProgress.phase === 'delete' && <p className="mt-1 text-surface-500">成功 {batchProgress.succeeded || 0} · 失败 {batchProgress.failed || 0}</p>}
+          <p className="mt-2 truncate text-surface-400">{batchProgress.current || ui('准备中…', 'Preparing…')}</p>
+          {batchProgress.phase === 'delete' && <p className="mt-1 text-surface-500">{ui('成功', 'Confirmed')} {batchProgress.succeeded || 0} · {ui('失败或未确认', 'Failed or unconfirmed')} {batchProgress.failed || 0}</p>}
         </div>
       )}
 
       {/* Delete confirm dialog */}
       {showDeleteConfirm && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setShowDeleteConfirm(null)}>
-          <div className="bg-surface-800 border border-surface-600 rounded-lg p-6 max-w-sm w-full shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>
+          <div role="dialog" aria-label={ui('确认卸载', 'Confirm uninstall')} className="bg-surface-800 border border-surface-600 rounded-lg p-6 max-w-sm w-full shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>
             <div className="flex items-center gap-3 mb-4">
               <div className="w-10 h-10 rounded-full bg-cyber-red/10 flex items-center justify-center">
                 <AlertTriangle size={20} className="text-cyber-red" />
               </div>
               <div>
-                <h3 className="text-sm font-semibold text-white">确认卸载</h3>
+                <h3 className="text-sm font-semibold text-white">{ui('确认卸载', 'Confirm uninstall')}</h3>
                 <p className="text-xs text-surface-300">{showDeleteConfirm.name_cn || showDeleteConfirm.name}</p>
                 {showDeleteConfirm.name_cn && showDeleteConfirm.name_cn !== showDeleteConfirm.name && (
                   <p className="text-[10px] text-surface-500">{showDeleteConfirm.name}</p>
@@ -1337,20 +1439,23 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
               </div>
             </div>
             <div className="bg-surface-900 rounded-md p-3 mb-4 text-xs text-surface-400 space-y-1.5">
-              <p><span className="text-white/80">功能：</span>{showDeleteConfirm.desc}</p>
+              <p><span className="text-white/80">{ui('功能：', 'Function: ')}</span>{showDeleteConfirm.desc}</p>
               {showDeleteConfirm.preview?.will_unsubscribe ? (
-                <p>工坊 Mod：将从 Steam <span className="text-cyber-yellow">退订</span>（Steam 托管文件不删除，退订后自动移除）。</p>
+                <p>{ui('工坊 Mod：将向 Steam 请求退订；文件移除由 Steam 管理，不由 ModAgent 直接删除。', 'Workshop Mod: request unsubscription through Steam. Steam manages removal of its files; ModAgent does not delete them directly.')}</p>
               ) : (
-                <p>将删除 <span className="text-cyber-red">{showDeleteConfirm.preview?.will_delete_count ?? '?'}</span> 个 mod 文件。</p>
+                <p>{ui(`将删除 ${showDeleteConfirm.preview?.will_delete_count ?? '?'} 个 Mod 文件。`, `${showDeleteConfirm.preview?.will_delete_count ?? '?'} Mod files will be deleted.`)}</p>
               )}
               {showDeleteConfirm.preview?.dependents?.length > 0 && (
-                <p className="text-cyber-yellow">⚠️ {showDeleteConfirm.preview.dependents.join('、')} 依赖此 Mod，卸载可能导致它们失效。</p>
+                <p className="text-cyber-yellow">⚠️ {ui(`${showDeleteConfirm.preview.dependents.join('、')} 依赖此 Mod，卸载可能导致它们失效。`, `${showDeleteConfirm.preview.dependents.join(', ')} depend on this Mod and may stop working after removal.`)}</p>
               )}
-              <p className="text-surface-500">卸载前会自动建快照，此操作可回滚。</p>
+              {showDeleteConfirm.preview?.blocked_unsafe_count > 0 && <p className="text-cyber-yellow">{ui(`${showDeleteConfirm.preview.blocked_unsafe_count} 条路径被安全检查拦下，不会删除；卸载可能只完成一部分。`, `${showDeleteConfirm.preview.blocked_unsafe_count} paths were blocked by safety checks and will not be deleted; uninstall may be partial.`)}</p>}
+              <p className="text-surface-500">{showDeleteConfirm.preview?.will_unsubscribe
+                ? ui('本地快照不能恢复 Steam 订阅；如需恢复，请在 Steam 中重新订阅。', 'Local snapshots cannot restore Steam subscriptions. To restore one, resubscribe through Steam.')
+                : ui('卸载前会创建本地安全快照；恢复范围以实际快照内容为准，不保证恢复存档或外部服务状态。', 'A local safety snapshot is created before uninstalling. Recovery is limited to its recorded contents; saves and external service state are not guaranteed to be restored.')}</p>
             </div>
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowDeleteConfirm(null)} className="btn-ghost">取消</button>
-              <button onClick={confirmDelete} className="tc-danger-button px-4 py-2 rounded-md text-sm bg-cyber-red/80 text-white hover:bg-cyber-red transition-colors">删除</button>
+              <button onClick={() => setShowDeleteConfirm(null)} className="btn-ghost">{ui('取消', 'Cancel')}</button>
+              <button onClick={confirmDelete} className="tc-danger-button px-4 py-2 rounded-md text-sm bg-cyber-red/80 text-white hover:bg-cyber-red transition-colors">{ui('删除', 'Uninstall')}</button>
             </div>
           </div>
         </div>
@@ -1358,7 +1463,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
 
       {/* 依赖链启停门禁 */}
       {dependencyGate && (
-        <div className="fixed inset-0 bg-black/65 flex items-center justify-center z-50" onClick={() => setDependencyGate(null)}>
+        <div role="dialog" aria-label={ui('依赖操作确认', 'Dependency operation review')} className="fixed inset-0 bg-black/65 flex items-center justify-center z-50" onClick={() => setDependencyGate(null)}>
           <div className="bg-surface-800 border border-surface-600 rounded-lg p-6 max-w-md w-full shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>
             <div className="flex items-center gap-3 mb-4">
               <div className={`w-10 h-10 rounded-full flex items-center justify-center ${dependencyGate.data.blocked || !dependencyGate.enabling ? 'bg-cyber-red/10' : 'bg-cyber-cyan/10'}`}>
@@ -1366,61 +1471,67 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
               </div>
               <div>
                 {dependencyGate.data.requires_external_manager && (
-                  <h3 className="text-sm font-semibold text-white">请在 Steam 中管理启用状态</h3>
+                  <h3 className="text-sm font-semibold text-white">{ui('请在 Steam 中管理启用状态', 'Manage this item in Steam')}</h3>
                 )}
                 {!dependencyGate.data.requires_external_manager && <h3 className="text-sm font-semibold text-white">
-                  {dependencyGate.data.blocked ? '缺少前置依赖' : dependencyGate.enabling ? '确认启用依赖链' : '确认级联禁用'}
+                  {dependencyGate.data.blocked ? ui('缺少前置依赖', 'Missing dependencies') : dependencyGate.enabling ? ui('确认启用依赖链', 'Confirm enabling dependencies') : ui('确认级联禁用', 'Confirm disabling dependents')}
                 </h3>}
                 <p className="text-xs text-surface-300">{dependencyGate.mod.name_cn || dependencyGate.mod.name}</p>
               </div>
             </div>
             <div className="bg-surface-900 rounded-md p-3 mb-4 text-xs text-surface-400 space-y-2">
-              <p><span className="text-white/80">功能：</span>{dependencyGate.mod.desc}</p>
+              <p><span className="text-white/80">{ui('功能：', 'Function: ')}</span>{dependencyGate.mod.desc}</p>
+              {language === 'en' && <p className="text-cyber-cyan">{dependencyGate.data.requires_external_manager
+                ? 'This item is managed by Steam. Change its enabled state in Steam; ModAgent will not move its files or change its subscription.'
+                : dependencyGate.data.blocked ? 'Enabling is blocked. Install the missing dependencies first.'
+                : dependencyGate.enabling ? 'Continuing enables the dependencies first, then the selected Mod.'
+                : 'Continuing disables the selected Mod and its listed active dependents. Review the impact below before confirming.'}</p>}
+              {language === 'en' && <p className="text-surface-500">Original backend details (may use another language):</p>}
               <p>{dependencyGate.data.note}</p>
               {dependencyGate.data.user_action && <p className="text-cyber-cyan">{dependencyGate.data.user_action}</p>}
               {!!dependencyGate.data.decision_support && (
                 <div className="space-y-2 border-l-2 border-cyber-yellow/60 pl-3">
                   <p className="text-white">{dependencyGate.data.decision_support.summary}</p>
-                  <p><span className="text-cyber-yellow">你会暂时失去：</span>{dependencyGate.data.decision_support.player_impact?.map(item => `${item.name}（${item.role_label}）：${item.functionality_lost}`).join('；')}</p>
+                  <p><span className="text-cyber-yellow">{ui('你会暂时失去：', 'Temporarily unavailable: ')}</span>{dependencyGate.data.decision_support.player_impact?.map(item => `${item.name} (${item.role_label}): ${item.functionality_lost}`).join('; ')}</p>
                   {!!dependencyGate.data.decision_support.already_inactive?.length && (
-                    <p><span className="text-surface-500">无需重复处理：</span>{dependencyGate.data.decision_support.already_inactive.map(item => item.name).join('、')} 已经禁用</p>
+                    <p><span className="text-surface-500">{ui('无需重复处理：', 'Already disabled; no repeat operation: ')}</span>{dependencyGate.data.decision_support.already_inactive.map(item => item.name).join(', ')}</p>
                   )}
                   {!!dependencyGate.data.decision_support.retained?.length && (
-                    <p><span className="text-cyber-cyan">仍会保留：</span>{dependencyGate.data.decision_support.retained.map(item => item.name).join('、')}</p>
+                    <p><span className="text-cyber-cyan">{ui('仍会保留：', 'Retained: ')}</span>{dependencyGate.data.decision_support.retained.map(item => item.name).join(', ')}</p>
                   )}
-                  <p><span className="text-white/80">为什么建议这样试：</span>{dependencyGate.data.decision_support.why_this_step}</p>
-                  <p><span className="text-white/80">建议：</span>{dependencyGate.data.decision_support.recommendation}</p>
+                  <p><span className="text-white/80">{ui('为什么建议这样试：', 'Reason for this step: ')}</span>{dependencyGate.data.decision_support.why_this_step}</p>
+                  <p><span className="text-white/80">{ui('建议：', 'Recommendation: ')}</span>{dependencyGate.data.decision_support.recommendation}</p>
                   <p className="text-surface-500">{dependencyGate.data.decision_support.recovery}</p>
                 </div>
               )}
               {!!dependencyGate.data.dependents?.length && (
                 <div>
-                  <p className="text-cyber-yellow mb-1">依赖它、将被连带禁用：</p>
+                  <p className="text-cyber-yellow mb-1">{ui('依赖它、将被连带禁用：', 'Dependents that will also be disabled:')}</p>
                   <p className="text-white/80">{dependencyGate.data.dependents.map(item => item.name || item.id).join(' → ')}</p>
                 </div>
               )}
               {!!dependencyGate.data.dependencies?.length && (
                 <div>
-                  <p className="text-cyber-cyan mb-1">启用顺序（前置优先）：</p>
+                  <p className="text-cyber-cyan mb-1">{ui('启用顺序（前置优先）：', 'Enable order (dependencies first):')}</p>
                   <p className="text-white/80">{dependencyGate.data.dependencies.map(item => item.name || item.id).join(' → ')}</p>
                 </div>
               )}
               {!!dependencyGate.data.missing_dependencies?.length && (
                 <div>
-                  <p className="text-cyber-red mb-1">尚未安装：</p>
+                  <p className="text-cyber-red mb-1">{ui('尚未安装：', 'Not installed:')}</p>
                   <p className="font-mono text-white/80">{dependencyGate.data.missing_dependencies.join('、')}</p>
-                  <p className="text-surface-500 mt-2">如果等价前置已从 GitHub、工坊或本地装过，请到对话页让 Agent 核对后建立跨来源依赖映射。</p>
+                  <p className="text-surface-500 mt-2">{ui('如果等价前置已从 GitHub、工坊或本地装过，请到对话页让 Agent 核对后建立跨来源依赖映射。', 'If an equivalent dependency was installed from GitHub, Workshop or a local file, ask the Agent in chat to verify it and map the dependency across sources.')}</p>
                 </div>
               )}
             </div>
             <div className="flex justify-end gap-2">
               <button onClick={() => setDependencyGate(null)} className="btn-ghost">
-                {dependencyGate.data.blocked ? '知道了' : '取消'}
+                {dependencyGate.data.blocked ? ui('知道了', 'Got it') : ui('取消', 'Cancel')}
               </button>
-              {!dependencyGate.data.blocked && (
+              {!dependencyGate.data.blocked && !dependencyGate.data.requires_external_manager && dependencyGate.data.requires_confirmation === true && (
                 <button onClick={confirmDependencyToggle}
                   className={dependencyGate.enabling ? 'btn-cyber' : 'tc-danger-button px-4 py-2 rounded-md text-sm bg-cyber-red/80 text-white hover:bg-cyber-red transition-colors'}>
-                  {dependencyGate.enabling ? '启用依赖并继续' : '全部禁用'}
+                  {dependencyGate.enabling ? ui('启用依赖并继续', 'Enable dependencies and continue') : ui('全部禁用', 'Disable all listed')}
                 </button>
               )}
             </div>
@@ -1430,16 +1541,16 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
 
       {/* 低置信名称不能自动决定身份；把真实候选交给用户确认。 */}
       {alignmentReview && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={() => setAlignmentReview(null)}>
-          <div className="bg-surface-800 border border-cyber-yellow/35 rounded-lg p-5 max-w-3xl w-[min(92vw,760px)] max-h-[82vh] overflow-y-auto shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={() => !actionLock && setAlignmentReview(null)}>
+          <div role="dialog" aria-modal="true" aria-label={ui('确认维护来源', 'Review maintenance sources')} className="bg-surface-800 border border-cyber-yellow/35 rounded-lg p-5 max-w-3xl w-[min(92vw,760px)] max-h-[82vh] overflow-y-auto shadow-2xl animate-slide-up" onClick={event => event.stopPropagation()}>
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
-                <h3 className="text-base font-semibold text-white">需要确认的来源歧义</h3>
+                <h3 className="text-base font-semibold text-white">{ui('确认维护来源', 'Review maintenance sources')}</h3>
                 <p className="text-xs text-surface-400 mt-1">
-                  “歧义”表示找到了多个相似维护页，但名称相似不足以证明是同一个 Mod。请选择你实际安装的来源；不确定可以暂时跳过。
+                  {ui('名称相似不足以证明是同一个 Mod。请选择你实际安装的来源；没有合适候选时可填写网址，不确定可以暂时跳过。', 'Similar names do not prove that two entries are the same Mod. Choose the source you actually installed, enter a URL if no candidate fits, or skip if unsure.')}
                 </p>
               </div>
-              <button className="btn-ghost p-1.5" onClick={() => setAlignmentReview(null)} title="稍后处理">
+              <button className="btn-ghost p-1.5" onClick={() => setAlignmentReview(null)} disabled={!!actionLock} title={ui('稍后处理', 'Review later')}>
                 <XCircle size={16} />
               </button>
             </div>
@@ -1448,7 +1559,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
                 <div key={item.mod_id} className="rounded-md border border-surface-600 bg-surface-900/70 p-3">
                   <div className="mb-2">
                     <div className="text-sm font-medium text-white">{item.name}</div>
-                    <div className="text-[11px] text-cyber-yellow">{item.reason || '候选相似，需要人工确认'}</div>
+                    <div className="text-[11px] text-cyber-yellow">{ui(item.reason || '来源身份尚未确认，请人工核对', 'Source identity is not confirmed. Review the candidates or provide the exact source page.')}</div>
                   </div>
                   <div className="space-y-2">
                     {(item.candidates || []).map(candidate => (
@@ -1459,9 +1570,9 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
                             <span className="ml-2 text-surface-500">{candidate.source}</span>
                           </div>
                           <div className="mt-1 text-[10px] text-surface-400">
-                            {candidate.owner ? `作者 ${candidate.owner} · ` : ''}
-                            {candidate.latest_version || candidate.version ? `版本 ${candidate.latest_version || candidate.version} · ` : ''}
-                            匹配度 {Math.round((Number(candidate.score) || 0) * 100)}%
+                            {candidate.owner ? ui(`作者 ${candidate.owner} · `, `Author ${candidate.owner} · `) : ''}
+                            {candidate.latest_version || candidate.version ? ui(`版本 ${candidate.latest_version || candidate.version} · `, `Version ${candidate.latest_version || candidate.version} · `) : ''}
+                            {ui('名称匹配度', 'Name match')} {Math.round((Number(candidate.score) || 0) * 100)}%
                           </div>
                           {(candidate.description || candidate.summary) && (
                             <div className="mt-1 text-[11px] text-surface-300 line-clamp-2">
@@ -1475,7 +1586,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
                               className="btn-ghost text-xs"
                               onClick={() => window.modagent?.openExternal?.(candidate.url)}
                             >
-                              查看维护页
+                              {ui('查看维护页', 'Open source page')}
                             </button>
                           )}
                           <button
@@ -1486,9 +1597,9 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
                             {actionLock === `align:${item.mod_id}` ? (
                               <span className="inline-flex items-center gap-1.5">
                                 <RefreshCw size={12} className="animate-spin" />
-                                确认中
+                                {ui('确认中', 'Confirming…')}
                               </span>
-                            ) : '确认此来源'}
+                            ) : ui('确认此来源', 'Confirm this source')}
                           </button>
                         </div>
                       </div>
@@ -1496,15 +1607,16 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
                   </div>
                   <div className="mt-3 border-t border-surface-700 pt-3">
                     <div className="text-[11px] text-surface-400 mb-2">
-                      如果你知道它来自哪里，可直接粘贴 Nexus / Thunderstore 的具体 Mod 维护页。ModAgent 会先核验，再由你确认绑定。
+                      {ui('可粘贴 Nexus / Thunderstore 的具体 Mod 维护页获取预览；请核对它与本地 Mod 是否相同，再确认绑定。Thunderstore 网址预览不代表已核验远端内容。', 'Paste a Nexus or Thunderstore Mod page to get a preview. Check that it matches your local Mod before confirming. A Thunderstore URL preview does not verify the remote content.')}
                     </div>
                     <div className="flex flex-col gap-2 sm:flex-row">
                       <input
                         value={manualSource[item.mod_id] || ''}
-                        onChange={event => setManualSource(previous => ({
+                        readOnly={!!actionLock}
+                        onChange={event => { setManualSource(previous => ({
                           ...previous, [item.mod_id]: event.target.value,
-                        }))}
-                        placeholder="手动添加网址并检查"
+                        }));setManualSourcePreview(previous => {const next={...previous};delete next[item.mod_id];return next}) }}
+                        placeholder={ui('手动添加网址并检查', 'Enter a source URL to check')}
                         className="input-cyber flex-1 text-xs"
                       />
                       <button
@@ -1512,26 +1624,26 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
                         disabled={!!actionLock}
                         onClick={() => inspectManualSource(item)}
                       >
-                        {actionLock === `manual-source:${item.mod_id}` ? '检查中…' : '检查网址'}
+                        {actionLock === `manual-source:${item.mod_id}` ? ui('检查中…', 'Checking…') : ui('检查网址', 'Check URL')}
                       </button>
                       <button
                         className="btn-ghost text-xs shrink-0"
                         disabled={binding || !!actionLock}
                         onClick={() => runAlignment([item], true)}
                       >
-                        重新对齐
+                        {ui('重新对齐', 'Find candidates again')}
                       </button>
                     </div>
                     {manualSourcePreview[item.mod_id] && (
                       <div className="mt-2 flex items-center justify-between gap-3 rounded border border-cyber-cyan/35 bg-cyber-cyan/5 px-3 py-2">
                         <div className="min-w-0 text-[11px] text-surface-200">
-                          已核验：{manualSourcePreview[item.mod_id].preview?.nexus?.name || manualSourcePreview[item.mod_id].preview?.source?.name || manualSourcePreview[item.mod_id].source_key}
+                          {ui('待确认来源：', 'Source to confirm: ')}{manualSourcePreview[item.mod_id].preview?.nexus?.name || manualSourcePreview[item.mod_id].preview?.source?.name || manualSourcePreview[item.mod_id].source_key}
                         </div>
                         <button
                           className="btn-cyber text-xs shrink-0"
                           disabled={!!actionLock}
                           onClick={() => confirmManualSource(item)}
-                        >确认绑定</button>
+                        >{ui('确认绑定', 'Confirm link')}</button>
                       </div>
                     )}
                   </div>
@@ -1539,7 +1651,7 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
               ))}
             </div>
             <div className="mt-4 flex justify-end">
-              <button className="btn-ghost" onClick={() => setAlignmentReview(null)}>暂时跳过</button>
+              <button disabled={!!actionLock} className="btn-ghost" onClick={() => setAlignmentReview(null)}>{ui('暂时跳过', 'Skip for now')}</button>
             </div>
           </div>
         </div>
@@ -1551,17 +1663,18 @@ export default function ModsPage({ toast, api, onRefresh, refreshKey, status, la
           <div className="bg-surface-800 border border-surface-600 rounded-lg p-6 max-w-md w-full shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>
             <div className="flex items-center gap-2 mb-3">
               <Download size={18} className="text-cyber-cyan" />
-              <h3 className="text-sm font-semibold text-white">下载新 Mod</h3>
+              <h3 className="text-sm font-semibold text-white">{language === 'en' ? 'Download mod' : '下载新 Mod'}</h3>
             </div>
-            <p className="text-xs text-surface-500 mb-3">粘贴 GitHub / Thunderstore / GameBanana 的 mod 链接，自动下载并安装到当前游戏。Nexus 请去对话页用搜索。</p>
-            <input autoFocus value={dlUrl} onChange={e => setDlUrl(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') doDownload() }}
+            <p className="text-xs text-surface-500 mb-3">{language === 'en' ? 'Paste a GitHub / Thunderstore / GameBanana link. Download and preview first; installation requires your confirmation. Use Chat for Nexus.' : '粘贴 GitHub / Thunderstore / GameBanana 链接，先下载并预览，确认后才安装。Nexus 请去对话页搜索。'}</p>
+            <input autoFocus value={dlUrl} readOnly={dlBusy} onChange={e => {setDlUrl(e.target.value);setDownloadReview(null)}}
+              onKeyDown={e => { if (e.key === 'Enter' && !downloadReview) doDownload() }}
               placeholder="thunderstore.io/c/.../p/.../  或  github.com/owner/repo"
               className="input-cyber mb-4" />
+            {downloadReview && <DirectInstallReview review={downloadReview} language={language}/>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowDownload(false)} className="btn-ghost" disabled={dlBusy}>取消</button>
-              <button onClick={doDownload} disabled={dlBusy || !dlUrl.trim()} className="btn-cyber flex items-center gap-1.5">
-                {dlBusy ? <RefreshCw size={14} className="animate-spin" /> : <Download size={14} />} 下载并安装
+              <button onClick={() => setShowDownload(false)} className="btn-ghost" disabled={dlBusy}>{language === 'en' ? 'Cancel' : '取消'}</button>
+              <button onClick={downloadReview ? confirmDirectInstall : doDownload} disabled={dlBusy || !dlUrl.trim() || (downloadReview && !downloadReview.ready)} className="btn-cyber flex items-center gap-1.5">
+                {dlBusy ? <RefreshCw size={14} className="animate-spin" /> : <Download size={14} />} {downloadReview ? (downloadReview.compatibilityRisk ? (language === 'en' ? 'Accept risk and install' : '接受风险并安装') : (language === 'en' ? 'Confirm installation' : '确认安装')) : (language === 'en' ? 'Download and preview' : '下载并预览')}
               </button>
             </div>
           </div>

@@ -10,6 +10,8 @@ export function taskActionLabel(value, language) {
   const labels = {
     waiting_for_confirmation: ['等待你核对清单后确认', 'Waiting for you to review and confirm'],
     confirm_or_adjust_plan: ['查看待确认清单，或返回调整选择', 'Review the pending selection or adjust it'],
+    review_install_recovery: ['先核对当前文件、快照与恢复记录，再决定是否重试', 'Review current files, snapshots and recovery details before retrying'],
+    installation_recovery_requires_review: ['安装恢复状态或文件改动待核对', 'Installation recovery or file changes require review'],
   }
   return labels[value]?.[language === 'en' ? 1 : 0] || value
 }

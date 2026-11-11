@@ -42,6 +42,7 @@ class ToolOutcome:
     status: OutcomeStatus
     reason: str = ""
     retryable: bool = False
+    requires_review: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -56,6 +57,22 @@ class ToolOutcome:
         if isinstance(data, dict):
             status = str(data.get("status") or "").lower()
             reason = str(data.get("error") or data.get("message") or status)
+            children = data.get("results")
+            receipts = [data] + (children if isinstance(children, list) else [])
+            needs_review = any(
+                isinstance(item, dict) and (
+                    item.get("recovery_required") is True
+                    or item.get("rollback_complete") is False
+                    or item.get("status") == "rollback_unconfirmed"
+                    or (isinstance(item.get("rollback"), dict)
+                        and item["rollback"].get("complete") is False)
+                ) for item in receipts
+            )
+            if needs_review:
+                successes = data.get("succeeded")
+                partial = isinstance(successes, (int, float)) and not isinstance(successes, bool) and successes > 0
+                return cls(OutcomeStatus.PARTIAL if partial else OutcomeStatus.BLOCKED,
+                           "installation_recovery_requires_review", False, True)
             if status in {"cancelled", "canceled"}:
                 return cls(OutcomeStatus.CANCELLED, reason)
             if status in {"unknown", "outcome_unknown", "interrupted"}:

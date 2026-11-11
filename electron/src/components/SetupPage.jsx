@@ -1,8 +1,9 @@
-import React, { useState } from 'react'
-import { Zap, ArrowRight, ArrowLeft, ExternalLink } from 'lucide-react'
+import React, { useState, useRef } from 'react'
+import { Zap } from 'lucide-react'
 import { emitFeedback } from '../feedback/feedbackBus'
 import { LANGUAGES, tr } from '../i18n'
-import { saveCredentialSettings, credentialErrorMessage } from '../credentialSettings.mjs'
+import { saveSetupConfiguration, setupFailureMessage } from '../setupWorkflow.mjs'
+import {CredentialHelp} from './CredentialGuide'
 
 const MODELS = [
   { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro（推荐）' },
@@ -43,20 +44,6 @@ const LLM_PROVIDERS = [
 
 const KEY_GUIDES = [
   {
-    id: 'nexus',
-    label: 'Nexus Mods API Key',
-    placeholder: '可跳过；需要 Nexus 下载/详情核验时再填写',
-    url: 'https://www.nexusmods.com/users/myaccount?tab=api',
-    optional: true,
-  },
-  {
-    id: 'tavily',
-    label: 'Tavily Search API Key',
-    placeholder: '可跳过；用于增强跨站搜索',
-    url: 'https://app.tavily.com/home',
-    optional: true,
-  },
-  {
     id: 'llm',
     label: 'LLM API Key',
     placeholder: '至少填写一个大模型 API Key',
@@ -65,20 +52,19 @@ const KEY_GUIDES = [
 ]
 
 export default function SetupPage({ onDone, api, toast, language = 'zh-CN', onLanguageChange }) {
-  const [step, setStep] = useState(0)
-  const [nexusKey, setNexusKey] = useState('')
-  const [tavilyKey, setTavilyKey] = useState('')
   const [llmKey, setLlmKey] = useState('')
   const [provider, setProvider] = useState('deepseek')
   const [model, setModel] = useState('deepseek-v4-pro')
   const [customModel, setCustomModel] = useState('')
   const [endpoint, setEndpoint] = useState('https://api.deepseek.com/v1')
   const [saving, setSaving] = useState(false)
+  const [restartRequired, setRestartRequired] = useState(false)
+  const savingRef = useRef(false)
 
   const selectedProvider = LLM_PROVIDERS.find(item => item.id === provider) || LLM_PROVIDERS[0]
   const effectiveModel = model === 'custom' ? customModel.trim() : model.trim()
-  const values = { nexus: nexusKey, tavily: tavilyKey, llm: llmKey }
-  const setters = { nexus: setNexusKey, tavily: setTavilyKey, llm: setLlmKey }
+  const values = { llm: llmKey }
+  const setters = { llm: setLlmKey }
   const llmKeyPresent = Boolean(llmKey.trim())
   const llmReady = llmKeyPresent && Boolean(endpoint.trim()) && Boolean(effectiveModel)
 
@@ -91,62 +77,37 @@ export default function SetupPage({ onDone, api, toast, language = 'zh-CN', onLa
     setCustomModel(preset.model || '')
   }
 
-  const openGuide = async (url) => {
-    try {
-      const result = await window.modagent?.openExternal?.(url)
-      if (result?.error) throw new Error(result.error)
-    } catch (_) {
-      toast('无法打开 API Key 获取页面', 'error')
-    }
-  }
-
-  const next = () => {
-    if (!llmKeyPresent) {
-      toast('请先填写一个 LLM API Key；Nexus 和 Tavily 可以稍后在设置里补', 'error')
-      return
-    }
-    setStep(1)
-  }
-
   const finish = async () => {
-    if (saving) return
+    if (savingRef.current || restartRequired) return
     if (!llmReady) {
-      toast('请确认 LLM API Key、模型名和接口地址都已填写', 'error')
+      toast(language==='en'?'Enter an LLM key, model and endpoint.':'请确认 LLM API Key、模型名和接口地址都已填写', 'error')
       return
     }
     setSaving(true)
+    savingRef.current = true
     try {
       const secrets = {
         llm_api_key: llmKey.trim(),
       }
-      if (nexusKey.trim()) secrets.nexus_api_key = nexusKey.trim()
-      if (tavilyKey.trim()) secrets.tavily_api_key = tavilyKey.trim()
       const body = {
         llm_api_key: secrets.llm_api_key,
         llm_model: effectiveModel,
         llm_endpoint: endpoint.trim(),
         language,
       }
-      if (secrets.nexus_api_key) body.api_key = secrets.nexus_api_key
-      if (secrets.tavily_api_key) body.tavily_api_key = secrets.tavily_api_key
-      const saved = await saveCredentialSettings(body, window.modagent?.saveSecrets)
-
-      const response = await fetch(api + '/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(saved.body),
-      })
-      if (!response.ok) throw new Error(`config failed: ${response.status}`)
-
-      await fetch(api + '/chat/reset', { method: 'POST' })
+      await saveSetupConfiguration(api, body, {store:window.modagent?.saveSecrets})
+      // /chat/reset without a session ID is a backend no-op; do not add a
+      // second network dependency after configuration was already saved.
       emitFeedback('success', { source: 'setup' })
-      toast('配置已安全保存，正在扫描本机游戏')
+      toast(language === 'en' ? 'Configuration saved. Detecting local games.' : '配置已安全保存，正在扫描本机游戏')
       onDone()
     } catch (error) {
       emitFeedback('error', { source: 'setup' })
-      toast(credentialErrorMessage(error, language), 'error')
+      if (error.restartRequired) setRestartRequired(true)
+      toast(setupFailureMessage(error, language), 'error')
     } finally {
       setSaving(false)
+      savingRef.current = false
     }
   }
 
@@ -158,11 +119,10 @@ export default function SetupPage({ onDone, api, toast, language = 'zh-CN', onLa
           <h2 className="text-lg font-bold text-white">{tr(language, 'setupTitle')}</h2>
         </div>
         <p className="text-xs text-surface-500 mb-6">
-          {tr(language, 'setupIntro')}
+          {language==='en'?'Start with one AI API key. Connect Mod sources later, only when needed.':'只需一个大模型 API Key 即可进入。其他来源用到时再配置，不必现在注册。'}
         </p>
 
-        {step === 0 && (
-          <div className="space-y-4">
+          <fieldset disabled={saving||restartRequired} className="space-y-4">
             <div>
               <label className="text-xs text-surface-400 font-medium block mb-1">{tr(language, 'language')}</label>
               <select className="input-cyber" value={language} onChange={e => onLanguageChange?.(e.target.value)}>
@@ -173,7 +133,7 @@ export default function SetupPage({ onDone, api, toast, language = 'zh-CN', onLa
             <div>
               <label className="text-xs text-surface-400 font-medium block mb-1">{tr(language, 'provider')}</label>
               <select className="input-cyber" value={provider} onChange={e => changeProvider(e.target.value)}>
-                {LLM_PROVIDERS.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+                {LLM_PROVIDERS.map(item => <option key={item.id} value={item.id}>{language==='en'?({deepseek:'DeepSeek (default)',openai:'OpenAI / GPT',custom:'Custom compatible API'})[item.id]:item.label}</option>)}
               </select>
             </div>
             {KEY_GUIDES.map((item, index) => (
@@ -183,41 +143,29 @@ export default function SetupPage({ onDone, api, toast, language = 'zh-CN', onLa
                     {item.id === 'llm' ? selectedProvider.keyLabel : item.label}
                     {item.optional && <span className="ml-1 text-[10px] text-surface-500">{tr(language, 'optional')}</span>}
                   </label>
-                  {(item.id === 'llm' ? selectedProvider.guideUrl : item.url) && (
-                    <button
-                      type="button"
-                      className="text-[11px] text-cyber-cyan hover:text-white flex items-center gap-1"
-                      onClick={() => openGuide(item.id === 'llm' ? selectedProvider.guideUrl : item.url)}
-                    >
-                      {tr(language, 'getKey')} <ExternalLink size={11} />
-                    </button>
-                  )}
                 </div>
                 <input
                   type="password"
                   className="input-cyber"
-                  placeholder={item.id === 'llm' ? selectedProvider.keyPlaceholder : item.placeholder}
+                  aria-label="LLM API Key"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder={language==='en'?'Paste your API key':selectedProvider.keyPlaceholder}
                   value={values[item.id]}
                   onChange={e => setters[item.id](e.target.value)}
-                  autoFocus={index === 2}
+                  autoFocus={index === 0}
                 />
               </div>
             ))}
-            <p className="text-[11px] leading-relaxed text-surface-500">
-              {tr(language, 'llmExplanation')}
-            </p>
-            <button onClick={next} className="btn-cyber w-full flex items-center justify-center gap-2 mt-2">
-              {tr(language, 'next')} <ArrowRight size={14} />
-            </button>
-          </div>
-        )}
+            <CredentialHelp provider={provider} language={language} toast={toast}/>
+            <p className="text-[11px] text-surface-400">{language==='en'?'Saving does not verify the provider connection. Never paste keys into chat.':'保存不代表已通过服务商连接验证。请勿把密钥发到聊天里。'}</p>
 
-        {step === 1 && (
-          <div className="space-y-4">
+          <details open={provider==='custom'} className="space-y-4">
+            <summary className="cursor-pointer text-xs text-surface-400">{language==='en'?'Advanced: model and endpoint (presets filled in)':'高级：模型和接口地址（已自动填写）'}</summary>
             <div>
               <label className="text-xs text-surface-500 block mb-1 font-medium">{tr(language, 'model')}</label>
               <select className="input-cyber" value={model} onChange={e => setModel(e.target.value)}>
-                {MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                {MODELS.map(m => <option key={m.value} value={m.value}>{language==='en'?(m.value==='custom'?'Custom model ID':m.value):m.label}</option>)}
               </select>
             </div>
             {model === 'custom' && (
@@ -227,7 +175,7 @@ export default function SetupPage({ onDone, api, toast, language = 'zh-CN', onLa
                   className="input-cyber"
                   value={customModel}
                   onChange={e => setCustomModel(e.target.value)}
-                  placeholder="例如服务商文档中的模型 ID"
+                  placeholder={language==='en'?'Model ID from your provider':'例如服务商文档中的模型 ID'}
                 />
               </div>
             )}
@@ -243,20 +191,17 @@ export default function SetupPage({ onDone, api, toast, language = 'zh-CN', onLa
             <div className="rounded-lg border border-surface-600 bg-surface-900/60 p-3 text-xs text-surface-400">
               {tr(language, 'setupDetail')}
             </div>
+          </details>
             <div className="flex gap-2 mt-2">
-              <button onClick={() => setStep(0)} className="btn-ghost flex items-center justify-center gap-1 flex-1">
-                <ArrowLeft size={14} /> {tr(language, 'previous')}
-              </button>
               <button
                 onClick={finish}
-                disabled={saving}
+                disabled={saving || restartRequired || !llmReady}
                 className="btn-cyber flex items-center justify-center gap-2 flex-1 disabled:opacity-50"
               >
-                <Zap size={14} /> {saving ? tr(language, 'saving') : tr(language, 'saveAndEnter')}
+                <Zap size={14} /> {restartRequired ? (language === 'en' ? 'Restart to verify save' : '请重启确认保存状态') : saving ? tr(language, 'saving') : tr(language, 'saveAndEnter')}
               </button>
             </div>
-          </div>
-        )}
+          </fieldset>
       </div>
     </div>
   )
